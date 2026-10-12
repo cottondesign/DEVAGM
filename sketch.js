@@ -1,11 +1,23 @@
 const ASPECT_PRESETS = {
   "16:9": { width: 1440, height: 810 },
   "1:1": { width: 1000, height: 1000 },
-  "4:5": { width: 960, height: 1200 }
+  "4:5": { width: 960, height: 1200 },
+  "2496:786": {
+    width: 2496,
+    height: 786,
+    outputPixels: true
+  }
 };
 
 const CANVAS_WIDTH = ASPECT_PRESETS["16:9"].width;
 const CANVAS_HEIGHT = ASPECT_PRESETS["16:9"].height;
+const CANVAS_PIXEL_DENSITY = 2;
+
+/*
+ * Max per-net fold delay (0–1 timeline units) before
+ * the fold-stagger slider scales it down.
+ */
+const FOLD_STAGGER_MAX = 0.72;
 
 const controls = {};
 
@@ -28,6 +40,29 @@ const PALETTE = [
 const BACKGROUNDS = {
   light: "#FEF9F3",
   dark: "#032932"
+};
+
+/*
+ * Page chrome uses the opposite of the canvas theme
+ * so the frame reads clearly against the artwork.
+ */
+const PAGE_CHROME = {
+  light: {
+    bg: "#032932",
+    fg: "#f4f1ea",
+    border: "rgba(244, 241, 234, 0.18)",
+    borderStrong: "rgba(244, 241, 234, 0.55)",
+    inputBg: "rgba(254, 249, 243, 0.08)",
+    swatchBorder: "rgba(255, 255, 255, 0.28)"
+  },
+  dark: {
+    bg: "#ecece8",
+    fg: "#111111",
+    border: "rgba(0, 0, 0, 0.12)",
+    borderStrong: "rgba(17, 17, 17, 0.85)",
+    inputBg: "#ffffff",
+    swatchBorder: "rgba(0, 0, 0, 0.18)"
+  }
 };
 
 /*
@@ -167,6 +202,12 @@ let placementSeed = 0;
 const PRESET_STORAGE_KEY =
   "devagm-11-cube-unfold-presets";
 
+const SESSION_SETTINGS_KEY =
+  "devagm-11-cube-unfold-session";
+
+let sessionSaveTimer = null;
+let sessionRestoring = false;
+
 const PRESET_FIELD_IDS = [
   "sketchMode",
   "netTypeMode",
@@ -177,8 +218,26 @@ const PRESET_FIELD_IDS = [
   "aspectRatio",
   "cascadeDirection",
   "cascadeCount",
+  "cascadePause",
+  "cascadeMotionCurve",
+  "cascadePhaseOffset",
+  "rollGridMotion",
+  "rollGridDirection",
+  "rollGridDestOffset",
+  "rollGridRadialBias",
+  "rollGridUniform",
+  "rollGridPause",
+  "insideOutGridFullness",
+  "insideOutFlatStop",
+  "insideOutPause",
+  "wanderGridFullness",
+  "wanderActionInterval",
+  "imageScaleBias",
+  "imageColorMode",
   "gridPlacement",
   "placementSkew",
+  "foldStagger",
+  "foldStaggerCarryOver",
   "foldProgress",
   "foldMode",
   "drapeAmount",
@@ -186,6 +245,9 @@ const PRESET_FIELD_IDS = [
   "cubeCount",
   "animationSpeed",
   "gridSize",
+  "cubeScale1",
+  "cubeScale2",
+  "cubeScale3",
   "layoutSpacing",
   "cameraZoom",
   "backgroundTheme",
@@ -197,6 +259,7 @@ const PRESET_FIELD_IDS = [
   "divisionAngleFilter",
   "showGrid",
   "showCubeGrid",
+  "allowBoxExtents",
   "showFaceShading"
 ];
 
@@ -214,6 +277,7 @@ const REMOVED_SKETCH_MODES = new Set([
 
 let animatedProgress = 0;
 let animationDirection = 1;
+let animationPauseTimer = 0;
 let monoColor = PALETTE[2];
 let outerColor = PALETTE[1];
 let innerColor = PALETTE[3];
@@ -222,7 +286,55 @@ let cascadeTravelers = [];
 let cascadeCacheKey = "";
 let cascadeTime = 0;
 
+/*
+ * Roll-grid mode: padded lattice of solid cubes that
+ * tip one cell at a time through the four directions.
+ */
+let rollGridCubes = [];
+let rollGridCacheKey = "";
+let rollGridTime = 0;
+let rollGridBoard = null;
+
+/*
+ * Wander mode: folded cubes placed on a random subset
+ * of the visible grid roll or unfold on their own,
+ * never claiming cells another cube already uses.
+ */
+let wanderAgents = [];
+let wanderCacheKey = "";
+let wanderTime = 0;
+
+/*
+ * Inside-out mode: padded lattice of folded cubes that
+ * evert through a random side wall and land inverted
+ * one grid row below, then keep descending.
+ */
+let insideOutCubes = [];
+let insideOutCacheKey = "";
+let insideOutTime = 0;
+let insideOutBoard = null;
+
+const ROLL_GRID_DIRS = [
+  { di: 1, dj: 0 },
+  { di: 0, dj: 1 },
+  { di: -1, dj: 0 },
+  { di: 0, dj: -1 }
+];
+
+/*
+ * Uploaded source for image mode. Pixels are stored
+ * in a plain ImageData buffer for fast sampling.
+ */
+let sourceImageData = null;
+let sourceImageKey = "";
+let sourceImageName = "";
+
 let syncingQuickToggle = false;
+
+const FPS_HISTORY_LENGTH = 90;
+let fpsHistory = [];
+let fpsDisplay = 60;
+let fpsMeterElements = null;
 
 function setup() {
   const canvas = createCanvas(
@@ -231,26 +343,12 @@ function setup() {
     WEBGL
   );
 
-  canvas.parent("canvas-container");
+  canvas.parent("canvas-stage");
 
-  pixelDensity(1);
   smooth();
 
   getControls();
   connectControls();
-
-  /*
-   * Explicitly enforce the initial flat state,
-   * even if the browser restores prior input values.
-   */
-  controls.foldProgress.value = 0;
-  controls.drapeAmount.value = 1;
-  controls.cubeCoverage.value = 100;
-
-  animatedProgress = 0;
-  animationDirection = 1;
-
-  updateAllValueLabels();
 
   processedNets = CUBE_NETS.map((cells) => {
     return prepareNet(cells);
@@ -261,12 +359,41 @@ function setup() {
   buildPaletteSwatches();
   buildNetTypeSlotOptions();
   refreshPresetSelect();
-  syncColorModeUI();
-  syncSketchModeUI();
-  syncNetTypeUI();
-  syncCoverageControlsUI();
-  applyBackgroundTheme();
-  applyAspectRatio();
+
+  /*
+   * Restore the last session when present. Otherwise
+   * start flat with the HTML defaults.
+   */
+  if (!restoreSessionSettings()) {
+    controls.foldProgress.value = 0;
+    controls.drapeAmount.value = 1;
+    controls.cubeCoverage.value = 100;
+
+    animatedProgress = 0;
+    animationDirection = 1;
+
+    syncColorModeUI();
+    syncSketchModeUI();
+    syncNetTypeUI();
+    syncCoverageControlsUI();
+    applyBackgroundTheme();
+    applyAspectRatio();
+    updateAllValueLabels();
+  }
+
+  window.addEventListener(
+    "beforeunload",
+    saveSessionSettings
+  );
+
+  document.addEventListener(
+    "visibilitychange",
+    () => {
+      if (document.visibilityState === "hidden") {
+        saveSessionSettings();
+      }
+    }
+  );
 }
 
 function draw() {
@@ -275,10 +402,14 @@ function draw() {
   background(getBackgroundColor(settings));
   applyBackgroundTheme(settings);
 
-  if (settings.sketchMode === "gridded") {
+  if (settings.sketchMode === "gridded" || settings.sketchMode === "image") {
     updateAnimation();
   } else if (settings.sketchMode === "cascade") {
     updateCascade(settings);
+  } else if (settings.sketchMode === "roll-grid") {
+    updateRollGrid(settings);
+  } else if (settings.sketchMode === "inside-out") {
+    updateInsideOut(settings);
   }
 
   if (settings.showCubeGrid) {
@@ -291,35 +422,72 @@ function draw() {
 
   setIsometricCamera(settings);
 
-  ambientLight(
-    settings.backgroundTheme === "dark" ? 160 : 205
-  );
+  if (settings.sketchMode === "image") {
+    /*
+     * Soft lighting: keeps sampled colors close to the
+     * photo while still reading folds when animating.
+     */
+    ambientLight(220);
 
-  directionalLight(
-    255,
-    255,
-    255,
-    -0.55,
-    -1,
-    -0.35
-  );
+    directionalLight(
+      70,
+      70,
+      70,
+      -0.55,
+      -1,
+      -0.35
+    );
+  } else if (
+    settings.sketchMode === "roll-grid" ||
+    settings.sketchMode === "inside-out"
+  ) {
+    /*
+     * No lights → p5's flat color shader. fill()
+     * colors match the palette with no angle tint.
+     */
+    noLights();
+  } else {
+    ambientLight(
+      settings.backgroundTheme === "dark" ? 160 : 205
+    );
 
-  directionalLight(
-    115,
-    115,
-    115,
-    0.7,
-    0.35,
-    0.55
-  );
+    directionalLight(
+      255,
+      255,
+      255,
+      -0.55,
+      -1,
+      -0.35
+    );
+
+    directionalLight(
+      115,
+      115,
+      115,
+      0.7,
+      0.35,
+      0.55
+    );
+  }
 
   if (settings.sketchMode === "cascade") {
     drawCascadeNets(settings);
   } else if (settings.sketchMode === "gradient") {
     drawGradientNets(settings);
+  } else if (settings.sketchMode === "image") {
+    drawImageNets(settings);
+  } else if (settings.sketchMode === "roll-grid") {
+    drawRollGrid(settings);
+  } else if (settings.sketchMode === "inside-out") {
+    drawInsideOut(settings);
+  } else if (settings.sketchMode === "wander") {
+    drawWanderAgents(settings);
+    updateWander(settings);
   } else {
     drawAllNets(settings);
   }
+
+  updateFpsMeter(settings);
 }
 
 
@@ -336,16 +504,76 @@ function applyBackgroundTheme(settings) {
       ? settings.backgroundTheme
       : controls.backgroundTheme.value;
 
+  const chrome =
+    PAGE_CHROME[theme] ||
+    PAGE_CHROME.light;
+
+  const root = document.documentElement;
+
+  root.style.setProperty("--page-bg", chrome.bg);
+  root.style.setProperty("--page-fg", chrome.fg);
+  root.style.setProperty("--page-border", chrome.border);
+  root.style.setProperty(
+    "--page-border-strong",
+    chrome.borderStrong
+  );
+  root.style.setProperty(
+    "--page-input-bg",
+    chrome.inputBg
+  );
+  root.style.setProperty(
+    "--page-swatch-border",
+    chrome.swatchBorder
+  );
+
+  /*
+   * Keep the area around the canvas on the contrasting
+   * page color — the canvas paints its own fill.
+   */
   const wrap =
     document.getElementById(
       "canvas-container"
     );
 
   if (wrap) {
-    wrap.style.background =
-      BACKGROUNDS[theme] ||
-      BACKGROUNDS.light;
+    wrap.style.background = chrome.bg;
   }
+}
+
+function isMulticolorColorMode(mode) {
+  return (
+    mode === "multicolored" ||
+    mode === "two-tone-multi"
+  );
+}
+
+/*
+ * In multicolor modes on the dark canvas, keep the
+ * background swatch off cube faces so they stay visible.
+ */
+function getFacePalette(settings) {
+  if (
+    settings.backgroundTheme !== "dark" ||
+    !isMulticolorColorMode(settings.colorMode)
+  ) {
+    return PALETTE;
+  }
+
+  const background = BACKGROUNDS.dark.toLowerCase();
+  const palette = PALETTE.filter(
+    (hex) => hex.toLowerCase() !== background
+  );
+
+  return palette.length ? palette : PALETTE;
+}
+
+function paletteColorForFace(index, settings) {
+  const palette = getFacePalette(settings);
+  const slot =
+    ((index % palette.length) + palette.length) %
+    palette.length;
+
+  return palette[slot];
 }
 
 function getNetColor(index, settings) {
@@ -360,7 +588,7 @@ function getNetColor(index, settings) {
     return outerColor;
   }
 
-  return PALETTE[index % PALETTE.length];
+  return paletteColorForFace(index, settings);
 }
 
 function isTwoToneColorMode(mode) {
@@ -388,11 +616,7 @@ function getFaceOuterColor(
   const salt =
     floor(abs(creaseSeed) * 97) + face * 3;
 
-  const index =
-    ((salt % PALETTE.length) + PALETTE.length) %
-    PALETTE.length;
-
-  return PALETTE[index];
+  return paletteColorForFace(salt, settings);
 }
 
 function getAllowedTypeIndexes(settings) {
@@ -436,6 +660,109 @@ function pickAllowedTypeIndex(seed, settings) {
 
 function allowedTypesCacheKey(settings) {
   return getAllowedTypeIndexes(settings).join(",");
+}
+
+/*
+ * Relative 1× / 2× / 3× mix. Sliders are weights;
+ * all-zero falls back to pure 1× so layouts stay valid.
+ */
+function getNormalizedScaleWeights(settings) {
+  const w1 = max(0, Number(settings.cubeScale1) || 0);
+  const w2 = max(0, Number(settings.cubeScale2) || 0);
+  const w3 = max(0, Number(settings.cubeScale3) || 0);
+  const sum = w1 + w2 + w3;
+
+  if (sum <= 0) {
+    return { 1: 1, 2: 0, 3: 0 };
+  }
+
+  return {
+    1: w1 / sum,
+    2: w2 / sum,
+    3: w3 / sum
+  };
+}
+
+function scaleWeightsCacheKey(settings) {
+  const weights = getNormalizedScaleWeights(settings);
+
+  return [
+    weights[1].toFixed(4),
+    weights[2].toFixed(4),
+    weights[3].toFixed(4)
+  ].join(",");
+}
+
+function getMaxActiveScale(settings) {
+  const weights = getNormalizedScaleWeights(settings);
+
+  if (weights[3] > 0) {
+    return 3;
+  }
+
+  if (weights[2] > 0) {
+    return 2;
+  }
+
+  return 1;
+}
+
+function onlyUnitScaleActive(settings) {
+  const weights = getNormalizedScaleWeights(settings);
+
+  return weights[2] <= 0 && weights[3] <= 0;
+}
+
+function pickCubeScale(seed, settings) {
+  const weights = getNormalizedScaleWeights(settings);
+  const roll = unitHash(seed);
+
+  if (roll < weights[1]) {
+    return 1;
+  }
+
+  if (roll < weights[1] + weights[2]) {
+    return 2;
+  }
+
+  return 3;
+}
+
+/*
+ * Each logical face of a scale-s cube occupies an
+ * s×s block on the base face lattice.
+ */
+function expandCellsToFootprint(cells, scale) {
+  const edge = max(1, round(scale) || 1);
+  const footprint = [];
+
+  for (const cell of cells) {
+    const ox = cell[0] * edge;
+    const oy = cell[1] * edge;
+
+    for (let dy = 0; dy < edge; dy++) {
+      for (let dx = 0; dx < edge; dx++) {
+        footprint.push([ox + dx, oy + dy]);
+      }
+    }
+  }
+
+  return footprint;
+}
+
+function footprintKeys(cells, scale) {
+  return expandCellsToFootprint(cells, scale).map(
+    (cell) => coordinateKey(cell[0], cell[1])
+  );
+}
+
+function worldOriginForFace(gridX, gridY, scale, faceSize) {
+  const edge = max(1, scale || 1);
+
+  return {
+    x: (gridX * edge + edge * 0.5) * faceSize,
+    z: (gridY * edge + edge * 0.5) * faceSize
+  };
 }
 
 function buildNetTypeSlotOptions() {
@@ -501,6 +828,9 @@ function syncNetTypeUI() {
 function invalidateNetTypeCaches() {
   packCacheKey = "";
   cascadeCacheKey = "";
+  rollGridCacheKey = "";
+  wanderCacheKey = "";
+  insideOutCacheKey = "";
 }
 
 function randomizePlacements() {
@@ -508,6 +838,7 @@ function randomizePlacements() {
     floor(Math.random() * 1000000000);
 
   invalidateNetTypeCaches();
+  scheduleSessionSave();
 }
 
 function readPresetStore() {
@@ -534,6 +865,65 @@ function writePresetStore(store) {
     PRESET_STORAGE_KEY,
     JSON.stringify(store)
   );
+}
+
+function scheduleSessionSave() {
+  if (sessionRestoring) {
+    return;
+  }
+
+  if (sessionSaveTimer !== null) {
+    clearTimeout(sessionSaveTimer);
+  }
+
+  sessionSaveTimer = setTimeout(() => {
+    sessionSaveTimer = null;
+    saveSessionSettings();
+  }, 200);
+}
+
+function saveSessionSettings() {
+  if (sessionRestoring || !controls.foldProgress) {
+    return;
+  }
+
+  try {
+    localStorage.setItem(
+      SESSION_SETTINGS_KEY,
+      JSON.stringify(collectPresetSnapshot())
+    );
+  } catch (error) {
+    /*
+     * Quota / private-mode failures shouldn't break
+     * the sketch.
+     */
+  }
+}
+
+function restoreSessionSettings() {
+  let preset = null;
+
+  try {
+    const raw =
+      localStorage.getItem(SESSION_SETTINGS_KEY);
+
+    if (!raw) {
+      return false;
+    }
+
+    preset = JSON.parse(raw);
+  } catch (error) {
+    return false;
+  }
+
+  if (!preset || typeof preset !== "object") {
+    return false;
+  }
+
+  sessionRestoring = true;
+  applyPresetSnapshot(preset);
+  sessionRestoring = false;
+  return true;
 }
 
 function refreshPresetSelect(selectedName = "") {
@@ -728,22 +1118,35 @@ function applyPresetSnapshot(preset) {
     controls.presetName.value =
       controls.presetSelect.value;
   }
+
+  scheduleSessionSave();
 }
 
 function syncColorModeUI() {
+  const isImage = controls.sketchMode.value === "image";
   const mode = controls.colorMode.value;
   const isMono = mode === "monochromatic";
   const isTwoTone = isTwoToneColorMode(mode);
   const isMultiOuter = mode === "two-tone-multi";
+  const imageNeedsPalette =
+    isImage &&
+    controls.imageColorMode.value === "shades";
+
+  if (controls.colorModeGroup) {
+    controls.colorModeGroup.classList.toggle(
+      "hidden",
+      isImage
+    );
+  }
 
   controls.monoColorGroup.classList.toggle(
     "hidden",
-    !isMono
+    isImage ? !imageNeedsPalette : !isMono
   );
 
   controls.twoToneColorGroup.classList.toggle(
     "hidden",
-    !isTwoTone
+    isImage || !isTwoTone
   );
 
   if (controls.outerColorRow) {
@@ -768,6 +1171,7 @@ function syncColorModeUI() {
   }
 
   refreshPaletteSelection();
+  syncImageAnimateButton();
 }
 
 function buildPaletteSwatches() {
@@ -776,9 +1180,12 @@ function buildPaletteSwatches() {
     () => monoColor,
     (hex) => {
       monoColor = hex;
-      controls.colorMode.value =
-        "monochromatic";
+      if (controls.sketchMode.value !== "image") {
+        controls.colorMode.value =
+          "monochromatic";
+      }
       syncColorModeUI();
+      scheduleSessionSave();
     }
   );
 
@@ -794,6 +1201,7 @@ function buildPaletteSwatches() {
         controls.colorMode.value = "two-tone";
       }
       syncColorModeUI();
+      scheduleSessionSave();
     }
   );
 
@@ -809,6 +1217,7 @@ function buildPaletteSwatches() {
         controls.colorMode.value = "two-tone";
       }
       syncColorModeUI();
+      scheduleSessionSave();
     }
   );
 
@@ -881,8 +1290,37 @@ function getControls() {
     "aspectRatio",
     "cascadeDirection",
     "cascadeCount",
+    "cascadePause",
+    "cascadeMotionCurve",
+    "cascadePhaseOffset",
     "cascadeDirectionGroup",
     "cascadeCountGroup",
+    "cascadePauseGroup",
+    "cascadeMotionCurveGroup",
+    "cascadePhaseOffsetGroup",
+    "rollGridControls",
+    "rollGridMotion",
+    "rollGridDirectionGroup",
+    "rollGridDirection",
+    "rollGridDestOffset",
+    "rollGridRadialGroup",
+    "rollGridRadialBias",
+    "rollGridRadialBiasLabel",
+    "rollGridUniform",
+    "rollGridPause",
+    "insideOutControls",
+    "insideOutGridFullness",
+    "insideOutFlatStop",
+    "insideOutPause",
+    "wanderControls",
+    "wanderGridFullness",
+    "wanderActionInterval",
+    "imageModeControls",
+    "imageUpload",
+    "imageUploadNote",
+    "imageScaleBias",
+    "imageColorMode",
+    "imageAnimateButton",
     "griddedPlacementControls",
     "sharedFoldControls",
     "griddedCoverageControls",
@@ -897,6 +1335,8 @@ function getControls() {
     "gridPlacement",
     "gridPlacementNote",
     "placementSkew",
+    "foldStagger",
+    "foldStaggerCarryOver",
     "foldProgress",
     "foldMode",
     "drapeAmount",
@@ -906,9 +1346,13 @@ function getControls() {
     "cubeCount",
     "animationSpeed",
     "gridSize",
+    "cubeScale1",
+    "cubeScale2",
+    "cubeScale3",
     "layoutSpacing",
     "cameraZoom",
     "backgroundTheme",
+    "colorModeGroup",
     "colorMode",
     "monoColorGroup",
     "monoPalette",
@@ -924,6 +1368,7 @@ function getControls() {
     "divisionAngleFilter",
     "showGrid",
     "showCubeGrid",
+    "allowBoxExtents",
     "showFaceShading",
     "unfoldButton",
     "foldButton",
@@ -952,11 +1397,25 @@ function connectControls() {
     "cubeCoverage",
     "cubeCount",
     "placementSkew",
+    "foldStagger",
     "cascadeCount",
+    "cascadePause",
+    "cascadePhaseOffset",
     "animationSpeed",
     "gridSize",
+    "cubeScale1",
+    "cubeScale2",
+    "cubeScale3",
     "layoutSpacing",
-    "cameraZoom"
+    "cameraZoom",
+    "rollGridRadialBias",
+    "rollGridDestOffset",
+    "rollGridPause",
+    "insideOutGridFullness",
+    "insideOutFlatStop",
+    "insideOutPause",
+    "wanderGridFullness",
+    "wanderActionInterval"
   ];
 
   for (const id of rangeIds) {
@@ -980,7 +1439,123 @@ function connectControls() {
     () => {
       syncSketchModeUI();
       cascadeCacheKey = "";
+      packCacheKey = "";
+      rollGridCacheKey = "";
+      insideOutCacheKey = "";
+      wanderCacheKey = "";
     }
+  );
+
+  controls.wanderGridFullness.addEventListener(
+    "change",
+    () => {
+      wanderCacheKey = "";
+    }
+  );
+
+  controls.wanderActionInterval.addEventListener(
+    "input",
+    () => {
+      setValueLabel(
+        "wanderActionInterval",
+        `${Number(controls.wanderActionInterval.value).toFixed(1)}s`
+      );
+    }
+  );
+
+  controls.rollGridMotion.addEventListener(
+    "change",
+    () => {
+      syncRollGridMotionUI();
+      rollGridCacheKey = "";
+    }
+  );
+
+  controls.rollGridDirection.addEventListener(
+    "change",
+    () => {
+      rollGridCacheKey = "";
+    }
+  );
+
+  controls.rollGridDestOffset.addEventListener(
+    "input",
+    () => {
+      setValueLabel(
+        "rollGridDestOffset",
+        `${controls.rollGridDestOffset.value}%`
+      );
+      rollGridCacheKey = "";
+    }
+  );
+
+  controls.rollGridUniform.addEventListener(
+    "change",
+    () => {
+      rollGridCacheKey = "";
+    }
+  );
+
+  controls.rollGridRadialBias.addEventListener(
+    "input",
+    () => {
+      setValueLabel(
+        "rollGridRadialBias",
+        `${controls.rollGridRadialBias.value}%`
+      );
+    }
+  );
+
+  controls.insideOutGridFullness.addEventListener(
+    "input",
+    () => {
+      setValueLabel(
+        "insideOutGridFullness",
+        `${controls.insideOutGridFullness.value}%`
+      );
+      insideOutCacheKey = "";
+    }
+  );
+
+  controls.insideOutGridFullness.addEventListener(
+    "change",
+    () => {
+      insideOutCacheKey = "";
+    }
+  );
+
+  controls.insideOutPause.addEventListener(
+    "input",
+    () => {
+      setValueLabel(
+        "insideOutPause",
+        `${Number(controls.insideOutPause.value).toFixed(2)}s`
+      );
+    }
+  );
+
+  controls.imageUpload.addEventListener(
+    "change",
+    handleImageUpload
+  );
+
+  controls.imageScaleBias.addEventListener(
+    "change",
+    () => {
+      packCacheKey = "";
+    }
+  );
+
+  controls.imageColorMode.addEventListener(
+    "change",
+    () => {
+      syncColorModeUI();
+    }
+  );
+
+  controls.imageAnimateButton.addEventListener(
+    "click",
+    toggleImageAnimate
   );
 
   controls.netTypeMode.addEventListener(
@@ -1063,6 +1638,13 @@ function connectControls() {
     syncQuickFromParts
   );
 
+  controls.allowBoxExtents.addEventListener(
+    "change",
+    () => {
+      rollGridCacheKey = "";
+    }
+  );
+
   controls.showFaceShading.addEventListener(
     "change",
     syncQuickFromParts
@@ -1085,7 +1667,30 @@ function connectControls() {
     }
   );
 
+  controls.foldStagger.addEventListener(
+    "input",
+    () => {
+      syncFoldProgressRange();
+      updateAllValueLabels();
+    }
+  );
+
+  controls.foldStaggerCarryOver.addEventListener(
+    "change",
+    () => {
+      syncFoldProgressRange();
+      updateAllValueLabels();
+    }
+  );
+
   controls.cascadeCount.addEventListener(
+    "input",
+    () => {
+      updateAllValueLabels();
+    }
+  );
+
+  controls.cascadePhaseOffset.addEventListener(
     "input",
     () => {
       cascadeCacheKey = "";
@@ -1093,15 +1698,39 @@ function connectControls() {
     }
   );
 
+  const invalidateScaleCaches = () => {
+    packCacheKey = "";
+    cascadeCacheKey = "";
+    insideOutCacheKey = "";
+    updateAllValueLabels();
+  };
+
+  controls.cubeScale1.addEventListener(
+    "input",
+    invalidateScaleCaches
+  );
+
+  controls.cubeScale2.addEventListener(
+    "input",
+    invalidateScaleCaches
+  );
+
+  controls.cubeScale3.addEventListener(
+    "input",
+    invalidateScaleCaches
+  );
+
   controls.unfoldButton.addEventListener(
     "click",
     () => {
       animatedProgress = 0;
       animationDirection = 1;
+      animationPauseTimer = 0;
 
       controls.foldProgress.value = 0;
       controls.animateFolding.checked = false;
 
+      syncImageAnimateButton();
       updateAllValueLabels();
     }
   );
@@ -1109,12 +1738,18 @@ function connectControls() {
   controls.foldButton.addEventListener(
     "click",
     () => {
-      animatedProgress = 1;
-      animationDirection = -1;
+      const settings = getSettings();
+      const foldEnd =
+        1 + getMaxFoldStaggerDelay(settings);
 
-      controls.foldProgress.value = 1;
+      animatedProgress = foldEnd;
+      animationDirection = -1;
+      animationPauseTimer = 0;
+
+      controls.foldProgress.value = foldEnd;
       controls.animateFolding.checked = false;
 
+      syncImageAnimateButton();
       updateAllValueLabels();
     }
   );
@@ -1171,6 +1806,22 @@ function connectControls() {
     "change",
     syncColorModeUI
   );
+
+  /*
+   * Persist every control that belongs in a session
+   * snapshot, including checkboxes / selects that
+   * don't always refresh value labels.
+   */
+  for (const id of PRESET_FIELD_IDS) {
+    const el = controls[id];
+
+    if (!el) {
+      continue;
+    }
+
+    el.addEventListener("input", scheduleSessionSave);
+    el.addEventListener("change", scheduleSessionSave);
+  }
 }
 
 function getSettings() {
@@ -1236,11 +1887,65 @@ function getSettings() {
     cascadeCount:
       Number(controls.cascadeCount.value),
 
+    cascadePause:
+      Number(controls.cascadePause.value) || 0,
+
+    cascadeMotionCurve:
+      controls.cascadeMotionCurve.value || "ease",
+
+    cascadePhaseOffset:
+      Number(controls.cascadePhaseOffset.value) / 100,
+
+    imageScaleBias:
+      controls.imageScaleBias.value || "dark-large",
+
+    imageColorMode:
+      controls.imageColorMode.value || "faces",
+
+    rollGridMotion:
+      controls.rollGridMotion.value || "uniform",
+
+    rollGridDirection:
+      controls.rollGridDirection.value || "x+",
+
+    rollGridDestOffset:
+      Number(controls.rollGridDestOffset.value) / 100,
+
+    rollGridRadialBias:
+      Number(controls.rollGridRadialBias.value) / 100,
+
+    rollGridUniform:
+      controls.rollGridUniform.checked,
+
+    rollGridPause:
+      Number(controls.rollGridPause.value) || 0,
+
+    insideOutGridFullness:
+      Number(controls.insideOutGridFullness.value) / 100,
+
+    insideOutFlatStop:
+      controls.insideOutFlatStop.value || "pause-flat",
+
+    insideOutPause:
+      Number(controls.insideOutPause.value) || 0,
+
+    wanderGridFullness:
+      Number(controls.wanderGridFullness.value) / 100,
+
+    wanderActionInterval:
+      Number(controls.wanderActionInterval.value) || 2,
+
     gridPlacement:
       controls.gridPlacement.value,
 
     placementSkew:
       Number(controls.placementSkew.value) / 100,
+
+    foldStagger:
+      Number(controls.foldStagger.value) / 100,
+
+    foldStaggerCarryOver:
+      controls.foldStaggerCarryOver.checked,
 
     foldProgress:
       animatedProgress,
@@ -1281,6 +1986,19 @@ function getSettings() {
     gridSize,
 
     /*
+     * Relative mix of 1× / 2× / 3× plain-faced cubes.
+     * Normalized at use sites; all-zero falls back to 1×.
+     */
+    cubeScale1:
+      Number(controls.cubeScale1.value) || 0,
+
+    cubeScale2:
+      Number(controls.cubeScale2.value) || 0,
+
+    cubeScale3:
+      Number(controls.cubeScale3.value) || 0,
+
+    /*
      * Current on-screen edge length after zoom.
      */
     screenGridSize,
@@ -1316,6 +2034,9 @@ function getSettings() {
 
     showCubeGrid:
       controls.showCubeGrid.checked,
+
+    allowBoxExtents:
+      controls.allowBoxExtents.checked,
 
     showFaceShading:
       controls.showFaceShading.checked
@@ -1353,8 +2074,23 @@ function updateAllValueLabels() {
   );
 
   setValueLabel(
+    "foldStagger",
+    `${controls.foldStagger.value}%`
+  );
+
+  setValueLabel(
     "cascadeCount",
     `${controls.cascadeCount.value}`
+  );
+
+  setValueLabel(
+    "cascadePause",
+    `${Number(controls.cascadePause.value).toFixed(2)}s`
+  );
+
+  setValueLabel(
+    "cascadePhaseOffset",
+    `${controls.cascadePhaseOffset.value}%`
   );
 
   setValueLabel(
@@ -1370,6 +2106,21 @@ function updateAllValueLabels() {
   );
 
   setValueLabel(
+    "cubeScale1",
+    `${controls.cubeScale1.value}`
+  );
+
+  setValueLabel(
+    "cubeScale2",
+    `${controls.cubeScale2.value}`
+  );
+
+  setValueLabel(
+    "cubeScale3",
+    `${controls.cubeScale3.value}`
+  );
+
+  setValueLabel(
     "layoutSpacing",
     `${Number(
       controls.layoutSpacing.value
@@ -1382,6 +2133,147 @@ function updateAllValueLabels() {
       controls.cameraZoom.value
     ).toFixed(2)
   );
+
+  setValueLabel(
+    "rollGridRadialBias",
+    `${controls.rollGridRadialBias.value}%`
+  );
+
+  setValueLabel(
+    "rollGridDestOffset",
+    `${controls.rollGridDestOffset.value}%`
+  );
+
+  setValueLabel(
+    "rollGridPause",
+    `${Number(controls.rollGridPause.value).toFixed(2)}s`
+  );
+
+  setValueLabel(
+    "insideOutGridFullness",
+    `${controls.insideOutGridFullness.value}%`
+  );
+
+  setValueLabel(
+    "insideOutPause",
+    `${Number(controls.insideOutPause.value).toFixed(2)}s`
+  );
+
+  setValueLabel(
+    "wanderGridFullness",
+    `${controls.wanderGridFullness.value}%`
+  );
+
+  setValueLabel(
+    "wanderActionInterval",
+    `${Number(controls.wanderActionInterval.value).toFixed(1)}s`
+  );
+
+  syncFoldProgressRange();
+}
+
+function getEffectiveFoldDelay(foldDelay, settings) {
+  const staggerMix = constrain(
+    settings.foldStagger ?? 1,
+    0,
+    1
+  );
+
+  return foldDelay * staggerMix;
+}
+
+function getMaxFoldStaggerDelay(settings) {
+  const staggerMix = constrain(
+    settings.foldStagger ?? 1,
+    0,
+    1
+  );
+
+  if (
+    !settings.foldStaggerCarryOver ||
+    staggerMix <= 0 ||
+    settings.sketchMode !== "gridded"
+  ) {
+    return 0;
+  }
+
+  ensurePackedLayout(settings);
+
+  const placements = selectPlacementsForCoverage(
+    packedPlacements.placements,
+    settings
+  );
+
+  let maxDelay = 0;
+
+  for (const placement of placements) {
+    maxDelay = max(
+      maxDelay,
+      getEffectiveFoldDelay(
+        placement.foldDelay,
+        settings
+      )
+    );
+  }
+
+  return maxDelay;
+}
+
+function staggeredNetFoldProgress(
+  globalProgress,
+  foldDelay,
+  settings
+) {
+  const delay = constrain(
+    getEffectiveFoldDelay(foldDelay, settings),
+    0,
+    FOLD_STAGGER_MAX
+  );
+
+  if (delay <= 0) {
+    return constrain(globalProgress, 0, 1);
+  }
+
+  if (
+    settings.foldStaggerCarryOver &&
+    settings.sketchMode === "gridded"
+  ) {
+    return constrain(
+      globalProgress - delay,
+      0,
+      1
+    );
+  }
+
+  const span = max(0.001, 1 - delay);
+
+  return constrain(
+    (globalProgress - delay) / span,
+    0,
+    1
+  );
+}
+
+function syncFoldProgressRange() {
+  if (!controls.foldProgress) {
+    return;
+  }
+
+  const settings = getSettings();
+  const maxDelay =
+    getMaxFoldStaggerDelay(settings);
+  const max = 1 + maxDelay;
+
+  controls.foldProgress.max = String(max);
+
+  const current = Number(
+    controls.foldProgress.value
+  );
+
+  if (current > max) {
+    controls.foldProgress.value = max;
+    animatedProgress = max;
+  }
 }
 
 function syncSketchModeUI() {
@@ -1393,13 +2285,47 @@ function syncSketchModeUI() {
   const isCascade = mode === "cascade";
   const isGridded = mode === "gridded";
   const isGradient = mode === "gradient";
+  const isImage = mode === "image";
+  const isRollGrid = mode === "roll-grid";
+  const isInsideOut = mode === "inside-out";
+  const isWander = mode === "wander";
+
+  controls.imageModeControls.classList.toggle(
+    "hidden",
+    !isImage
+  );
+
+  controls.rollGridControls.classList.toggle(
+    "hidden",
+    !isRollGrid
+  );
+
+  controls.insideOutControls.classList.toggle(
+    "hidden",
+    !isInsideOut
+  );
+
+  controls.wanderControls.classList.toggle(
+    "hidden",
+    !isWander
+  );
 
   controls.cascadeDirectionGroup.classList.toggle(
     "hidden",
-    isGridded
+    isGridded || isImage || isRollGrid || isInsideOut || isWander
   );
 
   controls.cascadeCountGroup.classList.toggle(
+    "hidden",
+    !isCascade
+  );
+
+  controls.cascadePauseGroup.classList.toggle(
+    "hidden",
+    !isCascade && !isGridded && !isImage
+  );
+
+  controls.cascadePhaseOffsetGroup.classList.toggle(
     "hidden",
     !isCascade
   );
@@ -1416,12 +2342,12 @@ function syncSketchModeUI() {
 
   controls.sharedFoldControls.classList.toggle(
     "hidden",
-    !isGridded
+    !isGridded && !isImage
   );
 
   controls.griddedCoverageControls.classList.toggle(
     "hidden",
-    !isGridded && !isGradient
+    !isGridded && !isGradient && !isImage
   );
 
   controls.griddedActionControls.classList.toggle(
@@ -1431,8 +2357,63 @@ function syncSketchModeUI() {
 
   controls.griddedFoldButtons.classList.toggle(
     "hidden",
-    !isGridded
+    !isGridded && !isImage
   );
+
+  syncRollGridMotionUI();
+  syncColorModeUI();
+  syncFoldProgressRange();
+  updateImageUploadNote();
+}
+
+function syncRollGridMotionUI() {
+  if (!controls.rollGridRadialGroup) {
+    return;
+  }
+
+  const isRoll =
+    controls.sketchMode.value === "roll-grid";
+  const motion = controls.rollGridMotion.value;
+  const showBias =
+    isRoll &&
+    (motion === "radial" || motion === "offset-center");
+
+  controls.rollGridRadialGroup.classList.toggle(
+    "hidden",
+    !showBias
+  );
+
+  if (controls.rollGridRadialBiasLabel) {
+    controls.rollGridRadialBiasLabel.textContent =
+      motion === "offset-center"
+        ? "Center phase lead"
+        : "Center speed boost";
+  }
+
+  if (controls.rollGridDirectionGroup) {
+    controls.rollGridDirectionGroup.classList.toggle(
+      "hidden",
+      !isRoll || motion !== "one-way"
+    );
+  }
+}
+
+function resolveAspectCanvasSize(preset) {
+  const density = CANVAS_PIXEL_DENSITY;
+
+  if (preset.outputPixels) {
+    return {
+      width: round(preset.width / density),
+      height: round(preset.height / density),
+      pixelDensity: density
+    };
+  }
+
+  return {
+    width: preset.width,
+    height: preset.height,
+    pixelDensity: density
+  };
 }
 
 function applyAspectRatio() {
@@ -1444,14 +2425,20 @@ function applyAspectRatio() {
   const preset =
     ASPECT_PRESETS[key] || ASPECT_PRESETS["16:9"];
 
+  const size = resolveAspectCanvasSize(preset);
+
+  if (pixelDensity() !== size.pixelDensity) {
+    pixelDensity(size.pixelDensity);
+  }
+
   if (
-    width === preset.width &&
-    height === preset.height
+    width === size.width &&
+    height === size.height
   ) {
     return;
   }
 
-  resizeCanvas(preset.width, preset.height);
+  resizeCanvas(size.width, size.height);
 
   /*
    * Layout depends on canvas bounds — rebuild packs
@@ -1459,6 +2446,8 @@ function applyAspectRatio() {
    */
   packCacheKey = "";
   cascadeCacheKey = "";
+  rollGridCacheKey = "";
+  insideOutCacheKey = "";
 }
 
 function setValueLabel(controlId, text) {
@@ -1477,25 +2466,68 @@ function updateAnimation() {
     animatedProgress = Number(
       controls.foldProgress.value
     );
+    animationPauseTimer = 0;
 
     return;
   }
+
+  const settings = getSettings();
+  const maxDelay =
+    getMaxFoldStaggerDelay(settings);
+  const foldEnd = 1 + maxDelay;
 
   const speed = Number(
     controls.animationSpeed.value
   );
 
+  const pauseSec = max(
+    0,
+    Number(controls.cascadePause.value) || 0
+  );
+
+  const dt =
+    (typeof deltaTime === "number" && deltaTime > 0
+      ? deltaTime
+      : 1000 / 60) / 1000;
+
+  if (animationPauseTimer > 0) {
+    animationPauseTimer = max(
+      0,
+      animationPauseTimer - dt
+    );
+
+    controls.foldProgress.value =
+      animatedProgress;
+
+    setValueLabel(
+      "foldProgress",
+      animatedProgress.toFixed(2)
+    );
+
+    return;
+  }
+
   animatedProgress +=
     speed * animationDirection;
 
-  if (animatedProgress >= 1) {
-    animatedProgress = 1;
-    animationDirection = -1;
-  }
+  if (animatedProgress >= foldEnd) {
+    animatedProgress = foldEnd;
 
-  if (animatedProgress <= 0) {
+    if (pauseSec > 0 && animationDirection > 0) {
+      animationPauseTimer = pauseSec;
+      animationDirection = -1;
+    } else {
+      animationDirection = -1;
+    }
+  } else if (animatedProgress <= 0) {
     animatedProgress = 0;
-    animationDirection = 1;
+
+    if (pauseSec > 0 && animationDirection < 0) {
+      animationPauseTimer = pauseSec;
+      animationDirection = 1;
+    } else {
+      animationDirection = 1;
+    }
   }
 
   controls.foldProgress.value =
@@ -1505,6 +2537,8 @@ function updateAnimation() {
     "foldProgress",
     animatedProgress.toFixed(2)
   );
+
+  scheduleSessionSave();
 }
 
 function getVerticalView(zoom) {
@@ -1594,6 +2628,179 @@ function beginScreenSpaceCamera() {
     1,
     0
   );
+}
+
+function ensureFpsMeter() {
+  if (fpsMeterElements) {
+    return fpsMeterElements;
+  }
+
+  fpsMeterElements = {
+    value: document.getElementById("fps-meter-value"),
+    chart: document.getElementById("fps-meter-chart"),
+    yAxis: document.getElementById("fps-meter-y-axis"),
+    xAxis: document.getElementById("fps-meter-x-label")
+  };
+
+  return fpsMeterElements;
+}
+
+function formatFpsAxisSeconds(seconds) {
+  const rounded = max(0, Number(seconds) || 0);
+
+  if (rounded === 0) {
+    return "0 s";
+  }
+
+  return `−${rounded.toFixed(1)} s`;
+}
+
+function getFpsChartScale() {
+  let maxFps = 60;
+
+  for (const sample of fpsHistory) {
+    maxFps = max(maxFps, sample);
+  }
+
+  return max(30, ceil(maxFps / 15) * 15);
+}
+
+function updateFpsMeter(settings) {
+  updateFpsSample();
+
+  const meter = ensureFpsMeter();
+
+  if (
+    !meter.chart ||
+    !meter.value ||
+    fpsHistory.length < 2
+  ) {
+    return;
+  }
+
+  const maxFps = getFpsChartScale();
+  const windowSec =
+    fpsHistory.length / max(fpsDisplay, 1);
+
+  meter.value.textContent = `${round(fpsDisplay)}`;
+
+  if (meter.yAxis) {
+    const yTicks = [
+      maxFps,
+      round(maxFps * (2 / 3)),
+      round(maxFps * (1 / 3)),
+      0
+    ];
+
+    meter.yAxis.innerHTML = yTicks
+      .map((tick) => `<span>${tick}</span>`)
+      .join("");
+  }
+
+  if (meter.xAxis) {
+    const xTicks = [
+      windowSec,
+      windowSec * (2 / 3),
+      windowSec * (1 / 3),
+      0
+    ];
+
+    meter.xAxis.innerHTML = xTicks
+      .map((tick) => `<span>${formatFpsAxisSeconds(tick)}</span>`)
+      .join("");
+  }
+
+  const ctx = meter.chart.getContext("2d");
+  const w = meter.chart.width;
+  const h = meter.chart.height;
+  const pad = { top: 4, right: 4, bottom: 4, left: 4 };
+  const chartW = w - pad.left - pad.right;
+  const chartH = h - pad.top - pad.bottom;
+  const dark = settings.backgroundTheme === "dark";
+
+  const gridColor = dark
+    ? "rgba(254, 249, 243, 0.12)"
+    : "rgba(3, 41, 50, 0.12)";
+
+  const lineColor = dark
+    ? "rgba(50, 238, 255, 0.9)"
+    : "rgba(10, 69, 82, 0.85)";
+
+  const fillColor = dark
+    ? "rgba(50, 238, 255, 0.12)"
+    : "rgba(10, 69, 82, 0.1)";
+
+  ctx.clearRect(0, 0, w, h);
+
+  ctx.strokeStyle = gridColor;
+  ctx.lineWidth = 1;
+
+  for (let i = 0; i <= 3; i++) {
+    const gy = pad.top + (i / 3) * chartH;
+
+    ctx.beginPath();
+    ctx.moveTo(pad.left, gy);
+    ctx.lineTo(pad.left + chartW, gy);
+    ctx.stroke();
+  }
+
+  const points = fpsHistory.map((sample, index) => {
+    const x =
+      pad.left +
+      (index / max(1, fpsHistory.length - 1)) * chartW;
+
+    const y =
+      pad.top +
+      chartH -
+      constrain(sample / maxFps, 0, 1) * chartH;
+
+    return { x, y };
+  });
+
+  if (points.length > 1) {
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, pad.top + chartH);
+
+    for (const point of points) {
+      ctx.lineTo(point.x, point.y);
+    }
+
+    ctx.lineTo(
+      points[points.length - 1].x,
+      pad.top + chartH
+    );
+    ctx.closePath();
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
+
+function updateFpsSample() {
+  const dt =
+    typeof deltaTime === "number" && deltaTime > 0
+      ? deltaTime
+      : 1000 / 60;
+
+  const fps = constrain(1000 / dt, 1, 999);
+
+  fpsHistory.push(fps);
+
+  if (fpsHistory.length > FPS_HISTORY_LENGTH) {
+    fpsHistory.shift();
+  }
+
+  fpsDisplay = fpsDisplay * 0.9 + fps * 0.1;
 }
 
 /*
@@ -1958,7 +3165,10 @@ function drawAllNets(settings) {
       settings,
       placement.creaseStyle,
       placement.seed,
-      placement.foldDelay
+      placement.foldDelay,
+      {
+        cubeScale: placement.scale || 1
+      }
     );
   }
 }
@@ -2053,13 +3263,3128 @@ function drawGradientNets(settings) {
       {
         drapeAmount: settings.drapeAmount,
         foldProgress: 0,
-        foldMode: "both"
+        foldMode: "both",
+        cubeScale: placement.scale || 1
       }
     );
   }
 }
 
 
+/* ---------------------------------------------------------
+   ROLL GRID — padded cubes tipping through 4 directions
+--------------------------------------------------------- */
+
+function ensureRollGrid(settings) {
+  const key = [
+    "roll-grid",
+    settings.faceSize.toFixed(5),
+    settings.cameraZoom.toFixed(3),
+    settings.gridSize,
+    settings.rollGridMotion,
+    settings.rollGridDirection,
+    settings.rollGridUniform ? 1 : 0,
+    settings.allowBoxExtents ? 1 : 0,
+    Number(settings.rollGridDestOffset || 0).toFixed(2),
+    placementSeed,
+    width,
+    height
+  ].join("|");
+
+  if (key === rollGridCacheKey && rollGridCubes.length) {
+    return;
+  }
+
+  rollGridCacheKey = key;
+  rollGridCubes = buildRollGridCubes(settings);
+  rollGridTime = 0;
+}
+
+function pickRollGridExtents(seed, allowBoxes) {
+  if (!allowBoxes) {
+    return { ex: 1, ey: 1, ez: 1 };
+  }
+
+  /*
+   * Integer edge lengths 1–3. Bias slightly away from
+   * pure cubes so the toggle reads clearly when on.
+   */
+  const axis = (salt) =>
+    1 + Math.floor(unitHash(seed * 0.17 + salt) * 3);
+
+  let ex = axis(1.1);
+  let ey = axis(2.3);
+  let ez = axis(3.7);
+
+  if (ex === ey && ey === ez) {
+    const stretch = 1 + Math.floor(unitHash(seed * 0.41 + 8.2) * 3);
+    const which = Math.floor(unitHash(seed * 0.59 + 4.4) * 3);
+
+    if (which === 0) {
+      ex = stretch;
+    } else if (which === 1) {
+      ey = stretch;
+    } else {
+      ez = stretch;
+    }
+  }
+
+  return { ex, ey, ez };
+}
+
+function getRollGridTravelDir(settings) {
+  const key = settings.rollGridDirection || "x+";
+
+  if (key === "x-") {
+    return { di: -1, dj: 0 };
+  }
+
+  if (key === "z+") {
+    return { di: 0, dj: 1 };
+  }
+
+  if (key === "z-") {
+    return { di: 0, dj: -1 };
+  }
+
+  return { di: 1, dj: 0 };
+}
+
+function getRollGridDirForStep(stepIndex, settings) {
+  if (settings.rollGridMotion === "one-way") {
+    return getRollGridTravelDir(settings);
+  }
+
+  return ROLL_GRID_DIRS[((stepIndex % 4) + 4) % 4];
+}
+
+function getRollGridBoard(settings) {
+  const visible = getVisibleFaceBoard(settings);
+
+  /*
+   * One-direction wraps re-enter from the far edge.
+   * Push that edge past the canvas so new cubes aren't
+   * seen popping in at the frame.
+   */
+  if (settings.rollGridMotion !== "one-way") {
+    return visible;
+  }
+
+  const margin = 8;
+  const dir = getRollGridTravelDir(settings);
+
+  let minI = visible.minI - margin;
+  let maxI = visible.maxI + margin;
+  let minJ = visible.minJ - margin;
+  let maxJ = visible.maxJ + margin;
+
+  /*
+   * Extra runway on the entry side (opposite travel).
+   */
+  if (dir.di > 0) {
+    minI -= margin;
+  } else if (dir.di < 0) {
+    maxI += margin;
+  } else if (dir.dj > 0) {
+    minJ -= margin;
+  } else if (dir.dj < 0) {
+    maxJ += margin;
+  }
+
+  const cells = [];
+
+  for (let j = minJ; j <= maxJ; j++) {
+    for (let i = minI; i <= maxI; i++) {
+      cells.push(coordinateKey(i, j));
+    }
+  }
+
+  return {
+    minI,
+    maxI,
+    minJ,
+    maxJ,
+    cells,
+    visible
+  };
+}
+
+function wrapRollGridPose(i, j, ex, ez, board) {
+  if (!board) {
+    return { i, j };
+  }
+
+  const spanI = board.maxI - board.minI + 1;
+  const spanJ = board.maxJ - board.minJ + 1;
+
+  if (spanI <= 0 || spanJ <= 0) {
+    return { i, j };
+  }
+
+  let ni = i;
+  let nj = j;
+
+  while (ni > board.maxI) {
+    ni -= spanI;
+  }
+
+  while (ni + ex - 1 < board.minI) {
+    ni += spanI;
+  }
+
+  while (nj > board.maxJ) {
+    nj -= spanJ;
+  }
+
+  while (nj + ez - 1 < board.minJ) {
+    nj += spanJ;
+  }
+
+  return { i: ni, j: nj };
+}
+
+function rollGridSlotSize(ex, ey, ez) {
+  return Math.max(1, ex || 1, ey || 1, ez || 1);
+}
+
+/*
+ * Ground footprints permute on tip (height can become
+ * width). Space the lattice for the largest edge so
+ * neighbors never collide after a roll. Desynced
+ * phases need a wider moat so a tip can't land on a
+ * neighbor still at rest.
+ */
+function rollGridWrapCoord(value, min, span) {
+  if (span <= 0) {
+    return value;
+  }
+
+  let v = value;
+
+  while (v > min + span - 0.0001) {
+    v -= span;
+  }
+
+  while (v < min - 0.0001) {
+    v += span;
+  }
+
+  return v;
+}
+
+/*
+ * Map a lattice position into 0–1 across the visible
+ * board along travel, folding through the wrap.
+ */
+function rollGridVisibleTravelT(
+  i,
+  j,
+  ex,
+  ez,
+  visible,
+  dir
+) {
+  const spanI = visible.maxI - visible.minI + 1;
+  const spanJ = visible.maxJ - visible.minJ + 1;
+  const posI =
+    rollGridWrapCoord(
+      i + ex * 0.5,
+      visible.minI,
+      spanI
+    );
+  const posJ =
+    rollGridWrapCoord(
+      j + ez * 0.5,
+      visible.minJ,
+      spanJ
+    );
+
+  if (dir.di !== 0) {
+    let t =
+      (posI - visible.minI) /
+      max(0.0001, spanI - 1);
+
+    if (dir.di < 0) {
+      t = 1 - t;
+    }
+
+    return constrain(t, 0, 1);
+  }
+
+  let t =
+    (posJ - visible.minJ) /
+    max(0.0001, spanJ - 1);
+
+  if (dir.dj < 0) {
+    t = 1 - t;
+  }
+
+  return constrain(t, 0, 1);
+}
+
+function rollGridUsesPerCubeTime(settings) {
+  const motion = settings.rollGridMotion;
+
+  return (
+    motion === "radial" ||
+    (
+      motion === "one-way" &&
+      (settings.rollGridDestOffset || 0) > 0.001
+    )
+  );
+}
+
+function initRollGridOneWayPhases(settings, cubes) {
+  const bias = max(0, settings.rollGridDestOffset || 0);
+
+  if (
+    bias <= 0.001 ||
+    settings.rollGridMotion !== "one-way" ||
+    !rollGridBoard
+  ) {
+    return;
+  }
+
+  const visible =
+    rollGridBoard.visible || rollGridBoard;
+  const dir = getRollGridTravelDir(settings);
+
+  for (const cube of cubes) {
+    const t = rollGridVisibleTravelT(
+      cube.homeI,
+      cube.homeJ,
+      cube.homeEx,
+      cube.homeEz,
+      visible,
+      dir
+    );
+
+    cube.localTime = bias * t;
+  }
+}
+
+function rollGridStepForExtents(ex, ey, ez, settings) {
+  const slot = rollGridSlotSize(ex, ey, ez);
+  const motion = settings.rollGridMotion;
+  const desynced =
+    motion === "radial" ||
+    motion === "offset-center";
+
+  if (desynced) {
+    return slot * 2 + 1;
+  }
+
+  return slot + 1;
+}
+
+function rollGridFootprintKeys(i, j, ex, ez, pad = 0) {
+  const keys = [];
+
+  for (let jj = j - pad; jj < j + ez + pad; jj++) {
+    for (let ii = i - pad; ii < i + ex + pad; ii++) {
+      keys.push(coordinateKey(ii, jj));
+    }
+  }
+
+  return keys;
+}
+
+function rollGridFootprintFits(board, occupied, i, j, ex, ez) {
+  for (let jj = j; jj < j + ez; jj++) {
+    for (let ii = i; ii < i + ex; ii++) {
+      if (
+        ii < board.minI ||
+        ii > board.maxI ||
+        jj < board.minJ ||
+        jj > board.maxJ ||
+        occupied.has(coordinateKey(ii, jj))
+      ) {
+        return false;
+      }
+    }
+  }
+
+  /*
+   * Keep a 1-cell moat around each footprint so
+   * neighbors never share an edge or corner gap.
+   */
+  for (const key of rollGridFootprintKeys(i, j, ex, ez, 1)) {
+    if (occupied.has(key)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function pushRollGridCube(
+  cubes,
+  i,
+  j,
+  extents,
+  colorIndex
+) {
+  const midI = i + extents.ex * 0.5;
+  const midJ = j + extents.ez * 0.5;
+
+  cubes.push({
+    homeI: i,
+    homeJ: j,
+    homeEx: extents.ex,
+    homeEy: extents.ey,
+    homeEz: extents.ez,
+    localTime: 0,
+    simStep: 0,
+    i,
+    j,
+    ex: extents.ex,
+    ey: extents.ey,
+    ez: extents.ez,
+    /*
+     * Which baked face paint sits on each world
+     * slot (bottom, top, +X, -X, +Z, -Z). Tips
+     * permute this so colors ride with the box.
+     */
+    facePaint: [0, 1, 2, 3, 4, 5],
+    colorIndex,
+    distNorm: 0,
+    midI,
+    midJ
+  });
+
+  return { midI, midJ };
+}
+
+function finishRollGridDistances(cubes) {
+  if (cubes.length === 0) {
+    return cubes;
+  }
+
+  let centerI = 0;
+  let centerJ = 0;
+
+  for (const cube of cubes) {
+    centerI += cube.midI;
+    centerJ += cube.midJ;
+  }
+
+  centerI /= cubes.length;
+  centerJ /= cubes.length;
+
+  let maxDist = 0.0001;
+
+  for (const cube of cubes) {
+    const dist = Math.hypot(
+      cube.midI - centerI,
+      cube.midJ - centerJ
+    );
+
+    cube.distFromCenter = dist;
+    maxDist = Math.max(maxDist, dist);
+  }
+
+  for (const cube of cubes) {
+    cube.distNorm = cube.distFromCenter / maxDist;
+  }
+
+  return cubes;
+}
+
+function buildRollGridCubes(settings) {
+  const board = getRollGridBoard(settings);
+  rollGridBoard = board;
+
+  const allowBoxes = Boolean(settings.allowBoxExtents);
+  const uniform = Boolean(settings.rollGridUniform);
+  const cubes = [];
+
+  if (uniform) {
+    const extents = pickRollGridExtents(
+      placementSeed + 19,
+      allowBoxes
+    );
+    const step = allowBoxes
+      ? rollGridStepForExtents(
+          extents.ex,
+          extents.ey,
+          extents.ez,
+          settings
+        )
+      : 2;
+
+    for (
+      let j = board.minJ;
+      j + extents.ez - 1 <= board.maxJ;
+      j += step
+    ) {
+      for (
+        let i = board.minI;
+        i + extents.ex - 1 <= board.maxI;
+        i += step
+      ) {
+        pushRollGridCube(
+          cubes,
+          i,
+          j,
+          extents,
+          cubes.length
+        );
+      }
+    }
+
+    initRollGridOneWayPhases(settings, cubes);
+
+    return finishRollGridDistances(cubes);
+  }
+
+  const occupied = new Set();
+  const candidates = [];
+
+  for (let j = board.minJ; j <= board.maxJ; j++) {
+    for (let i = board.minI; i <= board.maxI; i++) {
+      candidates.push({
+        i,
+        j,
+        order: cellHash(
+          coordinateKey(i, j),
+          placementSeed + 71
+        )
+      });
+    }
+  }
+
+  candidates.sort((a, b) => a.order - b.order);
+
+  for (const slot of candidates) {
+    const extents = pickRollGridExtents(
+      slot.order * 1000 + placementSeed,
+      allowBoxes
+    );
+
+    /*
+     * Reserve a square covering every tip orientation
+     * of this box, plus the motion moat.
+     */
+    const reserve = allowBoxes
+      ? rollGridStepForExtents(
+          extents.ex,
+          extents.ey,
+          extents.ez,
+          settings
+        ) - 1
+      : 1;
+
+    if (
+      !rollGridFootprintFits(
+        board,
+        occupied,
+        slot.i,
+        slot.j,
+        reserve,
+        reserve
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      slot.i + extents.ex - 1 > board.maxI ||
+      slot.j + extents.ez - 1 > board.maxJ
+    ) {
+      continue;
+    }
+
+    for (const key of rollGridFootprintKeys(
+      slot.i,
+      slot.j,
+      reserve,
+      reserve,
+      0
+    )) {
+      occupied.add(key);
+    }
+
+    pushRollGridCube(
+      cubes,
+      slot.i,
+      slot.j,
+      extents,
+      cubes.length
+    );
+  }
+
+  initRollGridOneWayPhases(settings, cubes);
+
+  return finishRollGridDistances(cubes);
+}
+
+function tipRollGridBox(i, j, ex, ey, ez, dir) {
+  if (dir.di === 1) {
+    return {
+      i: i + ex,
+      j,
+      ex: ey,
+      ey: ex,
+      ez
+    };
+  }
+
+  if (dir.di === -1) {
+    return {
+      i: i - ey,
+      j,
+      ex: ey,
+      ey: ex,
+      ez
+    };
+  }
+
+  if (dir.dj === 1) {
+    return {
+      i,
+      j: j + ez,
+      ex,
+      ey: ez,
+      ez: ey
+    };
+  }
+
+  return {
+    i,
+    j: j - ey,
+    ex,
+    ey: ez,
+    ez: ey
+  };
+}
+
+/*
+ * Face slots: 0 bottom, 1 top, 2 +X, 3 -X, 4 +Z, 5 -Z.
+ * After a tip, paints move with the physical faces.
+ */
+function tipRollGridFacePaint(facePaint, dir) {
+  const p = facePaint;
+
+  if (dir.di === 1) {
+    return [p[2], p[3], p[1], p[0], p[4], p[5]];
+  }
+
+  if (dir.di === -1) {
+    return [p[3], p[2], p[0], p[1], p[4], p[5]];
+  }
+
+  if (dir.dj === 1) {
+    return [p[4], p[5], p[2], p[3], p[1], p[0]];
+  }
+
+  return [p[5], p[4], p[2], p[3], p[0], p[1]];
+}
+
+function syncRollGridCubeToStep(cube, stepIndex, settings) {
+  let target = Math.max(0, stepIndex | 0);
+  const oneWay = settings.rollGridMotion === "one-way";
+
+  if (cube.simStep === target) {
+    return;
+  }
+
+  if (target < cube.simStep) {
+    if (target !== 0) {
+      return;
+    }
+
+    cube.i = cube.homeI;
+    cube.j = cube.homeJ;
+    cube.ex = cube.homeEx;
+    cube.ey = cube.homeEy;
+    cube.ez = cube.homeEz;
+    cube.facePaint = [0, 1, 2, 3, 4, 5];
+    cube.simStep = 0;
+  }
+
+  while (cube.simStep < target) {
+    const dir = getRollGridDirForStep(
+      cube.simStep,
+      settings
+    );
+    const next = tipRollGridBox(
+      cube.i,
+      cube.j,
+      cube.ex,
+      cube.ey,
+      cube.ez,
+      dir
+    );
+
+    cube.i = next.i;
+    cube.j = next.j;
+    cube.ex = next.ex;
+    cube.ey = next.ey;
+    cube.ez = next.ez;
+    cube.facePaint = tipRollGridFacePaint(
+      cube.facePaint,
+      dir
+    );
+
+    if (oneWay) {
+      const wrapped = wrapRollGridPose(
+        cube.i,
+        cube.j,
+        cube.ex,
+        cube.ez,
+        rollGridBoard
+      );
+
+      cube.i = wrapped.i;
+      cube.j = wrapped.j;
+    }
+
+    cube.simStep += 1;
+  }
+}
+
+function rollGridSpeedMul(cube, settings) {
+  if (settings.rollGridMotion !== "radial") {
+    return 1;
+  }
+
+  const bias = max(0, settings.rollGridRadialBias || 0);
+
+  /*
+   * bias 1.0 → center tips at 2× edge rate;
+   * bias 4.0 → center at 5× edge rate.
+   */
+  return 1 + bias * (1 - cube.distNorm);
+}
+
+/*
+ * Same tip rate everywhere; center sits further along
+ * the shared period. bias 1 → up to one tip ahead.
+ */
+function rollGridPhaseOffset(cube, settings) {
+  if (settings.rollGridMotion === "offset-center") {
+    const bias = max(0, settings.rollGridRadialBias || 0);
+
+    return bias * (1 - cube.distNorm);
+  }
+
+  return 0;
+}
+
+function rollGridTipRatePerSec(settings) {
+  /*
+   * One timeline unit = one roll. Previously added
+   * animationSpeed * 1.35 per frame (~60 fps).
+   */
+  return settings.animationSpeed * 1.35 * 60;
+}
+
+function rollGridPauseUnits(settings) {
+  const pauseSec =
+    max(0, Number(settings.rollGridPause) || 0);
+
+  if (pauseSec <= 0) {
+    return 0;
+  }
+
+  return pauseSec * rollGridTipRatePerSec(settings);
+}
+
+function rollGridStepState(timeline, settings) {
+  const pause = rollGridPauseUnits(settings);
+  const stepSize = 1 + pause;
+  const stepIndex = floor(max(0, timeline) / stepSize);
+  const local = timeline - stepIndex * stepSize;
+  const tipProgress =
+    local < pause
+      ? 0
+      : constrain((local - pause) / 1, 0, 0.999999);
+
+  return { stepIndex, tipProgress };
+}
+
+function updateRollGrid(settings) {
+  ensureRollGrid(settings);
+
+  const dt =
+    (typeof deltaTime === "number" && deltaTime > 0
+      ? deltaTime
+      : 1000 / 60) / 1000;
+
+  const tipRate = rollGridTipRatePerSec(settings);
+
+  if (rollGridUsesPerCubeTime(settings)) {
+    for (const cube of rollGridCubes) {
+      cube.localTime +=
+        dt *
+        tipRate *
+        rollGridSpeedMul(cube, settings);
+    }
+
+    return;
+  }
+
+  rollGridTime += dt * tipRate;
+}
+
+function drawRollGrid(settings) {
+  ensureRollGrid(settings);
+
+  const sharedTime = !rollGridUsesPerCubeTime(settings);
+
+  for (const cube of rollGridCubes) {
+    const timeline = sharedTime
+      ? rollGridTime + rollGridPhaseOffset(cube, settings)
+      : cube.localTime;
+
+    const { stepIndex, tipProgress } =
+      rollGridStepState(timeline, settings);
+
+    syncRollGridCubeToStep(cube, stepIndex, settings);
+
+    const dir = getRollGridDirForStep(
+      stepIndex,
+      settings
+    );
+
+    drawRollingCube(
+      cube.i,
+      cube.j,
+      cube.ex,
+      cube.ey,
+      cube.ez,
+      dir,
+      tipProgress,
+      getNetColor(cube.colorIndex, settings),
+      settings,
+      cube.colorIndex,
+      cube.facePaint
+    );
+  }
+}
+
+function rollGridBottomCenter(i, j, ex, ez, faceSize) {
+  return {
+    x: (i + ex * 0.5) * faceSize,
+    z: (j + ez * 0.5) * faceSize
+  };
+}
+
+function drawRollingCube(
+  plantI,
+  plantJ,
+  ex,
+  ey,
+  ez,
+  dir,
+  tipProgress,
+  netColor,
+  settings,
+  seed = 0,
+  facePaint = null
+) {
+  const faceSize = settings.faceSize;
+  const wx = ex * faceSize;
+  const hy = ey * faceSize;
+  const wz = ez * faceSize;
+  const origin = rollGridBottomCenter(
+    plantI,
+    plantJ,
+    ex,
+    ez,
+    faceSize
+  );
+
+  const angled =
+    applyMotionCurve(
+      constrain(tipProgress, 0, 1),
+      settings.cascadeMotionCurve || "ease"
+    ) * HALF_PI;
+
+  const pivotX =
+    origin.x + dir.di * (wx * 0.5);
+  const pivotZ =
+    origin.z + dir.dj * (wz * 0.5);
+
+  push();
+  translate(pivotX, 0, pivotZ);
+
+  if (dir.di !== 0) {
+    rotateZ(-dir.di * angled);
+  } else {
+    rotateX(dir.dj * angled);
+  }
+
+  translate(-pivotX, 0, -pivotZ);
+  drawSolidBox(
+    origin.x,
+    origin.z,
+    wx,
+    hy,
+    wz,
+    netColor,
+    settings,
+    seed,
+    facePaint
+  );
+  pop();
+}
+
+function drawSolidBox(
+  ox,
+  oz,
+  wx,
+  hy,
+  wz,
+  netColor,
+  settings,
+  seed = 0,
+  facePaint = null
+) {
+  const hx = wx * 0.5;
+  const hz = wz * 0.5;
+  const hy2 = hy * 0.5;
+  const innerBaseColor =
+    isTwoToneColorMode(settings.colorMode)
+      ? color(settings.innerColor)
+      : null;
+
+  const paint =
+    facePaint || [0, 1, 2, 3, 4, 5];
+
+  const flatSettings = {
+    ...settings,
+    showFaceShading: false
+  };
+
+  /*
+   * drawConnectedFace scales unit u/v by faceSize/2.
+   * For rectangles, pre-bake half-extents into u/v and
+   * pass faceSize = 2 so that scale factor is 1.
+   */
+  const faces = [
+    {
+      center: [ox, 0, oz],
+      u: [hx, 0, 0],
+      v: [0, 0, hz],
+      normal: [0, -1, 0],
+      faceSize: 2
+    },
+    {
+      center: [ox, hy, oz],
+      u: [hx, 0, 0],
+      v: [0, 0, -hz],
+      normal: [0, 1, 0],
+      faceSize: 2
+    },
+    {
+      center: [ox + hx, hy2, oz],
+      u: [0, 0, hz],
+      v: [0, hy2, 0],
+      normal: [1, 0, 0],
+      faceSize: 2
+    },
+    {
+      center: [ox - hx, hy2, oz],
+      u: [0, 0, -hz],
+      v: [0, hy2, 0],
+      normal: [-1, 0, 0],
+      faceSize: 2
+    },
+    {
+      center: [ox, hy2, oz + hz],
+      u: [-hx, 0, 0],
+      v: [0, hy2, 0],
+      normal: [0, 0, 1],
+      faceSize: 2
+    },
+    {
+      center: [ox, hy2, oz - hz],
+      u: [hx, 0, 0],
+      v: [0, hy2, 0],
+      normal: [0, 0, -1],
+      faceSize: 2
+    }
+  ];
+
+  for (let faceIndex = 0; faceIndex < faces.length; faceIndex++) {
+    const face = faces[faceIndex];
+    const paintIndex = paint[faceIndex];
+    const faceColor = color(
+      getFaceOuterColor(
+        paintIndex,
+        netColor,
+        settings,
+        seed
+      )
+    );
+
+    drawConnectedFace(
+      {
+        center: face.center,
+        u: face.u,
+        v: face.v,
+        normal: face.normal
+      },
+      faceColor,
+      1,
+      flatSettings,
+      innerBaseColor,
+      face.faceSize,
+      true
+    );
+  }
+}
+
+function drawSolidCube(
+  ox,
+  oz,
+  size,
+  netColor,
+  settings,
+  seed = 0
+) {
+  drawSolidBox(
+    ox,
+    oz,
+    size,
+    size,
+    size,
+    netColor,
+    settings,
+    seed
+  );
+}
+
+
+/* ---------------------------------------------------------
+   INSIDE OUT — evert through a random side wall downward
+--------------------------------------------------------- */
+
+const INSIDE_OUT_DEST_DIR = { di: 0, dj: 1 };
+
+function ensureInsideOut(settings) {
+  const key = [
+    "inside-out",
+    settings.faceSize.toFixed(5),
+    settings.cameraZoom.toFixed(3),
+    settings.gridSize,
+    allowedTypesCacheKey(settings),
+    scaleWeightsCacheKey(settings),
+    Number(settings.insideOutGridFullness || 0).toFixed(3),
+    placementSeed,
+    width,
+    height
+  ].join("|");
+
+  if (key === insideOutCacheKey && insideOutCubes.length) {
+    return;
+  }
+
+  insideOutCacheKey = key;
+  insideOutCubes = buildInsideOutCubes(settings);
+  insideOutTime = 0;
+}
+
+function pickInsideOutHingeDir(seed) {
+  const index =
+    floor(unitHash(seed * 0.73 + 4.1) * 4) % 4;
+
+  return ROLL_GRID_DIRS[index];
+}
+
+function findInsideOutNet(
+  startI,
+  startJ,
+  hingeDir,
+  settings
+) {
+  const destI = startI + INSIDE_OUT_DEST_DIR.di;
+  const destJ = startJ + INSIDE_OUT_DEST_DIR.dj;
+  const hingeI = startI + hingeDir.di;
+  const hingeJ = startJ + hingeDir.dj;
+  const allowed = getAllowedTypeIndexes(settings);
+
+  for (const typeIndex of allowed) {
+    const base = CUBE_NETS[typeIndex];
+
+    for (let flip = 0; flip < 2; flip++) {
+      for (let rot = 0; rot < 4; rot++) {
+        const local = normalizeCells(
+          transformCells(base, rot, flip === 1)
+        );
+
+        for (const anchor of local) {
+          const ox = startI - anchor[0];
+          const oy = startJ - anchor[1];
+          const cells = local.map((cell) => [
+            cell[0] + ox,
+            cell[1] + oy
+          ]);
+          const net = prepareNet(cells);
+          const startIndex = getNetFaceIndexAt(
+            net,
+            startI,
+            startJ
+          );
+          const hingeIndex = getNetFaceIndexAt(
+            net,
+            hingeI,
+            hingeJ
+          );
+          const destIndex = getNetFaceIndexAt(
+            net,
+            destI,
+            destJ
+          );
+
+          if (
+            startIndex === hingeIndex ||
+            startIndex === destIndex ||
+            hingeIndex === destIndex
+          ) {
+            continue;
+          }
+
+          if (
+            net.faces[startIndex] &&
+            net.faces[hingeIndex] &&
+            net.faces[destIndex]
+          ) {
+            return {
+              typeIndex,
+              cells,
+              net,
+              startIndex,
+              hingeIndex,
+              destIndex
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function insideOutPlacementKeys(cells, scale) {
+  return footprintKeys(cells, max(1, scale || 1));
+}
+
+function insideOutReserveKeys(cells, scale) {
+  const edge = max(1, scale || 1);
+  const keys = [];
+  let minI = Infinity;
+  let maxI = -Infinity;
+  let minJ = Infinity;
+  let maxJ = -Infinity;
+
+  for (const cell of expandCellsToFootprint(cells, edge)) {
+    minI = min(minI, cell[0]);
+    maxI = max(maxI, cell[0]);
+    minJ = min(minJ, cell[1]);
+    maxJ = max(maxJ, cell[1]);
+  }
+
+  for (let j = minJ - 1; j <= maxJ + 1; j++) {
+    for (let i = minI - 1; i <= maxI + 1; i++) {
+      keys.push(coordinateKey(i, j));
+    }
+  }
+
+  return keys;
+}
+
+function insideOutRestKeys(cube) {
+  const scale = max(1, cube.scale || 1);
+
+  return footprintKeys(
+    [[cube.i, cube.j]],
+    scale
+  );
+}
+
+function insideOutAnimating(cube) {
+  return (
+    cube.phase === "unravel" ||
+    cube.phase === "refold" ||
+    cube.phase === "flip"
+  ) && cube.phaseProgress > 0.001;
+}
+
+function getInsideOutClaimKeys(cube) {
+  const scale = max(1, cube.scale || 1);
+
+  if (
+    insideOutAnimating(cube) &&
+    cube.cells
+  ) {
+    return insideOutReserveKeys(cube.cells, scale);
+  }
+
+  return insideOutRestKeys(cube);
+}
+
+function buildInsideOutOccupancy(exceptCube = null) {
+  const occupied = new Set();
+
+  for (const cube of insideOutCubes) {
+    if (cube === exceptCube) {
+      continue;
+    }
+
+    for (const key of getInsideOutClaimKeys(cube)) {
+      occupied.add(key);
+    }
+  }
+
+  return occupied;
+}
+
+function insideOutPlanFits(
+  plan,
+  board,
+  occupied,
+  scale
+) {
+  const edge = max(1, scale || 1);
+  const footprint =
+    expandCellsToFootprint(plan.cells, edge);
+
+  for (const cell of footprint) {
+    if (
+      cell[0] < board.minI ||
+      cell[0] > board.maxI ||
+      cell[1] < board.minJ ||
+      cell[1] > board.maxJ
+    ) {
+      return false;
+    }
+  }
+
+  for (const key of insideOutPlacementKeys(
+    plan.cells,
+    edge
+  )) {
+    if (occupied.has(key)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function getInsideOutRestDrawState(cube, settings) {
+  if (cube.inverted) {
+    if (insideOutUsesFlatPause(settings)) {
+      return {
+        foldProgress: 1,
+        plantIndex: cube.destIndex,
+        invertFold: true,
+        insideOutFlow: false
+      };
+    }
+
+    return {
+      foldProgress: 1,
+      plantIndex: cube.hingeIndex,
+      invertFold: false,
+      insideOutFlow: true
+    };
+  }
+
+  return {
+    foldProgress: 1,
+    plantIndex: cube.startIndex,
+    invertFold: false,
+    insideOutFlow: false
+  };
+}
+
+function commitInsideOutCycle(cube, settings) {
+  cube.inverted = !cube.inverted;
+
+  const rest =
+    getInsideOutRestDrawState(cube, settings);
+  const face =
+    cube.net &&
+    cube.net.faces[rest.plantIndex];
+
+  if (face) {
+    cube.i = face.gridX;
+    cube.j = face.gridY;
+  }
+}
+
+function syncInsideOutCubeToCycle(
+  cube,
+  cycleIndex,
+  settings
+) {
+  while (cube.simCycle < cycleIndex) {
+    commitInsideOutCycle(cube, settings);
+    cube.simCycle += 1;
+  }
+}
+
+function insideOutCycleLength(settings) {
+  const pause = insideOutPauseUnits(settings);
+  return (1 + pause) * 2;
+}
+
+function insideOutCycleStart(phase, progress) {
+  return (
+    (phase === "unravel" ||
+      phase === "flip") &&
+    progress <= 0
+  );
+}
+
+function drawInsideOutNet(
+  cube,
+  drawState,
+  netColor,
+  settings,
+  size
+) {
+  const scale = max(1, cube.scale || 1);
+  const plantFace =
+    cube.net.faces[drawState.plantIndex] ||
+    cube.net.faces[0];
+  const origin = worldOriginForFace(
+    plantFace.gridX,
+    plantFace.gridY,
+    scale,
+    size
+  );
+
+  drawNet(
+    cube.net,
+    origin.x,
+    origin.z,
+    netColor,
+    settings,
+    cube.creaseStyle,
+    cube.seed,
+    0,
+    {
+      foldMode: "one-side",
+      foldProgress: drawState.foldProgress,
+      plantFaceIndex: drawState.plantIndex,
+      useOriginAsPlant: true,
+      drapeAmount: 0,
+      cubeScale: scale,
+      invertFold: drawState.invertFold,
+      insideOutFlow: drawState.insideOutFlow,
+      motionCurve:
+        settings.cascadeMotionCurve || "ease"
+    }
+  );
+}
+
+function buildInsideOutCubes(settings) {
+  const board = getVisibleFaceBoard(settings);
+  insideOutBoard = board;
+  const fullness = constrain(
+    settings.insideOutGridFullness || 0,
+    0,
+    1
+  );
+  const candidates = [];
+
+  for (let j = board.minJ; j <= board.maxJ; j++) {
+    for (let i = board.minI; i <= board.maxI; i++) {
+      candidates.push({
+        i,
+        j,
+        order: cellHash(
+          coordinateKey(i, j),
+          placementSeed + 131
+        )
+      });
+    }
+  }
+
+  candidates.sort((a, b) => a.order - b.order);
+
+  const occupied = new Set();
+  const packed = [];
+
+  for (const slot of candidates) {
+    const restKey =
+      coordinateKey(slot.i, slot.j);
+
+    if (occupied.has(restKey)) {
+      continue;
+    }
+
+    const seed =
+      packed.length * 97.3 +
+      placementSeed * 0.013 +
+      slot.order * 13.1;
+    const scale =
+      pickCubeScale(seed * 1.31, settings);
+    let plan = null;
+    let hingeDir = null;
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const dir = pickInsideOutHingeDir(
+        seed + attempt * 17.9
+      );
+      const candidate = findInsideOutNet(
+        slot.i,
+        slot.j,
+        dir,
+        settings
+      );
+
+      if (
+        candidate &&
+        insideOutPlanFits(
+          candidate,
+          board,
+          occupied,
+          scale
+        )
+      ) {
+        plan = candidate;
+        hingeDir = dir;
+        break;
+      }
+    }
+
+    if (!plan) {
+      continue;
+    }
+
+    for (const key of insideOutPlacementKeys(
+      plan.cells,
+      scale
+    )) {
+      occupied.add(key);
+    }
+
+    packed.push({
+      i: slot.i,
+      j: slot.j,
+      seed,
+      scale,
+      hingeDir,
+      typeIndex: plan.typeIndex,
+      creaseStyle:
+        floor(unitHash(seed * 1.7) * 5),
+      colorIndex:
+        pickAllowedTypeIndex(
+          seed,
+          settings
+        ),
+      inverted: false,
+      simCycle: 0,
+      net: plan.net,
+      cells: plan.cells,
+      startIndex: plan.startIndex,
+      hingeIndex: plan.hingeIndex,
+      destIndex: plan.destIndex,
+      phase: "rest",
+      phaseProgress: 0
+    });
+  }
+
+  const targetCount = max(
+    0,
+    floor(packed.length * fullness)
+  );
+
+  return packed.slice(0, targetCount);
+}
+
+function insideOutFlipRatePerSec(settings) {
+  return settings.animationSpeed * 1.1 * 60;
+}
+
+function insideOutPauseUnits(settings) {
+  const pauseSec =
+    max(0, Number(settings.insideOutPause) || 0);
+
+  if (pauseSec <= 0) {
+    return 0;
+  }
+
+  return pauseSec * insideOutFlipRatePerSec(settings);
+}
+
+function getInsideOutDrawState(
+  cube,
+  phase,
+  progress,
+  settings
+) {
+  if (phase === "unravel") {
+    if (cube.inverted) {
+      return {
+        foldProgress: 1 - progress,
+        plantIndex: cube.destIndex,
+        invertFold: true,
+        insideOutFlow: false
+      };
+    }
+
+    return {
+      foldProgress: 1 - progress,
+      plantIndex: cube.hingeIndex,
+      invertFold: false,
+      insideOutFlow: false
+    };
+  }
+
+  if (phase === "refold") {
+    if (cube.inverted) {
+      return {
+        foldProgress: progress,
+        plantIndex: cube.startIndex,
+        invertFold: false,
+        insideOutFlow: false
+      };
+    }
+
+    return {
+      foldProgress: progress,
+      plantIndex: cube.destIndex,
+      invertFold: true,
+      insideOutFlow: false
+    };
+  }
+
+  if (phase === "flip") {
+    if (cube.inverted) {
+      return {
+        foldProgress: 1 - progress,
+        plantIndex: cube.hingeIndex,
+        invertFold: false,
+        insideOutFlow: true
+      };
+    }
+
+    return {
+      foldProgress: progress,
+      plantIndex: cube.hingeIndex,
+      invertFold: false,
+      insideOutFlow: true
+    };
+  }
+
+  return getInsideOutRestDrawState(cube, settings);
+}
+
+function insideOutUsesFlatPause(settings) {
+  return (
+    settings.insideOutFlatStop ||
+    "pause-flat"
+  ) !== "continuous";
+}
+
+function insideOutCycleState(timeline, settings) {
+  const pause = insideOutPauseUnits(settings);
+  const phaseSize = 1 + pause;
+
+  if (insideOutUsesFlatPause(settings)) {
+    const cycleLength = phaseSize * 2;
+    const cycleIndex =
+      floor(max(0, timeline) / cycleLength);
+    const local =
+      timeline - cycleIndex * cycleLength;
+
+    if (local < phaseSize) {
+      const active = local < pause
+        ? 0
+        : constrain(
+            (local - pause) / 1,
+            0,
+            0.999999
+          );
+
+      return {
+        cycleIndex,
+        phase: "unravel",
+        progress: active
+      };
+    }
+
+    const refoldLocal = local - phaseSize;
+    const active = refoldLocal < pause
+      ? 0
+      : constrain(
+          (refoldLocal - pause) / 1,
+          0,
+          0.999999
+        );
+
+    return {
+      cycleIndex,
+      phase: "refold",
+      progress: active
+    };
+  }
+
+  /*
+   * Flow through: same total cycle length as pause-flat
+   * but one continuous motion that never fully opens.
+   */
+  const cycleLength = phaseSize * 2;
+  const cycleIndex =
+    floor(max(0, timeline) / cycleLength);
+  const local = timeline - cycleIndex * cycleLength;
+  const activeSpan = max(0.0001, cycleLength - pause);
+  const active = local < pause
+    ? 0
+    : constrain(
+        (local - pause) / activeSpan,
+        0,
+        0.999999
+      );
+
+  return {
+    cycleIndex,
+    phase: "flip",
+    progress: active
+  };
+}
+
+function updateInsideOut(settings) {
+  ensureInsideOut(settings);
+
+  const dt =
+    (typeof deltaTime === "number" && deltaTime > 0
+      ? deltaTime
+      : 1000 / 60) / 1000;
+
+  insideOutTime += dt * insideOutFlipRatePerSec(settings);
+}
+
+function drawInsideOut(settings) {
+  ensureInsideOut(settings);
+
+  const size = settings.faceSize;
+
+  for (const cube of insideOutCubes) {
+    const netColor = getNetColor(
+      cube.colorIndex,
+      settings
+    );
+
+    if (!cube.net) {
+      continue;
+    }
+
+    const phaseOffset =
+      unitHash(cube.seed * 0.31 + 2.7) * 3.5;
+    const timeline =
+      insideOutTime + phaseOffset;
+
+    let { cycleIndex, phase, progress } =
+      insideOutCycleState(
+        timeline,
+        settings
+      );
+
+    syncInsideOutCubeToCycle(
+      cube,
+      cycleIndex,
+      settings
+    );
+
+    cube.phase = phase;
+    cube.phaseProgress = progress;
+
+    if (insideOutCycleStart(phase, progress)) {
+      drawInsideOutNet(
+        cube,
+        getInsideOutRestDrawState(
+          cube,
+          settings
+        ),
+        netColor,
+        settings,
+        size
+      );
+      continue;
+    }
+
+    drawInsideOutNet(
+      cube,
+      getInsideOutDrawState(
+        cube,
+        phase,
+        progress,
+        settings
+      ),
+      netColor,
+      settings,
+      size
+    );
+  }
+}
+
+
+/* ---------------------------------------------------------
+   WANDER — random roll / unfold on a partial grid
+--------------------------------------------------------- */
+
+function getWanderBaseCacheKey(settings) {
+  return [
+    "wander",
+    settings.gridSize,
+    settings.cameraZoom.toFixed(3),
+    allowedTypesCacheKey(settings),
+    Number(settings.wanderGridFullness || 0).toFixed(3),
+    placementSeed,
+    width,
+    height
+  ].join("|");
+}
+
+function getNetFaceIndexAt(net, gridX, gridY) {
+  if (!net || !net.faces) {
+    return 0;
+  }
+
+  for (const face of net.faces) {
+    if (
+      face.gridX === gridX &&
+      face.gridY === gridY
+    ) {
+      return face.index;
+    }
+  }
+
+  return 0;
+}
+
+function ensureWanderAgents(settings) {
+  const key = getWanderBaseCacheKey(settings);
+
+  if (key === wanderCacheKey && wanderAgents.length) {
+    return;
+  }
+
+  wanderCacheKey = key;
+  wanderAgents = buildWanderAgents(settings);
+}
+
+function scheduleWanderWait(agent, settings) {
+  const maxInterval = max(
+    0.05,
+    Number(settings.wanderActionInterval) || 2
+  );
+
+  agent.waitDelay =
+    unitHash(
+      agent.seed * 0.41 +
+      wanderTime * 0.17 +
+      agent.i * 0.13 +
+      agent.j * 0.07
+    ) * maxInterval;
+
+  agent.waitTimer = 0;
+}
+
+function buildWanderAgents(settings) {
+  const board = getVisibleFaceBoard(settings);
+  const fullness = constrain(
+    settings.wanderGridFullness || 0,
+    0,
+    1
+  );
+  const candidates = [];
+
+  for (let j = board.minJ; j <= board.maxJ; j++) {
+    for (let i = board.minI; i <= board.maxI; i++) {
+      candidates.push({
+        i,
+        j,
+        order: cellHash(
+          coordinateKey(i, j),
+          placementSeed + 89
+        )
+      });
+    }
+  }
+
+  candidates.sort((a, b) => a.order - b.order);
+
+  const targetCount = max(
+    0,
+    floor(candidates.length * fullness)
+  );
+  const occupied = new Set();
+  const agents = [];
+
+  for (const slot of candidates) {
+    if (agents.length >= targetCount) {
+      break;
+    }
+
+    const key = coordinateKey(slot.i, slot.j);
+
+    if (occupied.has(key)) {
+      continue;
+    }
+
+    occupied.add(key);
+
+    const seed =
+      agents.length * 97.3 +
+      placementSeed * 0.013 +
+      slot.order * 13.1;
+    const typeIndex =
+      pickAllowedTypeIndex(seed, settings);
+
+    const agent = {
+      id: agents.length,
+      seed,
+      colorIndex: typeIndex,
+      typeIndex,
+      creaseStyle: floor(unitHash(seed * 1.7) * 5),
+      i: slot.i,
+      j: slot.j,
+      ex: 1,
+      ey: 1,
+      ez: 1,
+      facePaint: [0, 1, 2, 3, 4, 5],
+      phase: "folded",
+      animProgress: 0,
+      waitTimer: 0,
+      waitDelay: 0,
+      rollDir: null,
+      net: null,
+      cells: null,
+      travelUnfold: false,
+      trailingIndex: 0,
+      leadingIndex: 0,
+      plantFaceIndex: 0
+    };
+
+    scheduleWanderWait(agent, settings);
+    agent.waitTimer =
+      unitHash(seed * 0.23) * agent.waitDelay;
+    agents.push(agent);
+  }
+
+  return agents;
+}
+
+function wanderAgentIsFolded(agent) {
+  return (
+    agent.phase === "folded" ||
+    agent.phase === "rolling"
+  );
+}
+
+function getWanderClaimKeys(agent) {
+  if (agent.phase === "rolling" && agent.rollDir) {
+    const ex = agent.ex || 1;
+    const ey = agent.ey || 1;
+    const ez = agent.ez || 1;
+    const next = tipRollGridBox(
+      agent.i,
+      agent.j,
+      ex,
+      ey,
+      ez,
+      agent.rollDir
+    );
+
+    return [
+      coordinateKey(agent.i, agent.j),
+      coordinateKey(next.i, next.j)
+    ];
+  }
+
+  if (
+    wanderAgentIsFolded(agent) ||
+    !agent.cells
+  ) {
+    const keys = [];
+    const ex = max(1, agent.ex || 1);
+    const ez = max(1, agent.ez || 1);
+
+    for (let jj = agent.j; jj < agent.j + ez; jj++) {
+      for (let ii = agent.i; ii < agent.i + ex; ii++) {
+        keys.push(coordinateKey(ii, jj));
+      }
+    }
+
+    return keys;
+  }
+
+  return footprintKeys(agent.cells, 1);
+}
+
+function buildWanderOccupancy(exceptAgent = null) {
+  const occupied = new Set();
+
+  for (const agent of wanderAgents) {
+    if (agent === exceptAgent) {
+      continue;
+    }
+
+    for (const key of getWanderClaimKeys(agent)) {
+      occupied.add(key);
+    }
+  }
+
+  return occupied;
+}
+
+function wanderCellsFitBoard(cells, board) {
+  for (const cell of cells) {
+    if (
+      cell[0] < board.minI ||
+      cell[0] > board.maxI ||
+      cell[1] < board.minJ ||
+      cell[1] > board.maxJ
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function wanderRollFits(
+  i,
+  j,
+  ex,
+  ey,
+  ez,
+  dir,
+  board,
+  occupied,
+  ownKey
+) {
+  const next = tipRollGridBox(
+    i,
+    j,
+    ex,
+    ey,
+    ez,
+    dir
+  );
+
+  const key = coordinateKey(next.i, next.j);
+
+  if (
+    next.i < board.minI ||
+    next.i > board.maxI ||
+    next.j < board.minJ ||
+    next.j > board.maxJ
+  ) {
+    return false;
+  }
+
+  if (key !== ownKey && occupied.has(key)) {
+    return false;
+  }
+
+  return true;
+}
+
+function collectWanderRollActions(agent, settings) {
+  const board = getVisibleFaceBoard(settings);
+  const occupied = buildWanderOccupancy(agent);
+  const ownKey = coordinateKey(agent.i, agent.j);
+  const ex = agent.ex || 1;
+  const ey = agent.ey || 1;
+  const ez = agent.ez || 1;
+  const actions = [];
+
+  for (const dir of ROLL_GRID_DIRS) {
+    if (
+      wanderRollFits(
+        agent.i,
+        agent.j,
+        ex,
+        ey,
+        ez,
+        dir,
+        board,
+        occupied,
+        ownKey
+      )
+    ) {
+      actions.push({ type: "roll", dir });
+    }
+  }
+
+  return actions;
+}
+
+function collectWanderInPlaceUnfoldActions(
+  agent,
+  settings,
+  seen
+) {
+  const plant = [agent.i, agent.j];
+  const board = getVisibleFaceBoard(settings);
+  const occupied = buildWanderOccupancy(agent);
+  const ownKeys = new Set([
+    coordinateKey(plant[0], plant[1])
+  ]);
+  const allowed = getAllowedTypeIndexes(settings);
+  const actions = [];
+
+  for (const typeIndex of allowed) {
+    const base = CUBE_NETS[typeIndex];
+
+    for (let flip = 0; flip < 2; flip++) {
+      for (let rot = 0; rot < 4; rot++) {
+        const local = normalizeCells(
+          transformCells(base, rot, flip === 1)
+        );
+
+        for (const anchor of local) {
+          const ox = plant[0] - anchor[0];
+          const oy = plant[1] - anchor[1];
+          const cells = local.map((cell) => [
+            cell[0] + ox,
+            cell[1] + oy
+          ]);
+          const signature = cells
+            .map((cell) => coordinateKey(cell[0], cell[1]))
+            .join("|");
+
+          if (seen.has(signature)) {
+            continue;
+          }
+
+          if (!wanderCellsFitBoard(cells, board)) {
+            continue;
+          }
+
+          const keys = footprintKeys(cells, 1);
+
+          if (
+            !claimKeysAreFree(keys, occupied, ownKeys)
+          ) {
+            continue;
+          }
+
+          seen.add(signature);
+
+          actions.push({
+            type: "unfold",
+            plan: {
+              travel: false,
+              typeIndex,
+              cells
+            }
+          });
+        }
+      }
+    }
+  }
+
+  return actions;
+}
+
+function collectWanderTravelUnfoldActions(
+  agent,
+  settings,
+  seen
+) {
+  const plant = [agent.i, agent.j];
+  const board = getVisibleFaceBoard(settings);
+  const occupied = buildWanderOccupancy(agent);
+  const ownKeys = new Set([
+    coordinateKey(plant[0], plant[1])
+  ]);
+  const allowed = getAllowedTypeIndexes(settings);
+  const actions = [];
+
+  for (const prefer of ROLL_GRID_DIRS) {
+    for (const typeIndex of allowed) {
+      const base = CUBE_NETS[typeIndex];
+
+      for (let flip = 0; flip < 2; flip++) {
+        for (let rot = 0; rot < 4; rot++) {
+          const local = normalizeCells(
+            transformCells(base, rot, flip === 1)
+          );
+
+          const trailing = getLocalExtreme(
+            local,
+            prefer,
+            false
+          );
+          const leading = getLocalExtreme(
+            local,
+            prefer,
+            true
+          );
+
+          const span =
+            preferScore(leading[0], leading[1], prefer) -
+            preferScore(trailing[0], trailing[1], prefer);
+
+          if (span <= 0) {
+            continue;
+          }
+
+          if (
+            trailing[0] !== plant[0] ||
+            trailing[1] !== plant[1]
+          ) {
+            continue;
+          }
+
+          const ox = plant[0] - trailing[0];
+          const oy = plant[1] - trailing[1];
+          const cells = local.map((cell) => [
+            cell[0] + ox,
+            cell[1] + oy
+          ]);
+          const leadingCell = [
+            leading[0] + ox,
+            leading[1] + oy
+          ];
+
+          if (
+            leadingCell[0] === plant[0] &&
+            leadingCell[1] === plant[1]
+          ) {
+            continue;
+          }
+
+          const signature = cells
+            .map((cell) => coordinateKey(cell[0], cell[1]))
+            .join("|");
+
+          if (seen.has(signature)) {
+            continue;
+          }
+
+          if (!wanderCellsFitBoard(cells, board)) {
+            continue;
+          }
+
+          const keys = footprintKeys(cells, 1);
+
+          if (
+            !claimKeysAreFree(keys, occupied, ownKeys)
+          ) {
+            continue;
+          }
+
+          seen.add(signature);
+
+          actions.push({
+            type: "unfold",
+            plan: {
+              travel: true,
+              typeIndex,
+              cells,
+              trailingCell: plant.slice(),
+              leadingCell
+            }
+          });
+        }
+      }
+    }
+  }
+
+  return actions;
+}
+
+function collectWanderUnfoldActions(agent, settings) {
+  const seen = new Set();
+
+  return collectWanderInPlaceUnfoldActions(
+    agent,
+    settings,
+    seen
+  ).concat(
+    collectWanderTravelUnfoldActions(
+      agent,
+      settings,
+      seen
+    )
+  );
+}
+
+function collectWanderActions(agent, settings) {
+  const rolls = collectWanderRollActions(
+    agent,
+    settings
+  );
+  const unfolds = collectWanderUnfoldActions(
+    agent,
+    settings
+  );
+  const actions = rolls.concat(unfolds);
+
+  if (actions.length <= 1) {
+    return actions;
+  }
+
+  const offset = floor(
+    unitHash(
+      agent.seed * 0.53 +
+      wanderTime * 0.09 +
+      agent.i * 0.17
+    ) * actions.length
+  );
+
+  return actions
+    .slice(offset)
+    .concat(actions.slice(0, offset));
+}
+
+function tryBeginWanderAction(agent, settings) {
+  const actions = collectWanderActions(
+    agent,
+    settings
+  );
+
+  if (!actions.length) {
+    return false;
+  }
+
+  const pick = actions[
+    floor(
+      unitHash(
+        agent.seed * 0.67 +
+        wanderTime * 0.11 +
+        agent.waitTimer * 3.1
+      ) * actions.length
+    )
+  ];
+
+  if (pick.type === "roll") {
+    agent.rollDir = pick.dir;
+    agent.phase = "rolling";
+    agent.animProgress = 0;
+    return true;
+  }
+
+  agent.typeIndex = pick.plan.typeIndex;
+  agent.cells = pick.plan.cells;
+  agent.net = prepareNet(pick.plan.cells);
+  agent.travelUnfold = Boolean(pick.plan.travel);
+
+  if (agent.travelUnfold) {
+    agent.trailingIndex = getNetFaceIndexAt(
+      agent.net,
+      pick.plan.trailingCell[0],
+      pick.plan.trailingCell[1]
+    );
+    agent.leadingIndex = getNetFaceIndexAt(
+      agent.net,
+      pick.plan.leadingCell[0],
+      pick.plan.leadingCell[1]
+    );
+  } else {
+    agent.plantFaceIndex = getNetFaceIndexAt(
+      agent.net,
+      agent.i,
+      agent.j
+    );
+    agent.trailingIndex = agent.plantFaceIndex;
+    agent.leadingIndex = agent.plantFaceIndex;
+  }
+
+  agent.phase = "unravel";
+  agent.animProgress = 0;
+  return true;
+}
+
+function finishWanderRoll(agent) {
+  const next = tipRollGridBox(
+    agent.i,
+    agent.j,
+    agent.ex || 1,
+    agent.ey || 1,
+    agent.ez || 1,
+    agent.rollDir
+  );
+
+  agent.i = next.i;
+  agent.j = next.j;
+  agent.ex = next.ex;
+  agent.ey = next.ey;
+  agent.ez = next.ez;
+  agent.facePaint = tipRollGridFacePaint(
+    agent.facePaint || [0, 1, 2, 3, 4, 5],
+    agent.rollDir
+  );
+  agent.rollDir = null;
+}
+
+function finishWanderRefold(agent) {
+  if (agent.travelUnfold && agent.net) {
+    const leading =
+      agent.net.faces[agent.leadingIndex];
+
+    if (leading) {
+      agent.i = leading.gridX;
+      agent.j = leading.gridY;
+    }
+  }
+
+  agent.net = null;
+  agent.cells = null;
+  agent.travelUnfold = false;
+  agent.trailingIndex = 0;
+  agent.leadingIndex = 0;
+}
+
+function getWanderPlantFaceIndex(agent) {
+  if (!agent.net || !agent.net.faces) {
+    return agent.plantFaceIndex || 0;
+  }
+
+  for (const face of agent.net.faces) {
+    if (
+      face.gridX === agent.i &&
+      face.gridY === agent.j
+    ) {
+      return face.index;
+    }
+  }
+
+  return agent.plantFaceIndex || 0;
+}
+
+function updateWander(settings) {
+  ensureWanderAgents(settings);
+
+  const speed =
+    settings.animationSpeed * 1.65;
+  const dt =
+    (typeof deltaTime === "number" && deltaTime > 0
+      ? deltaTime
+      : 1000 / 60) / 1000;
+
+  wanderTime += dt;
+
+  for (const agent of wanderAgents) {
+    if (agent.phase === "folded") {
+      agent.waitTimer += dt;
+
+      if (agent.waitTimer >= agent.waitDelay) {
+        agent.waitTimer = 0;
+
+        if (!tryBeginWanderAction(agent, settings)) {
+          scheduleWanderWait(agent, settings);
+        }
+      }
+
+      continue;
+    }
+
+    agent.animProgress += speed;
+
+    while (agent.animProgress >= 1) {
+      agent.animProgress -= 1;
+
+      if (agent.phase === "rolling") {
+        finishWanderRoll(agent);
+        agent.phase = "folded";
+        scheduleWanderWait(agent, settings);
+        break;
+      }
+
+      if (agent.phase === "unravel") {
+        agent.phase = "refold";
+        break;
+      }
+
+      if (agent.phase === "refold") {
+        finishWanderRefold(agent);
+        agent.phase = "folded";
+        scheduleWanderWait(agent, settings);
+        break;
+      }
+
+      break;
+    }
+  }
+}
+
+function getWanderDrawPlantIndex(
+  agent,
+  unraveling,
+  foldProgress
+) {
+  if (!agent.travelUnfold) {
+    return getWanderPlantFaceIndex(agent);
+  }
+
+  if (
+    unraveling ||
+    foldProgress <= 0
+  ) {
+    return agent.trailingIndex;
+  }
+
+  return agent.leadingIndex;
+}
+
+function drawWanderAgents(settings) {
+  ensureWanderAgents(settings);
+
+  const size = settings.faceSize;
+
+  for (const agent of wanderAgents) {
+    const netColor = getNetColor(
+      agent.colorIndex !== undefined
+        ? agent.colorIndex
+        : agent.typeIndex,
+      settings
+    );
+
+    if (agent.phase === "rolling") {
+      const tipProgress = constrain(
+        agent.animProgress,
+        0,
+        1
+      );
+
+      drawRollingCube(
+        agent.i,
+        agent.j,
+        agent.ex || 1,
+        agent.ey || 1,
+        agent.ez || 1,
+        agent.rollDir,
+        tipProgress,
+        netColor,
+        settings,
+        agent.seed,
+        agent.facePaint
+      );
+      continue;
+    }
+
+    if (
+      agent.phase === "unravel" ||
+      agent.phase === "refold"
+    ) {
+      const animT = constrain(
+        agent.animProgress,
+        0,
+        1
+      );
+      const unraveling =
+        agent.phase === "unravel";
+      const foldProgress = unraveling
+        ? 1 - animT
+        : animT;
+      const plantIndex =
+        getWanderDrawPlantIndex(
+          agent,
+          unraveling,
+          foldProgress
+        );
+      const plantFace =
+        agent.net.faces[plantIndex] ||
+        agent.net.faces[0];
+      const origin = worldOriginForFace(
+        plantFace.gridX,
+        plantFace.gridY,
+        1,
+        size
+      );
+
+      drawNet(
+        agent.net,
+        origin.x,
+        origin.z,
+        netColor,
+        settings,
+        agent.creaseStyle,
+        agent.seed,
+        0,
+        {
+          foldMode: "one-side",
+          foldProgress,
+          plantFaceIndex: plantIndex,
+          useOriginAsPlant: true,
+          drapeAmount: 0,
+          cubeScale: 1,
+          motionCurve:
+            settings.cascadeMotionCurve || "ease"
+        }
+      );
+      continue;
+    }
+
+    drawRollingCube(
+      agent.i,
+      agent.j,
+      agent.ex || 1,
+      agent.ey || 1,
+      agent.ez || 1,
+      ROLL_GRID_DIRS[0],
+      0,
+      netColor,
+      settings,
+      agent.seed,
+      agent.facePaint
+    );
+  }
+}
+
+
+/* ---------------------------------------------------------
+   IMAGE — unfolded nets remapping a source photo
+--------------------------------------------------------- */
+
+function updateImageUploadNote() {
+  if (!controls.imageUploadNote) {
+    return;
+  }
+
+  if (!sourceImageData) {
+    controls.imageUploadNote.textContent =
+      "Upload an image to tile the canvas with " +
+      "unfolded nets. Mapped like object-fit: fill. " +
+      "Color comes from the image; size and unfold " +
+      "type are derived from local brightness / hue.";
+    return;
+  }
+
+  controls.imageUploadNote.textContent =
+    `Loaded ${sourceImageName || "image"} ` +
+    `(${sourceImageData.width}×${sourceImageData.height}). ` +
+    "Use Play open / close to fold; Image color picks " +
+    "how samples map onto faces.";
+}
+
+function handleImageUpload(event) {
+  const file =
+    event.target.files &&
+    event.target.files[0];
+
+  if (!file) {
+    return;
+  }
+
+  const reader = new FileReader();
+
+  reader.onload = () => {
+    const img = new Image();
+
+    img.onload = () => {
+      ingestSourceImage(img, file.name || "image");
+    };
+
+    img.onerror = () => {
+      sourceImageData = null;
+      sourceImageKey = "";
+      sourceImageName = "";
+      packCacheKey = "";
+      updateImageUploadNote();
+    };
+
+    img.src = reader.result;
+  };
+
+  reader.readAsDataURL(file);
+}
+
+function ingestSourceImage(img, name) {
+  /*
+   * Downsample large uploads so per-face sampling
+   * stays cheap while still covering the canvas.
+   */
+  const maxDim = 640;
+  const scale = Math.min(
+    1,
+    maxDim / Math.max(img.width, img.height)
+  );
+
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+
+  const ctx = canvas.getContext("2d", {
+    willReadFrequently: true
+  });
+
+  ctx.drawImage(img, 0, 0, w, h);
+
+  sourceImageData = ctx.getImageData(0, 0, w, h);
+  sourceImageKey = `${name}|${w}x${h}|${img.width}x${img.height}`;
+  sourceImageName = name;
+  packCacheKey = "";
+  updateImageUploadNote();
+}
+
+function worldToCanvasScreen(x, y, z, settings) {
+  const axes = getIsometricScreenAxes();
+  const scale = getPixelsPerWorldUnit(settings);
+
+  return {
+    x: axes.toScreenX(x, y, z) * scale,
+    y: axes.toScreenY(x, y, z) * scale
+  };
+}
+
+/*
+ * object-fit: fill — stretch source to the full
+ * canvas. Match WEBGL Y-up screen space directly to
+ * ImageData rows (top of canvas → top of image).
+ */
+function sampleSourceImageAtCanvas(sx, sy) {
+  if (!sourceImageData) {
+    return null;
+  }
+
+  const u = constrain(
+    (sx + width * 0.5) / width,
+    0,
+    0.999999
+  );
+
+  const v = constrain(
+    (sy + height * 0.5) / height,
+    0,
+    0.999999
+  );
+
+  const px = Math.min(
+    sourceImageData.width - 1,
+    Math.floor(u * sourceImageData.width)
+  );
+
+  const py = Math.min(
+    sourceImageData.height - 1,
+    Math.floor(v * sourceImageData.height)
+  );
+
+  const i = (py * sourceImageData.width + px) * 4;
+  const d = sourceImageData.data;
+  const r = d[i];
+  const g = d[i + 1];
+  const b = d[i + 2];
+
+  return {
+    r,
+    g,
+    b,
+    hex: rgbToHex(r, g, b),
+    luminance: (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255,
+    hue: rgbToHue(r, g, b)
+  };
+}
+
+function sampleImageAtLattice(i, j, scale, settings) {
+  const origin = worldOriginForFace(
+    i,
+    j,
+    scale,
+    settings.faceSize
+  );
+
+  const screen = worldToCanvasScreen(
+    origin.x,
+    0,
+    origin.z,
+    settings
+  );
+
+  return sampleSourceImageAtCanvas(screen.x, screen.y);
+}
+
+function rgbToHex(r, g, b) {
+  const to = (n) => {
+    const h = constrain(round(n), 0, 255)
+      .toString(16)
+      .padStart(2, "0");
+
+    return h;
+  };
+
+  return `#${to(r)}${to(g)}${to(b)}`;
+}
+
+function hexToRgb(hex) {
+  const raw = String(hex || "").replace("#", "");
+
+  if (raw.length !== 6) {
+    return { r: 128, g: 128, b: 128 };
+  }
+
+  return {
+    r: parseInt(raw.slice(0, 2), 16),
+    g: parseInt(raw.slice(2, 4), 16),
+    b: parseInt(raw.slice(4, 6), 16)
+  };
+}
+
+function rgbToHue(r, g, b) {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const maxC = Math.max(rn, gn, bn);
+  const minC = Math.min(rn, gn, bn);
+  const delta = maxC - minC;
+
+  if (delta < 1e-6) {
+    return 0;
+  }
+
+  let hue;
+
+  if (maxC === rn) {
+    hue = ((gn - bn) / delta) % 6;
+  } else if (maxC === gn) {
+    hue = (bn - rn) / delta + 2;
+  } else {
+    hue = (rn - gn) / delta + 4;
+  }
+
+  hue *= 60;
+
+  if (hue < 0) {
+    hue += 360;
+  }
+
+  return hue;
+}
+
+function rgbToHsl(r, g, b) {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const maxC = Math.max(rn, gn, bn);
+  const minC = Math.min(rn, gn, bn);
+  const lightness = (maxC + minC) * 0.5;
+  const delta = maxC - minC;
+
+  if (delta < 1e-6) {
+    return { h: 0, s: 0, l: lightness };
+  }
+
+  const saturation =
+    lightness > 0.5
+      ? delta / (2 - maxC - minC)
+      : delta / (maxC + minC);
+
+  return {
+    h: rgbToHue(r, g, b),
+    s: saturation,
+    l: lightness
+  };
+}
+
+function hslToRgb(h, s, l) {
+  const hue = ((h % 360) + 360) % 360;
+  const sat = constrain(s, 0, 1);
+  const light = constrain(l, 0, 1);
+
+  if (sat < 1e-6) {
+    const v = round(light * 255);
+
+    return { r: v, g: v, b: v };
+  }
+
+  const c = (1 - Math.abs(2 * light - 1)) * sat;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = light - c * 0.5;
+
+  let rp = 0;
+  let gp = 0;
+  let bp = 0;
+
+  if (hue < 60) {
+    rp = c;
+    gp = x;
+  } else if (hue < 120) {
+    rp = x;
+    gp = c;
+  } else if (hue < 180) {
+    gp = c;
+    bp = x;
+  } else if (hue < 240) {
+    gp = x;
+    bp = c;
+  } else if (hue < 300) {
+    rp = x;
+    bp = c;
+  } else {
+    rp = c;
+    bp = x;
+  }
+
+  return {
+    r: round((rp + m) * 255),
+    g: round((gp + m) * 255),
+    b: round((bp + m) * 255)
+  };
+}
+
+function nearestPaletteHex(r, g, b) {
+  let best = PALETTE[0];
+  let bestDist = Infinity;
+
+  for (const hex of PALETTE) {
+    const c = hexToRgb(hex);
+    const dist =
+      (c.r - r) * (c.r - r) +
+      (c.g - g) * (c.g - g) +
+      (c.b - b) * (c.b - b);
+
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = hex;
+    }
+  }
+
+  return best;
+}
+
+function shadeOfPaletteColor(baseHex, luminance) {
+  const base = hexToRgb(baseHex);
+  const hsl = rgbToHsl(base.r, base.g, base.b);
+  const lit = constrain(0.1 + luminance * 0.8, 0.08, 0.92);
+  const rgb = hslToRgb(hsl.h, Math.max(hsl.s, 0.35), lit);
+
+  return rgbToHex(rgb.r, rgb.g, rgb.b);
+}
+
+function averageImageSample(placement, scale, settings) {
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let n = 0;
+
+  for (const face of placement.net.faces) {
+    const sample = sampleImageAtLattice(
+      face.gridX,
+      face.gridY,
+      scale,
+      settings
+    );
+
+    if (!sample) {
+      continue;
+    }
+
+    r += sample.r;
+    g += sample.g;
+    b += sample.b;
+    n += 1;
+  }
+
+  if (n === 0) {
+    return null;
+  }
+
+  r = round(r / n);
+  g = round(g / n);
+  b = round(b / n);
+
+  return {
+    r,
+    g,
+    b,
+    hex: rgbToHex(r, g, b),
+    luminance: (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255,
+    hue: rgbToHue(r, g, b)
+  };
+}
+
+function resolveImageColor(sample, settings) {
+  if (!sample) {
+    return "#888888";
+  }
+
+  const mode = settings.imageColorMode || "faces";
+
+  if (mode === "palette") {
+    return nearestPaletteHex(sample.r, sample.g, sample.b);
+  }
+
+  if (mode === "shades") {
+    return shadeOfPaletteColor(
+      monoColor || PALETTE[0],
+      sample.luminance
+    );
+  }
+
+  return sample.hex;
+}
+
+function syncImageAnimateButton() {
+  if (!controls.imageAnimateButton) {
+    return;
+  }
+
+  const playing = controls.animateFolding.checked;
+
+  controls.imageAnimateButton.textContent = playing
+    ? "Pause open / close"
+    : "Play open / close";
+}
+
+function toggleImageAnimate() {
+  const playing = !controls.animateFolding.checked;
+
+  controls.animateFolding.checked = playing;
+
+  if (playing) {
+    animationPauseTimer = 0;
+
+    const foldEnd =
+      1 +
+      getMaxFoldStaggerDelay(getSettings());
+
+    animationDirection =
+      animatedProgress >= foldEnd - 0.001
+        ? -1
+        : 1;
+
+    if (Number(controls.drapeAmount.value) < 0.05) {
+      controls.drapeAmount.value = 1;
+      setValueLabel("drapeAmount", "1.00");
+    }
+  }
+
+  syncImageAnimateButton();
+  scheduleSessionSave();
+}
+
+function scaleFromImageLuminance(luminance, bias) {
+  if (bias === "unit") {
+    return 1;
+  }
+
+  const t =
+    bias === "bright-large"
+      ? luminance
+      : 1 - luminance;
+
+  if (t > 0.62) {
+    return 3;
+  }
+
+  if (t > 0.32) {
+    return 2;
+  }
+
+  return 1;
+}
+
+function typeIndexFromImageHue(hue, allowedTypes) {
+  const pool =
+    allowedTypes && allowedTypes.length > 0
+      ? allowedTypes
+      : CUBE_NETS.map((_, index) => index);
+
+  const idx = Math.floor((hue / 360) * pool.length) % pool.length;
+
+  return pool[idx];
+}
+
+function drawImageNets(settings) {
+  if (!sourceImageData) {
+    return;
+  }
+
+  ensureImageLayout(settings);
+
+  const placements = selectPlacementsForCoverage(
+    packedPlacements.placements,
+    {
+      ...settings,
+      gridPlacement: "random"
+    }
+  );
+
+  const colorMode = settings.imageColorMode || "faces";
+  const perCube = colorMode === "cube";
+
+  const drawSettings = {
+    ...settings,
+    colorMode: "mono"
+  };
+
+  for (const placement of placements) {
+    const scale = placement.scale || 1;
+
+    const cubeSample = perCube
+      ? averageImageSample(placement, scale, settings)
+      : null;
+
+    const cubeColor = perCube
+      ? resolveImageColor(cubeSample, settings)
+      : null;
+
+    drawNet(
+      placement.net,
+      placement.originX,
+      placement.originZ,
+      cubeColor || "#888888",
+      drawSettings,
+      placement.creaseStyle,
+      placement.seed,
+      placement.foldDelay,
+      {
+        drapeAmount: settings.drapeAmount,
+        foldMode: settings.foldMode || "both",
+        cubeScale: scale,
+        faceColorFor(faceIndex) {
+          if (perCube) {
+            return cubeColor || "#888888";
+          }
+
+          const face =
+            placement.net.faces[faceIndex];
+
+          const sample = sampleImageAtLattice(
+            face.gridX,
+            face.gridY,
+            scale,
+            settings
+          );
+
+          return resolveImageColor(sample, settings);
+        }
+      }
+    );
+  }
+}
+
+function ensureImageLayout(settings) {
+  const key = [
+    "image",
+    sourceImageKey,
+    settings.imageScaleBias,
+    settings.faceSize.toFixed(5),
+    settings.cameraZoom.toFixed(3),
+    settings.gridSize,
+    allowedTypesCacheKey(settings),
+    placementSeed,
+    width,
+    height
+  ].join("|");
+
+  if (key === packCacheKey && packedPlacements.placements) {
+    return;
+  }
+
+  packCacheKey = key;
+  packedPlacements = buildImagePacking(settings);
+}
+
+function buildImagePacking(settings) {
+  const board = getVisibleFaceBoard(settings);
+  const totalCells = board.cells.length;
+  const occupied = new Set();
+  const raw = [];
+  const allowedTypes = getAllowedTypeIndexes(settings);
+  const bias = settings.imageScaleBias || "dark-large";
+  const placement = "random";
+  const skew = 0;
+
+  const cells = board.cells
+    .slice()
+    .sort((a, b) => {
+      return (
+        cellHash(a, placementSeed + 19) -
+        cellHash(b, placementSeed + 23)
+      );
+    });
+
+  for (const key of cells) {
+    if (occupied.has(key)) {
+      continue;
+    }
+
+    const [i, j] = parseCoordinateKey(key);
+    const sample = sampleImageAtLattice(i, j, 1, settings);
+
+    if (!sample) {
+      continue;
+    }
+
+    const preferredScale =
+      scaleFromImageLuminance(sample.luminance, bias);
+
+    const preferredType =
+      typeIndexFromImageHue(sample.hue, allowedTypes);
+
+    const scaleOrder =
+      preferredScale === 1
+        ? [1]
+        : preferredScale === 2
+          ? [2, 1, 3]
+          : [3, 2, 1];
+
+    for (const scale of scaleOrder) {
+      const mi = Math.floor(i / scale);
+      const mj = Math.floor(j / scale);
+      const salt =
+        i * 17 +
+        j * 41 +
+        scale * 13 +
+        preferredType * 7 +
+        placementSeed;
+
+      /*
+       * Prefer the hue-matched net, then one
+       * fallback of any allowed type.
+       */
+      let candidate = tryPlaceScaledNetAt(
+        mi,
+        mj,
+        scale,
+        occupied,
+        board,
+        [preferredType],
+        placement,
+        skew,
+        salt
+      );
+
+      if (!candidate) {
+        candidate = tryPlaceScaledNetAt(
+          mi,
+          mj,
+          scale,
+          occupied,
+          board,
+          allowedTypes,
+          placement,
+          skew,
+          salt + 101
+        );
+      }
+
+      if (!candidate) {
+        continue;
+      }
+
+      for (const footprint of candidate.footprintKeys) {
+        occupied.add(footprint);
+      }
+
+      raw.push(candidate.entry);
+      break;
+    }
+  }
+
+  return finalizePackedPlacements(
+    raw,
+    settings,
+    totalCells
+  );
+}
 
 /*
  * Random placement: scatter by hash.
@@ -2132,12 +6457,20 @@ function selectCenteredCluster(
     ((board.minJ + board.maxJ) * 0.5 + 0.5) * size;
 
   const ranked = placements.map((placement) => {
+    const scale = max(1, placement.scale || 1);
     let sumX = 0;
     let sumZ = 0;
 
     for (const face of placement.net.faces) {
-      sumX += (face.gridX + 0.5) * size;
-      sumZ += (face.gridY + 0.5) * size;
+      const origin = worldOriginForFace(
+        face.gridX,
+        face.gridY,
+        scale,
+        size
+      );
+
+      sumX += origin.x;
+      sumZ += origin.z;
     }
 
     const n = placement.net.faces.length;
@@ -2298,12 +6631,13 @@ function pickEvenlySpacedBands(bands, keepCount) {
 
 function placementBandKey(placement, gridPlacement) {
   const faces = placement.net.faces;
+  const scale = max(1, placement.scale || 1);
   let sumX = 0;
   let sumY = 0;
 
   for (const face of faces) {
-    sumX += face.gridX;
-    sumY += face.gridY;
+    sumX += face.gridX * scale + (scale - 1) * 0.5;
+    sumY += face.gridY * scale + (scale - 1) * 0.5;
   }
 
   const x = sumX / faces.length;
@@ -2364,10 +6698,10 @@ function placementIsSpaced(placement) {
 
 /*
  * Cascade mode: cubes inch across the lattice using
- * only one-side unfold / refold. No sliding — each
- * cycle plants the trailing face, unrolls onto the
- * grid, then folds onto the leading face so the cube
- * reassembles one net-span further along.
+ * only one-side unfold / refold. Each cube claims only
+ * the lattice it currently needs — plant footprint
+ * while folded, full net while open — and may switch
+ * unfold patterns to fit free space.
  */
 function updateCascade(settings) {
   ensureCascadeTravelers(settings);
@@ -2375,64 +6709,476 @@ function updateCascade(settings) {
   const speed =
     settings.animationSpeed * 1.65;
 
+  const pauseSec = max(0, settings.cascadePause || 0);
+  const dt =
+    (typeof deltaTime === "number" && deltaTime > 0
+      ? deltaTime
+      : 1000 / 60) / 1000;
+
   cascadeTime += speed;
 
   for (const traveler of cascadeTravelers) {
+    if (
+      traveler.phase === "folded" ||
+      traveler.phase === "waiting"
+    ) {
+      traveler.waitTimer =
+        (traveler.waitTimer || 0) + dt;
+
+      if (
+        traveler.waitTimer >=
+        (traveler.waitDelay || 0)
+      ) {
+        tryBeginCascadeUnfold(traveler, settings);
+      }
+
+      continue;
+    }
+
+    if (
+      traveler.phase === "pause-open" ||
+      traveler.phase === "pause-closed"
+    ) {
+      traveler.pauseTimer =
+        (traveler.pauseTimer || 0) + dt;
+
+      if (
+        pauseSec <= 0 ||
+        traveler.pauseTimer >= pauseSec
+      ) {
+        traveler.pauseTimer = 0;
+        traveler.animProgress = 0;
+
+        if (traveler.phase === "pause-open") {
+          traveler.phase = "refold";
+        } else {
+          traveler.phase = "folded";
+          traveler.waitTimer = 0;
+          traveler.waitDelay = 0;
+          tryBeginCascadeUnfold(traveler, settings);
+        }
+      }
+
+      continue;
+    }
+
     traveler.animProgress += speed;
 
     while (traveler.animProgress >= 1) {
       traveler.animProgress -= 1;
 
       if (traveler.phase === "unravel") {
+        if (pauseSec > 0) {
+          traveler.phase = "pause-open";
+          traveler.pauseTimer = 0;
+          traveler.animProgress = 0;
+          break;
+        }
+
         traveler.phase = "refold";
+      } else if (traveler.phase === "refold") {
+        finishCascadeRefold(traveler, settings);
+
+        if (pauseSec > 0) {
+          traveler.phase = "pause-closed";
+          traveler.pauseTimer = 0;
+          traveler.animProgress = 0;
+          break;
+        }
+
+        traveler.phase = "folded";
+        traveler.waitTimer = 0;
+        traveler.waitDelay = 0;
+
+        if (!tryBeginCascadeUnfold(traveler, settings)) {
+          traveler.phase = "waiting";
+        }
+
+        break;
       } else {
-        advanceCascadeTraveler(traveler, settings);
-        traveler.phase = "unravel";
+        break;
       }
     }
   }
 }
 
-function ensureCascadeTravelers(settings) {
-  const key = [
+function cascadeTravelerIsFolded(traveler) {
+  return (
+    traveler.phase === "folded" ||
+    traveler.phase === "waiting" ||
+    traveler.phase === "pause-closed"
+  );
+}
+
+function getCascadePlantCell(traveler) {
+  if (
+    typeof traveler.plantX === "number" &&
+    typeof traveler.plantY === "number"
+  ) {
+    return [traveler.plantX, traveler.plantY];
+  }
+
+  const plantIndex =
+    traveler.phase === "refold" ||
+    traveler.phase === "pause-closed"
+      ? traveler.leadingIndex
+      : traveler.trailingIndex;
+
+  const face =
+    traveler.net &&
+    traveler.net.faces[plantIndex];
+
+  if (face) {
+    return [face.gridX, face.gridY];
+  }
+
+  if (traveler.cells && traveler.cells[0]) {
+    return traveler.cells[0].slice();
+  }
+
+  return [0, 0];
+}
+
+function getTravelerClaimKeys(traveler) {
+  const scale = max(1, traveler.scale || 1);
+
+  if (cascadeTravelerIsFolded(traveler)) {
+    return footprintKeys(
+      [getCascadePlantCell(traveler)],
+      scale
+    );
+  }
+
+  return footprintKeys(traveler.cells, scale);
+}
+
+function buildCascadeOccupancy(exceptTraveler = null) {
+  const occupied = new Set();
+
+  for (const traveler of cascadeTravelers) {
+    if (traveler === exceptTraveler) {
+      continue;
+    }
+
+    for (const key of getTravelerClaimKeys(traveler)) {
+      occupied.add(key);
+    }
+  }
+
+  return occupied;
+}
+
+function claimKeysAreFree(keys, occupied, ownKeys) {
+  for (const key of keys) {
+    if (ownKeys.has(key)) {
+      continue;
+    }
+
+    if (occupied.has(key)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/*
+ * Search allowed nets / orientations for an unfold
+ * anchored on this cube's plant that fits free space
+ * and advances along travel.
+ */
+function findCascadeUnfoldPlan(traveler, settings) {
+  const scale = max(1, traveler.scale || 1);
+  const plant = getCascadePlantCell(traveler);
+  const prefer = traveler.prefer;
+  const board = getVisibleFaceBoard(settings);
+  const occupied = buildCascadeOccupancy(traveler);
+  const ownKeys = new Set(
+    footprintKeys([plant], scale)
+  );
+  const plantOffBoard =
+    !cascadePlantOnBoard(plant, board, scale);
+
+  const allowed = getAllowedTypeIndexes(settings);
+  let best = null;
+  let bestScore = -Infinity;
+
+  for (const typeIndex of allowed) {
+    const base = CUBE_NETS[typeIndex];
+
+    for (let flip = 0; flip < 2; flip++) {
+      for (let rot = 0; rot < 4; rot++) {
+        const local =
+          normalizeCells(
+            transformCells(base, rot, flip === 1)
+          );
+
+        const trailing =
+          getLocalExtreme(local, prefer, false);
+
+        const leading =
+          getLocalExtreme(local, prefer, true);
+
+        const span =
+          (leading[0] - trailing[0]) * prefer.di +
+          (leading[1] - trailing[1]) * prefer.dj;
+
+        if (span <= 0) {
+          continue;
+        }
+
+        const ox = plant[0] - trailing[0];
+        const oy = plant[1] - trailing[1];
+
+        const cells = local.map((cell) => [
+          cell[0] + ox,
+          cell[1] + oy
+        ]);
+
+        const keys = footprintKeys(cells, scale);
+
+        if (!claimKeysAreFree(keys, occupied, ownKeys)) {
+          continue;
+        }
+
+        const leadingPlant = [
+          leading[0] + ox,
+          leading[1] + oy
+        ];
+
+        const entersView =
+          cascadePlantOnBoard(
+            leadingPlant,
+            board,
+            scale
+          );
+
+        const score =
+          span * 10 -
+          abs(span - 3) * 1.5 +
+          (entersView ? 12 : 0) +
+          (plantOffBoard && entersView ? 10 : 0) +
+          unitHash(
+            traveler.seed * 0.31 +
+            typeIndex * 17.9 +
+            rot * 3.7 +
+            flip * 11.3 +
+            cascadeTime * 0.01
+          ) * 2.5;
+
+        if (score > bestScore) {
+          bestScore = score;
+          best = { typeIndex, cells, span };
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
+function tryBeginCascadeUnfold(traveler, settings) {
+  const plan = findCascadeUnfoldPlan(traveler, settings);
+
+  if (!plan) {
+    traveler.phase = "waiting";
+    return false;
+  }
+
+  traveler.typeIndex = plan.typeIndex;
+  traveler.cells = plan.cells;
+  traveler.net = prepareNet(plan.cells);
+
+  /*
+   * Keep colorIndex stable across pattern changes so
+   * multicolor cubes don't recolor every cycle.
+   */
+  if (traveler.colorIndex === undefined) {
+    traveler.colorIndex = plan.typeIndex;
+  }
+
+  const extremes =
+    getCascadeTravelExtremes(
+      traveler.net,
+      traveler.prefer
+    );
+
+  traveler.trailingIndex = extremes.trailingIndex;
+  traveler.leadingIndex = extremes.leadingIndex;
+
+  const plant = getCascadePlantCell(traveler);
+  traveler.plantX = plant[0];
+  traveler.plantY = plant[1];
+
+  traveler.phase = "unravel";
+  traveler.animProgress = 0;
+  traveler.waitTimer = 0;
+  traveler.nudgeX = 0;
+  traveler.nudgeZ = 0;
+
+  return true;
+}
+
+function finishCascadeRefold(traveler, settings) {
+  const leading =
+    traveler.net.faces[traveler.leadingIndex];
+
+  traveler.plantX = leading.gridX;
+  traveler.plantY = leading.gridY;
+
+  /*
+   * Keep the current net so the folded cube still
+   * has geometry to draw; occupancy shrinks to plant.
+   */
+  traveler.trailingIndex = traveler.leadingIndex;
+
+  if (cascadeTravelerOffBoard(traveler, settings)) {
+    resetCascadeTravelerToStart(traveler, settings);
+  }
+}
+
+function getCascadeBaseCacheKey(settings) {
+  return [
     settings.cascadeDirection,
-    settings.cascadeCount,
+    settings.cascadePhaseOffset.toFixed(3),
     settings.faceSize.toFixed(5),
     settings.cameraZoom.toFixed(3),
     settings.gridSize,
     allowedTypesCacheKey(settings),
+    scaleWeightsCacheKey(settings),
     placementSeed,
     width,
     height
   ].join("|");
+}
 
-  if (key === cascadeCacheKey && cascadeTravelers.length) {
+function buildCascadeOccupiedSet() {
+  const occupied = new Set();
+
+  for (const traveler of cascadeTravelers) {
+    for (const key of getTravelerClaimKeys(traveler)) {
+      occupied.add(key);
+    }
+  }
+
+  return occupied;
+}
+
+function createCascadeTravelersUpTo(
+  settings,
+  prefer,
+  board,
+  layout,
+  targetCount,
+  startIndex,
+  occupied
+) {
+  let created = startIndex;
+  let attempt = 0;
+  const maxAttempts = max(
+    (targetCount - startIndex) * 12,
+    64
+  );
+
+  while (created < targetCount && attempt < maxAttempts) {
+    const seed =
+      created * 97.3 +
+      attempt * 13.1 +
+      prefer.di * 11 +
+      prefer.dj * 19 +
+      placementSeed * 0.013;
+
+    const traveler = createFoldedCascadeTraveler(
+      created,
+      targetCount,
+      prefer,
+      board,
+      settings,
+      layout,
+      seed,
+      occupied
+    );
+
+    attempt += 1;
+
+    if (!traveler) {
+      continue;
+    }
+
+    for (const key of getTravelerClaimKeys(traveler)) {
+      occupied.add(key);
+    }
+
+    cascadeTravelers.push(traveler);
+    created += 1;
+  }
+}
+
+function ensureCascadeTravelers(settings) {
+  const baseKey = getCascadeBaseCacheKey(settings);
+  const targetCount = max(1, settings.cascadeCount);
+
+  if (baseKey !== cascadeCacheKey) {
+    cascadeCacheKey = baseKey;
+    cascadeTravelers = [];
+
+    const prefer =
+      getCascadeCellPrefer(settings.cascadeDirection);
+
+    const board = getVisibleFaceBoard(settings);
+    const maxScale = getMaxActiveScale(settings);
+    const layout =
+      getCascadeStreamLayout(
+        board,
+        prefer,
+        targetCount,
+        maxScale
+      );
+
+    createCascadeTravelersUpTo(
+      settings,
+      prefer,
+      board,
+      layout,
+      targetCount,
+      0,
+      new Set()
+    );
+
     return;
   }
 
-  cascadeCacheKey = key;
-  cascadeTravelers = [];
+  if (cascadeTravelers.length === targetCount) {
+    return;
+  }
+
+  if (cascadeTravelers.length > targetCount) {
+    cascadeTravelers.length = targetCount;
+    return;
+  }
 
   const prefer =
     getCascadeCellPrefer(settings.cascadeDirection);
 
   const board = getVisibleFaceBoard(settings);
-  const count = settings.cascadeCount;
+  const maxScale = getMaxActiveScale(settings);
   const layout =
-    getCascadeStreamLayout(board, prefer, count);
-
-  for (let i = 0; i < count; i++) {
-    cascadeTravelers.push(
-      createCascadeTraveler(
-        i,
-        count,
-        prefer,
-        board,
-        settings,
-        layout
-      )
+    getCascadeStreamLayout(
+      board,
+      prefer,
+      targetCount,
+      maxScale
     );
-  }
+
+  createCascadeTravelersUpTo(
+    settings,
+    prefer,
+    board,
+    layout,
+    targetCount,
+    cascadeTravelers.length,
+    buildCascadeOccupiedSet()
+  );
 }
 
 /*
@@ -2457,14 +7203,22 @@ function getCascadeCellPrefer(direction) {
 
 /*
  * Pack travelers into perpendicular lanes × depth
- * along travel so a high count keeps a continuous
- * conveyor across the visible board.
+ * along travel. Spacing compresses with count so the
+ * stream can fill denser than one cube per several
+ * cells.
  */
-function getCascadeStreamLayout(board, prefer, count) {
+function getCascadeStreamLayout(
+  board,
+  prefer,
+  count,
+  scaleFactor = 1
+) {
   const travelI = prefer.di;
   const travelJ = prefer.dj;
   const perpI = -prefer.dj;
   const perpJ = prefer.di;
+  const factor = max(1, scaleFactor);
+  const total = max(1, count);
 
   const corners = [
     [board.minI, board.minJ],
@@ -2492,34 +7246,21 @@ function getCascadeStreamLayout(board, prefer, count) {
   }
 
   const travelLength =
-    max(8, travelMax - travelMin);
+    max(1, travelMax - travelMin);
 
   const perpExtent =
-    max(4, perpMax - perpMin);
+    max(1, perpMax - perpMin);
 
-  const minLaneSpacing = 4.6;
-  const minStepSpacing = 5.4;
+  const aspect =
+    travelLength / max(0.001, perpExtent);
 
-  const maxLanes =
-    max(1, floor(perpExtent / minLaneSpacing) + 1);
+  let lanes = max(
+    1,
+    round(sqrt(total / max(0.35, aspect)))
+  );
 
-  const maxDepth =
-    max(1, floor(travelLength / minStepSpacing) + 1);
-
-  let lanes =
-    min(count, maxLanes);
-
-  let depth =
-    max(1, ceil(count / max(1, lanes)));
-
-  if (depth > maxDepth) {
-    depth = maxDepth;
-    lanes =
-      min(
-        count,
-        max(1, ceil(count / max(1, depth)))
-      );
-  }
+  lanes = constrain(lanes, 1, total);
+  let depth = max(1, ceil(total / lanes));
 
   const laneSpacing =
     lanes <= 1
@@ -2528,8 +7269,8 @@ function getCascadeStreamLayout(board, prefer, count) {
 
   const stepSpacing =
     depth <= 1
-      ? minStepSpacing
-      : travelLength / depth;
+      ? max(1, travelLength * 0.35)
+      : travelLength / max(1, depth - 1);
 
   return {
     lanes,
@@ -2538,92 +7279,545 @@ function getCascadeStreamLayout(board, prefer, count) {
     stepSpacing,
     travelLength,
     perpExtent,
+    travelMin,
+    travelMax,
+    perpMin,
+    perpMax,
     perpI,
-    perpJ
+    perpJ,
+    scaleFactor: factor
   };
 }
 
-function getCascadeLaneDepth(index, layout, count) {
-  const lanes =
-    max(1, layout.lanes);
-
-  /*
-   * Fill lane-major so neighboring indexes share a
-   * lane and pipeline along travel.
-   */
-  const lane =
-    index % lanes;
-
-  const depthIndex =
-    floor(index / lanes);
-
-  return {
-    lane,
-    depthIndex,
-    laneCount: lanes,
-    depthCount:
-      max(1, ceil(count / lanes))
-  };
-}
-
-function createCascadeTraveler(
+function createFoldedCascadeTraveler(
   index,
   count,
   prefer,
   board,
   settings,
-  layout
+  layout,
+  seed,
+  occupied
 ) {
-  const seed =
-    index * 97.3 +
-    prefer.di * 11 +
-    prefer.dj * 19 +
-    placementSeed * 0.013;
-
+  const scale = pickCubeScale(seed * 1.31, settings);
   const typeIndex =
     pickAllowedTypeIndex(seed, settings);
 
-  const slot =
-    getCascadeLaneDepth(index, layout, count);
+  const laneIndex = index % max(1, layout.lanes);
+  const depthIndex = floor(index / max(1, layout.lanes));
+
+  const plant = findFreeCascadePlant(
+    board,
+    prefer,
+    scale,
+    occupied,
+    seed,
+    index,
+    layout,
+    laneIndex,
+    depthIndex,
+    "initial"
+  );
+
+  if (!plant) {
+    return null;
+  }
 
   const placement =
-    buildCascadeNetPlacement(
+    buildCascadeNetAtPlant(
       typeIndex,
       prefer,
-      board,
-      slot.lane,
-      slot.laneCount,
-      seed,
-      slot.depthIndex,
-      layout
+      plant,
+      scale,
+      seed
     );
+
+  if (!placement) {
+    return null;
+  }
 
   const net = prepareNet(placement.cells);
   const extremes =
     getCascadeTravelExtremes(net, prefer);
 
-  /*
-   * Small phase offset by lane keeps the parade
-   * orderly without locking every fold to one beat.
-   */
-  const phaseOffset =
-    (slot.lane / max(1, slot.laneCount)) * 0.35;
+  const phaseAmount = constrain(
+    Number(settings.cascadePhaseOffset) || 0,
+    0,
+    1
+  );
+
+  const waitDelay =
+    cascadePhaseRoll(seed, index) * phaseAmount * 1.8;
 
   return {
     typeIndex,
+    colorIndex: typeIndex,
+    scale,
     seed,
-    laneIndex: slot.lane,
-    depthIndex: slot.depthIndex,
-    laneCount: slot.laneCount,
+    laneIndex: index % max(1, layout.lanes),
+    depthIndex: floor(index / max(1, layout.lanes)),
+    laneCount: layout.lanes,
+    streamLayout: layout,
     creaseStyle: floor(unitHash(seed * 1.7) * 5),
     prefer,
     cells: placement.cells,
     net,
     trailingIndex: extremes.trailingIndex,
     leadingIndex: extremes.leadingIndex,
-    phase: "unravel",
-    animProgress: phaseOffset
+    plantX: plant[0],
+    plantY: plant[1],
+    nudgeX: 0,
+    nudgeZ: 0,
+    phase: "folded",
+    animProgress: 0,
+    pauseTimer: 0,
+    waitTimer: 0,
+    waitDelay
   };
+}
+
+function cascadeSourceMargin(scale = 1) {
+  return max(2, max(1, round(scale) || 1) + 1);
+}
+
+function cascadeTravelerVisible(traveler, settings) {
+  if (
+    traveler.phase === "unravel" ||
+    traveler.phase === "refold" ||
+    traveler.phase === "pause-open" ||
+    traveler.phase === "pause-closed"
+  ) {
+    return true;
+  }
+
+  const board = getVisibleFaceBoard(settings);
+  const scale = max(1, traveler.scale || 1);
+
+  return cascadePlantOnBoard(
+    getCascadePlantCell(traveler),
+    board,
+    scale
+  );
+}
+
+function cascadePlantOnBoard(plant, board, scale) {
+  const footprint = expandCellsToFootprint([plant], scale);
+
+  for (const cell of footprint) {
+    if (
+      cell[0] >= board.minI &&
+      cell[0] <= board.maxI &&
+      cell[1] >= board.minJ &&
+      cell[1] <= board.maxJ
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/*
+ * True when every base cell of the plant footprint sits
+ * strictly outside the visible board on the source axes.
+ */
+function cascadePlantOffSourceBoard(
+  plant,
+  board,
+  prefer,
+  scale
+) {
+  const edge = max(1, scale);
+  const footprint = expandCellsToFootprint([plant], edge);
+
+  for (const cell of footprint) {
+    if (prefer.di < 0 && cell[0] <= board.maxI) {
+      return false;
+    }
+
+    if (prefer.di > 0 && cell[0] >= board.minI) {
+      return false;
+    }
+
+    if (prefer.dj < 0 && cell[1] <= board.maxJ) {
+      return false;
+    }
+
+    if (prefer.dj > 0 && cell[1] >= board.minJ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function findFreeCascadePlant(
+  board,
+  prefer,
+  scale,
+  occupied,
+  seed,
+  index,
+  layout = null,
+  laneIndex = 0,
+  depthIndex = 0,
+  spawnMode = "reset"
+) {
+  const edge = max(1, scale);
+
+  if (spawnMode === "initial") {
+    return findInitialCascadePlant(
+      board,
+      prefer,
+      edge,
+      occupied,
+      seed,
+      index,
+      layout,
+      laneIndex,
+      depthIndex
+    );
+  }
+
+  const plant = findResetCascadePlant(
+    board,
+    prefer,
+    edge,
+    occupied,
+    seed,
+    index,
+    layout,
+    laneIndex,
+    depthIndex
+  );
+
+  return plant;
+}
+
+function findInitialCascadePlant(
+  board,
+  prefer,
+  edge,
+  occupied,
+  seed,
+  index,
+  layout,
+  laneIndex,
+  depthIndex
+) {
+  const laneCount = layout ? layout.lanes : 1;
+
+  const slot = getCascadeStartCell(
+    board,
+    prefer,
+    laneIndex,
+    laneCount,
+    seed,
+    depthIndex,
+    layout,
+    edge,
+    "initial"
+  );
+
+  const anchorI = round(slot.i / edge);
+  const anchorJ = round(slot.j / edge);
+  const candidates = [];
+
+  for (
+    let j = board.minJ;
+    j <= board.maxJ - (edge - 1);
+    j += edge
+  ) {
+    for (
+      let i = board.minI;
+      i <= board.maxI - (edge - 1);
+      i += edge
+    ) {
+      const logicalI = round(i / edge);
+      const logicalJ = round(j / edge);
+      const plant = [logicalI, logicalJ];
+
+      if (
+        !cascadePlantOnBoard(
+          plant,
+          board,
+          edge
+        )
+      ) {
+        continue;
+      }
+
+      candidates.push({
+        i: logicalI,
+        j: logicalJ,
+        travel: preferScore(
+          logicalI * edge,
+          logicalJ * edge,
+          prefer
+        ),
+        dist:
+          abs(logicalI - anchorI) +
+          abs(logicalJ - anchorJ),
+        order: cellHash(
+          coordinateKey(logicalI, logicalJ),
+          index + placementSeed + edge * 17
+        )
+      });
+    }
+  }
+
+  return pickFreeCascadeCandidate(
+    candidates,
+    edge,
+    occupied,
+    seed,
+    index,
+    (a, b) => {
+      if (a.dist !== b.dist) {
+        return a.dist - b.dist;
+      }
+
+      if (a.travel !== b.travel) {
+        return a.travel - b.travel;
+      }
+
+      return a.order - b.order;
+    }
+  );
+}
+
+function findResetCascadePlant(
+  board,
+  prefer,
+  edge,
+  occupied,
+  seed,
+  index,
+  layout,
+  laneIndex,
+  depthIndex
+) {
+  const laneCount = layout ? layout.lanes : 1;
+  const depthSpread =
+    layout
+      ? max(4, layout.depth + 4)
+      : 8;
+
+  for (
+    let depthTry = depthIndex;
+    depthTry <= depthIndex + depthSpread;
+    depthTry++
+  ) {
+    const plant = findResetCascadePlantAtDepth(
+      board,
+      prefer,
+      edge,
+      occupied,
+      seed,
+      index,
+      layout,
+      laneIndex,
+      depthTry,
+      laneCount
+    );
+
+    if (plant) {
+      return plant;
+    }
+  }
+
+  return null;
+}
+
+function findResetCascadePlantAtDepth(
+  board,
+  prefer,
+  edge,
+  occupied,
+  seed,
+  index,
+  layout,
+  laneIndex,
+  depthIndex,
+  laneCount
+) {
+  const slot = getCascadeStartCell(
+    board,
+    prefer,
+    laneIndex,
+    laneCount,
+    seed,
+    depthIndex,
+    layout,
+    edge,
+    "reset"
+  );
+
+  const anchorI = round(slot.i / edge);
+  const anchorJ = round(slot.j / edge);
+  const searchRadius = max(
+    3,
+    layout ? ceil(layout.lanes * 0.75) + 2 : 4
+  );
+
+  const candidates = [];
+
+  for (let dj = -searchRadius; dj <= searchRadius; dj++) {
+    for (let di = -searchRadius; di <= searchRadius; di++) {
+      const logicalI = anchorI + di;
+      const logicalJ = anchorJ + dj;
+      const plant = [logicalI, logicalJ];
+
+      if (
+        !cascadePlantOffSourceBoard(
+          plant,
+          board,
+          prefer,
+          edge
+        )
+      ) {
+        continue;
+      }
+
+      candidates.push({
+        i: logicalI,
+        j: logicalJ,
+        dist: abs(di) + abs(dj),
+        order: cellHash(
+          coordinateKey(logicalI, logicalJ),
+          index + placementSeed + edge * 17 + depthIndex * 5.3
+        )
+      });
+    }
+  }
+
+  return pickFreeCascadeCandidate(
+    candidates,
+    edge,
+    occupied,
+    seed,
+    index,
+    (a, b) => {
+      if (a.dist !== b.dist) {
+        return a.dist - b.dist;
+      }
+
+      return a.order - b.order;
+    }
+  );
+}
+
+function pickFreeCascadeCandidate(
+  candidates,
+  edge,
+  occupied,
+  seed,
+  index,
+  sortFn
+) {
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort(sortFn);
+
+  const start =
+    floor(
+      unitHash(seed * 0.71 + index * 3.1) *
+      candidates.length
+    );
+
+  for (let n = 0; n < candidates.length; n++) {
+    const candidate =
+      candidates[(start + n) % candidates.length];
+
+    const keys = footprintKeys(
+      [[candidate.i, candidate.j]],
+      edge
+    );
+
+    let free = true;
+
+    for (const key of keys) {
+      if (occupied.has(key)) {
+        free = false;
+        break;
+      }
+    }
+
+    if (free) {
+      return [candidate.i, candidate.j];
+    }
+  }
+
+  return null;
+}
+
+function buildCascadeNetAtPlant(
+  typeIndex,
+  prefer,
+  plant,
+  scale,
+  seed
+) {
+  const base = CUBE_NETS[typeIndex];
+  let best = null;
+  let bestScore = -Infinity;
+
+  for (let flip = 0; flip < 2; flip++) {
+    for (let rot = 0; rot < 4; rot++) {
+      const local =
+        normalizeCells(
+          transformCells(base, rot, flip === 1)
+        );
+
+      const trailing =
+        getLocalExtreme(local, prefer, false);
+
+      const leading =
+        getLocalExtreme(local, prefer, true);
+
+      const span =
+        (leading[0] - trailing[0]) * prefer.di +
+        (leading[1] - trailing[1]) * prefer.dj;
+
+      if (span <= 0) {
+        continue;
+      }
+
+      const score =
+        span * 8 -
+        abs(span - 3) * 2.5 +
+        unitHash(seed + rot * 3 + flip) * 0.2;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = { local, trailing, leading, span };
+      }
+    }
+  }
+
+  if (!best) {
+    return null;
+  }
+
+  const ox = plant[0] - best.trailing[0];
+  const oy = plant[1] - best.trailing[1];
+
+  const cells = best.local.map((cell) => [
+    cell[0] + ox,
+    cell[1] + oy
+  ]);
+
+  return { cells, span: best.span, scale };
+}
+
+function cascadePhaseRoll(seed, salt = 0) {
+  const a = fract(Math.abs(seed) * 0.6180339887);
+  const b = fract(Math.abs(placementSeed) * 1.6180339887e-6);
+  const c = fract(Math.abs(salt) * 0.3819660113);
+
+  return unitHash(a * 127.1 + b * 311.7 + c * 74.9 + 3.1);
 }
 
 function buildCascadeNetPlacement(
@@ -2634,8 +7828,11 @@ function buildCascadeNetPlacement(
   laneCount,
   seed,
   depthIndex = 0,
-  layout = null
+  layout = null,
+  scale = 1,
+  slot = null
 ) {
+  const cubeScale = max(1, scale || 1);
   const base = CUBE_NETS[typeIndex];
   let best = null;
   let bestScore = -Infinity;
@@ -2658,10 +7855,6 @@ function buildCascadeNetPlacement(
         continue;
       }
 
-      /*
-       * Prefer compact, even spans so pipelined
-       * travelers advance at similar rates.
-       */
       const score =
         span * 8 -
         abs(span - 3) * 2.5 +
@@ -2684,20 +7877,29 @@ function buildCascadeNetPlacement(
     };
   }
 
-  const start =
-    getCascadeStartCell(
-      board,
-      prefer,
-      laneIndex,
-      laneCount,
-      seed,
-      depthIndex,
-      layout
-    );
+  const startBase =
+    slot
+      ? { i: slot.i, j: slot.j }
+      : getCascadeStartCell(
+          board,
+          prefer,
+          laneIndex,
+          laneCount,
+          seed,
+          depthIndex,
+          layout,
+          cubeScale
+        );
 
   /*
-   * Place so the trailing leaf sits on the start cell.
+   * Keep stream positions in base lattice units, then
+   * quantize into this cube's logical face grid.
    */
+  const start = {
+    i: round(startBase.i / cubeScale),
+    j: round(startBase.j / cubeScale)
+  };
+
   const ox = start.i - best.trailing[0];
   const oy = start.j - best.trailing[1];
 
@@ -2706,7 +7908,13 @@ function buildCascadeNetPlacement(
     cell[1] + oy
   ]);
 
-  return { cells, span: best.span };
+  return {
+    cells,
+    span: best.span,
+    scale: cubeScale,
+    nudgeX: slot ? slot.nudgeX || 0 : 0,
+    nudgeZ: slot ? slot.nudgeZ || 0 : 0
+  };
 }
 
 function getLocalExtreme(cells, prefer, wantLeading) {
@@ -2742,29 +7950,39 @@ function getCascadeStartCell(
   laneCount,
   seed,
   depthIndex = 0,
-  layout = null
+  layout = null,
+  scale = 1,
+  spawnMode = "reset"
 ) {
   const midI = (board.minI + board.maxI) * 0.5;
   const midJ = (board.minJ + board.maxJ) * 0.5;
+  const margin = cascadeSourceMargin(scale);
+  const inset = max(1, max(1, round(scale) || 1));
+  const onBoard = spawnMode === "initial";
 
-  /*
-   * Enter from the anti-travel side of the board.
-   */
   let startI;
   let startJ;
 
   if (prefer.di < 0) {
-    startI = board.maxI - 1;
+    startI = onBoard
+      ? board.maxI - inset
+      : board.maxI + margin;
   } else if (prefer.di > 0) {
-    startI = board.minI + 1;
+    startI = onBoard
+      ? board.minI + inset
+      : board.minI - margin;
   } else {
     startI = round(midI);
   }
 
   if (prefer.dj < 0) {
-    startJ = board.maxJ - 1;
+    startJ = onBoard
+      ? board.maxJ - inset
+      : board.maxJ + margin;
   } else if (prefer.dj > 0) {
-    startJ = board.minJ + 1;
+    startJ = onBoard
+      ? board.minJ + inset
+      : board.minJ - margin;
   } else {
     startJ = round(midJ);
   }
@@ -2775,31 +7993,50 @@ function getCascadeStartCell(
   const perpJ =
     layout ? layout.perpJ : prefer.di;
 
+  const lanes = max(1, laneCount);
+  const lane = laneIndex - (lanes - 1) * 0.5;
+
   const laneSpacing =
     layout
       ? layout.laneSpacing
-      : 2.2;
+      : max(
+          1,
+          ((board.maxI - board.minI) +
+            (board.maxJ - board.minJ)) *
+            0.08
+        );
 
   const stepSpacing =
     layout
-      ? layout.stepSpacing
+      ? max(1, layout.stepSpacing)
       : 5.4;
 
-  const lane =
-    laneIndex - (laneCount - 1) * 0.5;
-
-  startI = round(startI + perpI * lane * laneSpacing);
-  startJ = round(startJ + perpJ * lane * laneSpacing);
-
   /*
-   * Pipeline along travel so the board starts full
-   * and stays in a continuous stream.
+   * Prefer at least one base cell between lanes when
+   * possible so resets don't snap on top of each other.
    */
-  const depth =
-    max(0, depthIndex);
+  const laneStep = max(laneSpacing, lanes > 12 ? 0.65 : 1);
 
-  startI = round(startI + prefer.di * depth * stepSpacing);
-  startJ = round(startJ + prefer.dj * depth * stepSpacing);
+  startI = round(startI + perpI * lane * laneStep);
+  startJ = round(startJ + perpJ * lane * laneStep);
+
+  const depth = max(0, depthIndex);
+
+  if (onBoard) {
+    /*
+     * Initial stream: stack from the source edge into
+     * the frame so cubes are visible right away.
+     */
+    startI = round(startI + prefer.di * depth * stepSpacing);
+    startJ = round(startJ + prefer.dj * depth * stepSpacing);
+  } else {
+    /*
+     * Resets: stack further off-board along the source
+     * side so re-entries don't pop in mid-frame.
+     */
+    startI = round(startI - prefer.di * depth * stepSpacing);
+    startJ = round(startJ - prefer.dj * depth * stepSpacing);
+  }
 
   return { i: startI, j: startJ };
 }
@@ -2867,11 +8104,16 @@ function advanceCascadeTraveler(traveler, settings) {
 
 function cascadeTravelerOffBoard(traveler, settings) {
   const board = getVisibleFaceBoard(settings);
-  const margin = 3;
+  const scale = max(1, traveler.scale || 1);
+  const margin = 3 * scale;
+  const footprint = expandCellsToFootprint(
+    traveler.cells,
+    scale
+  );
 
   let anyOn = false;
 
-  for (const cell of traveler.cells) {
+  for (const cell of footprint) {
     if (
       cell[0] >= board.minI - margin &&
       cell[0] <= board.maxI + margin &&
@@ -2894,10 +8136,13 @@ function cascadeTravelerOffBoard(traveler, settings) {
   const trailing =
     traveler.net.faces[traveler.trailingIndex];
 
+  const trailingBaseI = trailing.gridX * scale;
+  const trailingBaseJ = trailing.gridY * scale;
+
   const score =
     preferScore(
-      trailing.gridX,
-      trailing.gridY,
+      trailingBaseI,
+      trailingBaseJ,
       traveler.prefer
     );
 
@@ -2920,71 +8165,86 @@ function cascadeTravelerOffBoard(traveler, settings) {
 
 function resetCascadeTravelerToStart(traveler, settings) {
   const board = getVisibleFaceBoard(settings);
-  const count = max(1, cascadeTravelers.length);
+  const occupied = buildCascadeOccupancy(traveler);
+  const scale = max(1, traveler.scale || 1);
   const layout =
+    traveler.streamLayout ||
     getCascadeStreamLayout(
       board,
       traveler.prefer,
-      count
+      max(1, cascadeTravelers.length),
+      scale
     );
 
-  const laneIndex =
-    traveler.laneIndex ??
-    max(0, cascadeTravelers.indexOf(traveler));
+  let plant = findFreeCascadePlant(
+    board,
+    traveler.prefer,
+    scale,
+    occupied,
+    traveler.seed + cascadeTime * 17,
+    max(0, cascadeTravelers.indexOf(traveler)),
+    layout,
+    traveler.laneIndex || 0,
+    traveler.depthIndex || 0,
+    "reset"
+  );
 
-  const laneCount =
-    traveler.laneCount ?? layout.lanes;
-
-  /*
-   * Re-enter at the back of this lane. Other cubes
-   * already pipeline ahead, so the stream stays full.
-   */
-  let placement =
-    buildCascadeNetPlacement(
-      traveler.typeIndex,
-      traveler.prefer,
+  if (!plant) {
+    const slot = getCascadeStartCell(
       board,
-      laneIndex,
-      laneCount,
-      traveler.seed,
-      0,
-      layout
+      traveler.prefer,
+      traveler.laneIndex || 0,
+      traveler.laneCount || layout.lanes || 1,
+      traveler.seed + cascadeTime * 0.31,
+      (traveler.depthIndex || 0) +
+        floor(cascadeTime * 0.07) % 6,
+      layout,
+      scale,
+      "reset"
     );
 
-  let cells = placement.cells;
-
-  /*
-   * If the entry slot is still occupied, nudge further
-   * behind along anti-travel so cubes don't stack.
-   */
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const blocked =
-      cascadeTravelers.some((other) => {
-        if (other === traveler) {
-          return false;
-        }
-
-        return cascadeCellsOverlap(cells, other.cells);
-      });
-
-    if (!blocked) {
-      break;
-    }
-
-    const back =
-      max(2, round(layout.stepSpacing * 0.85));
-
-    cells = cells.map((cell) => [
-      cell[0] - traveler.prefer.di * back,
-      cell[1] - traveler.prefer.dj * back
-    ]);
+    plant = [
+      round(slot.i / scale),
+      round(slot.j / scale)
+    ];
   }
 
-  traveler.cells = cells;
-  traveler.net = prepareNet(cells);
-  traveler.laneIndex = laneIndex;
-  traveler.laneCount = laneCount;
-  traveler.depthIndex = 0;
+  const typeIndex =
+    traveler.typeIndex ??
+    pickAllowedTypeIndex(
+      traveler.seed + cascadeTime,
+      settings
+    );
+
+  const placement =
+    buildCascadeNetAtPlant(
+      typeIndex,
+      traveler.prefer,
+      plant,
+      scale,
+      traveler.seed
+    );
+
+  if (!placement) {
+    traveler.plantX = plant[0];
+    traveler.plantY = plant[1];
+    traveler.phase = "waiting";
+    traveler.waitTimer = 0;
+    traveler.waitDelay = 0.1;
+    return;
+  }
+
+  traveler.typeIndex = typeIndex;
+  if (traveler.colorIndex === undefined) {
+    traveler.colorIndex = typeIndex;
+  }
+  traveler.cells = placement.cells;
+  traveler.net = prepareNet(placement.cells);
+  traveler.plantX = plant[0];
+  traveler.plantY = plant[1];
+  traveler.nudgeX = 0;
+  traveler.nudgeZ = 0;
+  traveler.scale = scale;
 
   const extremes =
     getCascadeTravelExtremes(
@@ -2994,32 +8254,46 @@ function resetCascadeTravelerToStart(traveler, settings) {
 
   traveler.trailingIndex = extremes.trailingIndex;
   traveler.leadingIndex = extremes.leadingIndex;
-  traveler.phase = "unravel";
-  traveler.animProgress =
-    (laneIndex / max(1, laneCount)) * 0.35;
+  traveler.phase = "folded";
+  traveler.animProgress = 0;
+  traveler.pauseTimer = 0;
+  traveler.waitTimer = 0;
+  traveler.waitDelay = 0;
 }
 
-function cascadeCellsOverlap(cellsA, cellsB) {
+function cascadeCellsOverlap(
+  cellsA,
+  cellsB,
+  scaleA = 1,
+  scaleB = 1
+) {
   const keys =
-    new Set(
-      cellsB.map(
-        (cell) => `${cell[0]},${cell[1]}`
-      )
-    );
+    new Set(footprintKeys(cellsB, scaleB));
 
-  let hits = 0;
-
-  for (const cell of cellsA) {
-    if (keys.has(`${cell[0]},${cell[1]}`)) {
-      hits += 1;
-
-      if (hits >= 2) {
-        return true;
-      }
+  for (const key of footprintKeys(cellsA, scaleA)) {
+    if (keys.has(key)) {
+      return true;
     }
   }
 
   return false;
+}
+
+function getCascadePlantFaceIndex(traveler) {
+  if (!traveler.net || !traveler.net.faces) {
+    return 0;
+  }
+
+  for (const face of traveler.net.faces) {
+    if (
+      face.gridX === traveler.plantX &&
+      face.gridY === traveler.plantY
+    ) {
+      return face.index;
+    }
+  }
+
+  return traveler.trailingIndex || 0;
 }
 
 function drawCascadeNets(settings) {
@@ -3028,31 +8302,56 @@ function drawCascadeNets(settings) {
   const size = settings.faceSize;
 
   for (const traveler of cascadeTravelers) {
+    if (!cascadeTravelerVisible(traveler, settings)) {
+      continue;
+    }
+
+    const folded = cascadeTravelerIsFolded(traveler);
     const unraveling =
       traveler.phase === "unravel";
+    const pauseOpen =
+      traveler.phase === "pause-open";
 
-    const plantIndex = unraveling
-      ? traveler.trailingIndex
-      : traveler.leadingIndex;
+    const plantIndex = folded
+      ? getCascadePlantFaceIndex(traveler)
+      : unraveling || pauseOpen
+        ? traveler.trailingIndex
+        : traveler.leadingIndex;
 
-    const foldProgress = unraveling
-      ? 1 - traveler.animProgress
-      : traveler.animProgress;
+    let foldProgress;
+
+    if (folded) {
+      foldProgress = 1;
+    } else if (pauseOpen) {
+      foldProgress = 0;
+    } else if (unraveling) {
+      foldProgress = 1 - traveler.animProgress;
+    } else {
+      foldProgress = traveler.animProgress;
+    }
 
     const plantFace =
-      traveler.net.faces[plantIndex];
+      traveler.net.faces[plantIndex] ||
+      traveler.net.faces[0];
 
-    const originX =
-      (plantFace.gridX + 0.5) * size;
-
-    const originZ =
-      (plantFace.gridY + 0.5) * size;
+    const scale = max(1, traveler.scale || 1);
+    const origin = worldOriginForFace(
+      plantFace.gridX,
+      plantFace.gridY,
+      scale,
+      size
+    );
 
     drawNet(
       traveler.net,
-      originX,
-      originZ,
-      getNetColor(traveler.typeIndex, settings),
+      origin.x,
+      origin.z,
+      getNetColor(
+        traveler.colorIndex !== undefined
+          ? traveler.colorIndex
+          : traveler.typeIndex,
+        settings
+      ),
       settings,
       traveler.creaseStyle,
       traveler.seed,
@@ -3060,13 +8359,16 @@ function drawCascadeNets(settings) {
       {
         foldMode: "one-side",
         foldProgress,
-        plantFaceIndex: plantIndex,
+        plantFaceIndex: plantFace.index,
         useOriginAsPlant: true,
-        drapeAmount: 0
+        drapeAmount: 0,
+        cubeScale: scale,
+        motionCurve: settings.cascadeMotionCurve
       }
     );
   }
 }
+
 
 
 /*
@@ -3166,6 +8468,7 @@ function ensurePackedLayout(settings) {
     settings.gridPlacement,
     settings.placementSkew.toFixed(3),
     allowedTypesCacheKey(settings),
+    scaleWeightsCacheKey(settings),
     placementSeed,
     width,
     height
@@ -3286,12 +8589,20 @@ const HEXOMINO_TILINGS = [
 ];
 
 /*
- * Cover every visible face-lattice cell with
- * non-overlapping cube-net hexominoes via a plane
- * tiling, then locally rematch pairs so multiple
- * net types / crease styles appear across the field.
+ * Cover the visible face lattice with non-overlapping
+ * cube nets. Pure 1× keeps the gapless hexomino tiling;
+ * mixed / larger scales use occupancy packing that
+ * preserves the requested size mix and allows gaps.
  */
 function buildHexominoPacking(settings) {
+  if (onlyUnitScaleActive(settings)) {
+    return buildUnitScalePacking(settings);
+  }
+
+  return buildMixedScalePacking(settings);
+}
+
+function buildUnitScalePacking(settings) {
   const board = getVisibleFaceBoard(settings);
   const totalCells = board.cells.length;
   const placement = settings.gridPlacement;
@@ -3318,21 +8629,324 @@ function buildHexominoPacking(settings) {
   );
   raw = filterPackedByPlacement(raw, placement, skew);
 
+  return finalizePackedPlacements(
+    raw,
+    settings,
+    totalCells
+  );
+}
+
+function buildMixedScalePacking(settings) {
+  const board = getVisibleFaceBoard(settings);
+  const totalCells = board.cells.length;
+  const weights = getNormalizedScaleWeights(settings);
+  const avgFootprint =
+    6 * (
+      weights[1] * 1 +
+      weights[2] * 4 +
+      weights[3] * 9
+    );
+
+  const totalTarget = max(
+    1,
+    floor(totalCells / max(1, avgFootprint))
+  );
+
+  const quotas = allocateScaleQuotas(totalTarget, weights);
+  const occupied = new Set();
+  const raw = [];
+
+  /*
+   * Place largest cubes first so the mix can claim
+   * contiguous blocks before small cubes fill leftovers.
+   */
+  for (const scale of [3, 2, 1]) {
+    placeScaledQuota(
+      raw,
+      occupied,
+      board,
+      settings,
+      scale,
+      quotas[scale]
+    );
+  }
+
+  const filtered = filterPackedByPlacement(
+    raw,
+    settings.gridPlacement,
+    settings.placementSkew
+  );
+
+  return finalizePackedPlacements(
+    filtered,
+    settings,
+    totalCells
+  );
+}
+
+function allocateScaleQuotas(totalTarget, weights) {
+  const quotas = {
+    1: round(totalTarget * weights[1]),
+    2: round(totalTarget * weights[2]),
+    3: round(totalTarget * weights[3])
+  };
+
+  let sum = quotas[1] + quotas[2] + quotas[3];
+
+  const order = [1, 2, 3].sort((a, b) => {
+    return weights[b] - weights[a];
+  });
+
+  while (sum > totalTarget) {
+    let trimmed = false;
+
+    for (const scale of order) {
+      if (quotas[scale] > 0) {
+        quotas[scale] -= 1;
+        sum -= 1;
+        trimmed = true;
+        break;
+      }
+    }
+
+    if (!trimmed) {
+      break;
+    }
+  }
+
+  while (sum < totalTarget) {
+    let grown = false;
+
+    for (const scale of order) {
+      if (weights[scale] > 0) {
+        quotas[scale] += 1;
+        sum += 1;
+        grown = true;
+        break;
+      }
+    }
+
+    if (!grown) {
+      quotas[1] += 1;
+      sum += 1;
+    }
+  }
+
+  if (quotas[1] + quotas[2] + quotas[3] === 0) {
+    quotas[1] = 1;
+  }
+
+  return quotas;
+}
+
+function placeScaledQuota(
+  raw,
+  occupied,
+  board,
+  settings,
+  scale,
+  want
+) {
+  if (want <= 0 || scale < 1) {
+    return;
+  }
+
+  const placement = settings.gridPlacement;
+  const skew = settings.placementSkew;
+  const allowedTypes = getAllowedTypeIndexes(settings);
+  const margin = 2;
+
+  const minMI = floor(board.minI / scale) - margin;
+  const maxMI = ceil(board.maxI / scale) + margin;
+  const minMJ = floor(board.minJ / scale) - margin;
+  const maxMJ = ceil(board.maxJ / scale) + margin;
+
+  const anchors = [];
+
+  for (let mj = minMJ; mj <= maxMJ; mj++) {
+    for (let mi = minMI; mi <= maxMI; mi++) {
+      anchors.push({
+        mi,
+        mj,
+        order: cellHash(
+          coordinateKey(mi * scale, mj * scale),
+          scale * 19 + placementSeed
+        )
+      });
+    }
+  }
+
+  anchors.sort((a, b) => a.order - b.order);
+
+  let placed = 0;
+
+  for (const anchor of anchors) {
+    if (placed >= want) {
+      break;
+    }
+
+    const salt =
+      anchor.order +
+      scale * 131 +
+      placed * 7 +
+      placementSeed;
+
+    const candidate = tryPlaceScaledNetAt(
+      anchor.mi,
+      anchor.mj,
+      scale,
+      occupied,
+      board,
+      allowedTypes,
+      placement,
+      skew,
+      salt
+    );
+
+    if (!candidate) {
+      continue;
+    }
+
+    for (const key of candidate.footprintKeys) {
+      occupied.add(key);
+    }
+
+    raw.push(candidate.entry);
+    placed += 1;
+  }
+}
+
+function tryPlaceScaledNetAt(
+  mi,
+  mj,
+  scale,
+  occupied,
+  board,
+  allowedTypes,
+  placement,
+  skew,
+  salt
+) {
+  const variants = netVariants
+    .filter((variant) => {
+      if (
+        allowedTypes &&
+        allowedTypes.length > 0 &&
+        !allowedTypes.includes(variant.typeIndex)
+      ) {
+        return false;
+      }
+
+      return variantMatchesPlacement(
+        variant,
+        placement,
+        skew,
+        salt
+      );
+    })
+    .map((variant, index) => {
+      return {
+        variant,
+        score:
+          placementBiasScore(variant.cells, placement) *
+            10 +
+          unitHash(salt * 0.17 + index * 3.1 + scale)
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  for (const { variant } of variants) {
+    const absolute = variant.cells.map((cell) => [
+      cell[0] + mi,
+      cell[1] + mj
+    ]);
+
+    if (!pieceIntersectsBoard(
+      expandCellsToFootprint(absolute, scale),
+      board
+    )) {
+      continue;
+    }
+
+    const keys = footprintKeys(absolute, scale);
+    let free = true;
+
+    for (const key of keys) {
+      if (occupied.has(key)) {
+        free = false;
+        break;
+      }
+    }
+
+    if (!free) {
+      continue;
+    }
+
+    const rootCell = absolute[0];
+
+    return {
+      footprintKeys: keys,
+      entry: {
+        cells: absolute,
+        scale,
+        typeIndex: variant.typeIndex,
+        creaseStyle:
+          floor(
+            unitHash(
+              rootCell[0] * 19.7 +
+              rootCell[1] * 47.3 +
+              salt * 3.1 +
+              placementSeed * 0.71 +
+              scale * 5.9
+            ) * 5
+          ),
+        seed:
+          rootCell[0] * 131 +
+          rootCell[1] * 17 +
+          salt +
+          placementSeed +
+          scale * 97,
+        order: cellHash(
+          coordinateKey(
+            rootCell[0] * scale,
+            rootCell[1] * scale
+          ),
+          scale
+        )
+      }
+    };
+  }
+
+  return null;
+}
+
+function finalizePackedPlacements(raw, settings, totalCells) {
   const size = settings.faceSize;
+  const placement = settings.gridPlacement;
+  const skew = settings.placementSkew;
+
   const placements = raw.map((entry) => {
+    const scale = max(1, entry.scale || 1);
     const net = prepareNet(entry.cells);
     const root = net.faces[net.rootIndex];
     const skews =
       unitHash(entry.seed * 0.83) < skew;
+    const origin = worldOriginForFace(
+      root.gridX,
+      root.gridY,
+      scale,
+      size
+    );
 
     return {
       net,
+      scale,
       /*
-       * Centers sit on half-cell offsets so face
+       * Centers sit on half-face offsets so face
        * corners land on the isometric lattice nodes.
        */
-      originX: (root.gridX + 0.5) * size,
-      originZ: (root.gridY + 0.5) * size,
+      originX: origin.x,
+      originZ: origin.z,
       colorIndex: entry.typeIndex,
       creaseStyle:
         creaseStyleForPlacement(
@@ -3347,8 +8961,9 @@ function buildHexominoPacking(settings) {
         unitHash(
           root.gridX * 73.1 +
           root.gridY * 29.7 +
-          entry.seed * 0.17
-        ) * 0.72
+          entry.seed * 0.17 +
+          scale * 4.3
+        ) * FOLD_STAGGER_MAX
     };
   });
 
@@ -4195,40 +9810,38 @@ function drawNet(
   const foldMode =
     options.foldMode || settings.foldMode;
 
+  const cubeScale = max(1, options.cubeScale || 1);
+  const edgeSize = settings.faceSize * cubeScale;
+  const motionCurve =
+    options.motionCurve ||
+    settings.cascadeMotionCurve ||
+    (options.linearFold ? "linear" : "ease");
+
   let staggeredProgress;
 
   if (options.foldProgress !== undefined) {
-    const clamped = constrain(
+    staggeredProgress = constrain(
       options.foldProgress,
       0,
       1
     );
-
-    /*
-     * Linear fold keeps equal time per plane
-     * (scatter one-side). Default eases the
-     * whole-sheet progress.
-     */
-    staggeredProgress = options.linearFold
-      ? clamped
-      : smootherstep(clamped);
   } else {
     /*
      * Per-net fold stagger: some cubes begin folding
      * later so the field doesn't turn over in lockstep.
      */
-    const delay = constrain(foldDelay, 0, 0.85);
-    const span = max(0.001, 1 - delay);
-
-    staggeredProgress =
-      smootherstep(
-        constrain(
-          (settings.foldProgress - delay) / span,
-          0,
-          1
-        )
-      );
+    staggeredProgress = staggeredNetFoldProgress(
+      settings.foldProgress,
+      foldDelay,
+      settings
+    );
   }
+
+  const globalCurvedProgress =
+    applyMotionCurve(
+      staggeredProgress,
+      motionCurve
+    );
 
   /*
    * One side: plant an end face and fold the sheet
@@ -4263,13 +9876,15 @@ function drawNet(
       const endFace =
         activeNet.faces[endIndex];
 
-      plantX =
-        (endFace.gridX + 0.5) *
-        settings.faceSize;
+      const plant = worldOriginForFace(
+        endFace.gridX,
+        endFace.gridY,
+        cubeScale,
+        settings.faceSize
+      );
 
-      plantZ =
-        (endFace.gridY + 0.5) *
-        settings.faceSize;
+      plantX = plant.x;
+      plantZ = plant.z;
     }
   }
 
@@ -4289,7 +9904,8 @@ function drawNet(
       activeNet,
       staggeredProgress,
       foldMode,
-      creaseSeed
+      creaseSeed,
+      motionCurve
     );
 
   const creaseDepth =
@@ -4309,7 +9925,7 @@ function drawNet(
       activeNet,
       plantX,
       plantZ,
-      settings.faceSize,
+      edgeSize,
       (childIndex) => {
         const progress =
           creaseProgress[childIndex];
@@ -4338,7 +9954,18 @@ function drawNet(
             )
           );
 
-        const foldedAngle = HALF_PI;
+        if (options.insideOutFlow) {
+          return lerp(
+            HALF_PI,
+            -HALF_PI,
+            progress
+          );
+        }
+
+        const foldedAngle =
+          options.invertFold
+            ? -HALF_PI
+            : HALF_PI;
 
         return lerp(
           drapedAngle,
@@ -4388,27 +10015,36 @@ function drawNet(
 
     const shadeProgress =
       aligned > 0.98
-        ? staggeredProgress
+        ? globalCurvedProgress
         : creaseProgress[faceIndex];
 
     const faceBaseColor =
-      multiOuter
+      options.faceColorFor
         ? color(
-            getFaceOuterColor(
+            options.faceColorFor(
               faceIndex,
-              netColor,
-              settings,
-              creaseSeed
+              transform,
+              activeNet
             )
           )
-        : baseColor;
+        : multiOuter
+          ? color(
+              getFaceOuterColor(
+                faceIndex,
+                netColor,
+                settings,
+                creaseSeed
+              )
+            )
+          : baseColor;
 
     drawConnectedFace(
       transform,
       faceBaseColor,
       shadeProgress,
       settings,
-      innerBaseColor
+      innerBaseColor,
+      edgeSize
     );
   }
 }
@@ -4569,14 +10205,21 @@ function getFaceFoldProgress(
   net,
   globalProgress,
   foldMode,
-  foldSeed = 0
+  foldSeed = 0,
+  motionCurve = "ease"
 ) {
   const count = net.faces.length;
   const progress =
     new Array(count).fill(globalProgress);
 
   if (foldMode === "both") {
-    return progress;
+    const curved =
+      applyMotionCurve(
+        globalProgress,
+        motionCurve
+      );
+
+    return new Array(count).fill(curved);
   }
 
   /*
@@ -4587,7 +10230,8 @@ function getFaceFoldProgress(
   if (foldMode === "one-side") {
     return getOneSideFoldProgress(
       net,
-      globalProgress
+      globalProgress,
+      motionCurve
     );
   }
 
@@ -4651,8 +10295,9 @@ function getFaceFoldProgress(
       distance[i];
 
     progress[i] =
-      smootherstep(
-        constrain(local / blend, 0, 1)
+      applyMotionCurve(
+        constrain(local / blend, 0, 1),
+        motionCurve
       );
   }
 
@@ -4664,7 +10309,11 @@ function getFaceFoldProgress(
  * root. Farthest faces move first so the sheet
  * rolls onto the edge plane.
  */
-function getOneSideFoldProgress(net, globalProgress) {
+function getOneSideFoldProgress(
+  net,
+  globalProgress,
+  motionCurve = "ease"
+) {
   const count = net.faces.length;
   const progress =
     new Array(count).fill(0);
@@ -4712,8 +10361,9 @@ function getOneSideFoldProgress(net, globalProgress) {
       globalProgress * slots - slot;
 
     progress[folding[slot].index] =
-      smootherstep(
-        constrain(local, 0, 1)
+      applyMotionCurve(
+        constrain(local, 0, 1),
+        motionCurve
       );
   }
 
@@ -5082,10 +10732,14 @@ function drawConnectedFace(
   baseColor,
   progress,
   settings,
-  innerBaseColor = null
+  innerBaseColor = null,
+  faceSize = null,
+  exactColor = false
 ) {
   const half =
-    settings.faceSize * 0.5;
+    (faceSize == null
+      ? settings.faceSize
+      : faceSize) * 0.5;
 
   const u =
     scaleVector(
@@ -5152,7 +10806,8 @@ function drawConnectedFace(
     normal,
     progress,
     settings,
-    true
+    true,
+    exactColor
   );
 
   if (!needsInner) {
@@ -5175,7 +10830,8 @@ function drawConnectedFace(
     inward,
     progress,
     settings,
-    false
+    false,
+    exactColor
   );
 }
 
@@ -5223,8 +10879,7 @@ function drawFaceSide(
   }
 
   if (!settings.showDivisions) {
-    stroke(faceColor);
-    strokeWeight(1.5);
+    noStroke();
     drawFaceQuad(corners);
     return;
   }
@@ -5758,4 +11413,14 @@ function smootherstep(value) {
       10
     )
   );
+}
+
+function applyMotionCurve(value, curve = "ease") {
+  const t = constrain(value, 0, 1);
+
+  if (curve === "linear") {
+    return t;
+  }
+
+  return smootherstep(t);
 }
