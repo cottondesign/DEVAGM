@@ -1,0 +1,1624 @@
+const BASE_WIDTH = 1440;
+const BASE_HEIGHT = 810;
+const MAX_PIXEL_DENSITY = 2;
+
+
+function getRenderDensity() {
+  return min(
+    MAX_PIXEL_DENSITY,
+    displayDensity()
+  );
+}
+
+
+function getCanvasDimensions() {
+  const aspect =
+    BASE_WIDTH /
+    BASE_HEIGHT;
+
+  let width =
+    windowWidth;
+
+  let height =
+    windowHeight;
+
+  if (
+    width / height >
+    aspect
+  ) {
+    width =
+      height *
+      aspect;
+  } else {
+    height =
+      width /
+      aspect;
+  }
+
+  return {
+    width: max(
+      1,
+      floor(width)
+    ),
+
+    height: max(
+      1,
+      floor(height)
+    )
+  };
+}
+
+
+/* ---------------------------------------------------------
+   PALETTE
+--------------------------------------------------------- */
+
+const PALETTE = [
+  "#FFFFFF",
+  "#032932",
+  "#0A4552",
+  "#32EEFF",
+  "#DAFF47",
+  "#5D005D",
+  "#16C518",
+  "#235C58",
+  "#9EE6FF",
+  "#0DB6FF",
+  "#AF830F",
+  "#F9A3FB",
+  "#FF520D",
+  "#FFB616"
+];
+
+
+let selectedColor = PALETTE[0];
+
+let controls = {};
+
+let singleImage = null;
+let leftImage = null;
+let rightImage = null;
+
+
+/* ---------------------------------------------------------
+   ANIMATION
+--------------------------------------------------------- */
+
+let animationProgress = 1;
+let animationRunning = false;
+let animationStartTime = 0;
+
+let activeRevealDirection = "left";
+
+
+/* ---------------------------------------------------------
+   SETUP
+--------------------------------------------------------- */
+
+function setup() {
+  setAttributes(
+    "antialias",
+    true
+  );
+
+  const dimensions =
+    getCanvasDimensions();
+
+  const canvas = createCanvas(
+    dimensions.width,
+    dimensions.height,
+    WEBGL
+  );
+
+  canvas.parent("canvas-container");
+
+  pixelDensity(
+    getRenderDensity()
+  );
+
+  textureMode(NORMAL);
+
+  getControls();
+  buildPalette();
+  connectControls();
+  updateControlUI();
+
+  applyBackgroundColor();
+}
+
+
+function windowResized() {
+  const dimensions =
+    getCanvasDimensions();
+
+  resizeCanvas(
+    dimensions.width,
+    dimensions.height
+  );
+
+  pixelDensity(
+    getRenderDensity()
+  );
+}
+
+
+/* ---------------------------------------------------------
+   DRAW
+--------------------------------------------------------- */
+
+function draw() {
+  const settings = getSettings();
+
+  background(selectedColor);
+
+  updateAnimation(settings);
+
+  if (settings.showGrid) {
+    drawScreenIsometricGrid(settings);
+  }
+
+  setIsometricCamera(settings);
+
+  drawCube(settings);
+}
+
+
+/* ---------------------------------------------------------
+   SETTINGS
+--------------------------------------------------------- */
+
+function getSettings() {
+  const cameraZoom =
+    Number(controls.cameraZoom.value);
+
+  const verticalView =
+    getVerticalView(cameraZoom);
+
+  return {
+    cubeSize:
+      Number(controls.cubeSize.value),
+
+    cubeY:
+      Number(controls.cubeY.value),
+
+    debugMode:
+      controls.debugMode.checked,
+
+    imageMode:
+      controls.imageMode.value,
+
+    oneFaceSide:
+      controls.oneFaceSide.value,
+
+    revealDirection:
+      controls.revealDirection.value,
+
+    animationDuration:
+      Number(controls.animationDuration.value),
+
+    rotationAmount:
+      radians(
+        Number(controls.rotationAmount.value)
+      ),
+
+    autoLoop:
+      controls.autoLoop.checked,
+
+    showGrid:
+      controls.showGrid.checked,
+
+    gridSize:
+      Number(controls.gridSize.value),
+
+    gridOpacity:
+      Number(controls.gridOpacity.value) / 100,
+
+    cameraZoom,
+
+    verticalView
+  };
+}
+
+
+/* ---------------------------------------------------------
+   CUBE
+--------------------------------------------------------- */
+
+function drawCube(settings) {
+  push();
+
+  translate(
+    0,
+    settings.cubeY,
+    0
+  );
+
+  const eased =
+    easeInOutCubic(animationProgress);
+
+  const rotations =
+    getRevealRotation(
+      activeRevealDirection,
+      settings.rotationAmount
+    );
+
+  let currentX;
+  let currentY;
+  let currentZ;
+
+  if (isDiagonalReveal(activeRevealDirection)) {
+    /*
+     * Diagonal reveals keep full yaw at the start so both
+     * image faces stay hidden, then arc through X mid-flight.
+     */
+    const arc =
+      sin(eased * PI);
+
+    currentY =
+      rotations.y *
+      (1 - eased);
+
+    currentX =
+      rotations.x *
+      arc;
+
+    currentZ = 0;
+  } else {
+    currentX =
+      lerp(
+        rotations.x,
+        0,
+        eased
+      );
+
+    currentY =
+      lerp(
+        rotations.y,
+        0,
+        eased
+      );
+
+    currentZ =
+      lerp(
+        rotations.z,
+        0,
+        eased
+      );
+  }
+
+  /*
+   * Rotation ordering matters.
+   *
+   * Y is applied first for the main left/right spin,
+   * followed by X and Z for angled reveal modes.
+   */
+
+  rotateY(currentY);
+  rotateX(currentX);
+  rotateZ(currentZ);
+
+  drawCubeFaces(settings);
+
+  pop();
+}
+
+
+/* ---------------------------------------------------------
+   REVEAL DIRECTIONS
+--------------------------------------------------------- */
+
+function getBaseRevealDirection(direction) {
+  if (direction.endsWith("-old")) {
+    return direction.slice(0, -4);
+  }
+
+  return direction;
+}
+
+
+function isDiagonalReveal(direction) {
+  return (
+    direction === "left-up" ||
+    direction === "right-up" ||
+    direction === "left-down" ||
+    direction === "right-down"
+  );
+}
+
+
+function getRevealRotation(direction, amount) {
+  const baseDirection =
+    getBaseRevealDirection(direction);
+
+  /*
+   * The normal cube position is:
+   *
+   * X = 0
+   * Y = 0
+   * Z = 0
+   *
+   * These values describe ONLY the starting position.
+   */
+
+  if (baseDirection === "left") {
+    return {
+      x: 0,
+      y: amount,
+      z: 0
+    };
+  }
+
+  if (baseDirection === "right") {
+    return {
+      x: 0,
+      y: -amount,
+      z: 0
+    };
+  }
+
+  if (baseDirection === "up") {
+    return {
+      x: amount,
+      y: 0,
+      z: 0
+    };
+  }
+
+  if (baseDirection === "down") {
+    return {
+      x: -amount,
+      y: 0,
+      z: 0
+    };
+  }
+
+  if (baseDirection === "left-up") {
+    return {
+      x: amount * 0.7,
+      y: amount,
+      z: 0
+    };
+  }
+
+  if (baseDirection === "right-up") {
+    return {
+      x: amount * 0.7,
+      y: -amount,
+      z: 0
+    };
+  }
+
+  if (baseDirection === "left-down") {
+    return {
+      x: -amount * 0.7,
+      y: amount,
+      z: 0
+    };
+  }
+
+  if (baseDirection === "right-down") {
+    return {
+      x: -amount * 0.7,
+      y: -amount,
+      z: 0
+    };
+  }
+
+  return {
+    x: 0,
+    y: amount,
+    z: 0
+  };
+}
+
+
+/* ---------------------------------------------------------
+   CUSTOM CUBE FACES
+--------------------------------------------------------- */
+
+function drawCubeFaces(settings) {
+  const s = settings.cubeSize;
+  const h = s * 0.5;
+
+  const leftTexture =
+    shouldShowFaceTextures()
+      ? getLeftTexture(settings)
+      : null;
+
+  const rightTexture =
+    shouldShowFaceTextures()
+      ? getRightTexture(settings)
+      : null;
+
+
+  /* ---------------- TOP ---------------- */
+
+  drawSolidQuad(
+    [
+      [-h, -h, -h],
+      [ h, -h, -h],
+      [ h, -h,  h],
+      [-h, -h,  h]
+    ],
+    settings
+  );
+
+
+  /* ---------------- LEFT / +Z ---------------- */
+
+  if (leftTexture) {
+    drawTexturedQuad(
+      leftTexture,
+      [
+        [-h, -h, h],
+        [ h, -h, h],
+        [ h,  h, h],
+        [-h,  h, h]
+      ],
+      settings,
+      0
+    );
+  } else {
+    drawSolidQuad(
+      [
+        [-h, -h, h],
+        [ h, -h, h],
+        [ h,  h, h],
+        [-h,  h, h]
+      ],
+      settings
+    );
+  }
+
+
+  /* ---------------- RIGHT / +X ---------------- */
+
+  if (rightTexture) {
+    drawTexturedQuad(
+      rightTexture,
+      [
+        [h, -h, -h],
+        [h,  h, -h],
+        [h,  h,  h],
+        [h, -h,  h]
+      ],
+      settings,
+
+      /*
+       * RIGHT SIDE PNG:
+       * 90° CCW aligns texture top with screen top
+       * on this +X face in isometric view.
+       */
+      HALF_PI
+    );
+  } else {
+    drawSolidQuad(
+      [
+        [h, -h, -h],
+        [h,  h, -h],
+        [h,  h,  h],
+        [h, -h,  h]
+      ],
+      settings
+    );
+  }
+
+
+  /* ---------------- BACK / -Z ---------------- */
+
+  drawSolidQuad(
+    [
+      [ h, -h, -h],
+      [-h, -h, -h],
+      [-h,  h, -h],
+      [ h,  h, -h]
+    ],
+    settings
+  );
+
+
+  /* ---------------- BACK / -X ---------------- */
+
+  drawSolidQuad(
+    [
+      [-h, -h,  h],
+      [-h,  h,  h],
+      [-h,  h, -h],
+      [-h, -h, -h]
+    ],
+    settings
+  );
+
+
+  /* ---------------- BOTTOM ---------------- */
+
+  drawSolidQuad(
+    [
+      [-h, h,  h],
+      [ h, h,  h],
+      [ h, h, -h],
+      [-h, h, -h]
+    ],
+    settings
+  );
+}
+
+
+/* ---------------------------------------------------------
+   FACE TEXTURE SELECTION
+--------------------------------------------------------- */
+
+function shouldShowFaceTextures() {
+  /*
+   * Keep PNGs hidden at animation start. Diagonal reveal
+   * directions can leave a textured face facing camera
+   * even when the cube is fully rotated away.
+   */
+  return animationProgress > 0.001;
+}
+
+
+function getLeftTexture(settings) {
+  if (settings.imageMode === "none") {
+    return null;
+  }
+
+  if (settings.imageMode === "one") {
+    if (settings.oneFaceSide === "left") {
+      return singleImage;
+    }
+
+    return null;
+  }
+
+  if (settings.imageMode === "two") {
+    return leftImage;
+  }
+
+  return null;
+}
+
+
+function getRightTexture(settings) {
+  if (settings.imageMode === "none") {
+    return null;
+  }
+
+  if (settings.imageMode === "one") {
+    if (settings.oneFaceSide === "right") {
+      return singleImage;
+    }
+
+    return null;
+  }
+
+  if (settings.imageMode === "two") {
+    return rightImage;
+  }
+
+  return null;
+}
+
+
+/* ---------------------------------------------------------
+   SOLID FACE
+--------------------------------------------------------- */
+
+function drawSolidQuad(points, settings) {
+  push();
+
+  fill(selectedColor);
+
+  if (settings.debugMode) {
+    stroke(getDebugColor());
+    strokeWeight(2);
+  } else {
+    noStroke();
+  }
+
+  beginShape(QUADS);
+
+  for (const point of points) {
+    vertex(
+      point[0],
+      point[1],
+      point[2]
+    );
+  }
+
+  endShape(CLOSE);
+
+  pop();
+}
+
+
+/* ---------------------------------------------------------
+   TEXTURED FACE
+
+   textureRotation lets individual faces rotate their
+   PNG without rotating the actual cube face.
+--------------------------------------------------------- */
+
+function drawTexturedQuad(
+  img,
+  points,
+  settings,
+  textureRotation = 0
+) {
+  if (!img) {
+    drawSolidQuad(points, settings);
+    return;
+  }
+
+  push();
+
+  fill(255);
+
+  if (settings.debugMode) {
+    stroke(getDebugColor());
+    strokeWeight(2);
+  } else {
+    noStroke();
+  }
+
+  texture(img);
+  applyTextureQuality();
+
+  const uv0 =
+    rotateUV(
+      0,
+      0,
+      textureRotation
+    );
+
+  const uv1 =
+    rotateUV(
+      1,
+      0,
+      textureRotation
+    );
+
+  const uv2 =
+    rotateUV(
+      1,
+      1,
+      textureRotation
+    );
+
+  const uv3 =
+    rotateUV(
+      0,
+      1,
+      textureRotation
+    );
+
+
+  beginShape(QUADS);
+
+  vertex(
+    points[0][0],
+    points[0][1],
+    points[0][2],
+    uv0.u,
+    uv0.v
+  );
+
+  vertex(
+    points[1][0],
+    points[1][1],
+    points[1][2],
+    uv1.u,
+    uv1.v
+  );
+
+  vertex(
+    points[2][0],
+    points[2][1],
+    points[2][2],
+    uv2.u,
+    uv2.v
+  );
+
+  vertex(
+    points[3][0],
+    points[3][1],
+    points[3][2],
+    uv3.u,
+    uv3.v
+  );
+
+  endShape(CLOSE);
+
+  pop();
+}
+
+
+/* ---------------------------------------------------------
+   UV ROTATION
+
+   Rotates texture coordinates around the center
+   of the square face.
+--------------------------------------------------------- */
+
+function rotateUV(u, v, angle) {
+  const cx = 0.5;
+  const cy = 0.5;
+
+  const x =
+    u - cx;
+
+  const y =
+    v - cy;
+
+  const cosA =
+    cos(angle);
+
+  const sinA =
+    sin(angle);
+
+  const rotatedX =
+    x * cosA -
+    y * sinA;
+
+  const rotatedY =
+    x * sinA +
+    y * cosA;
+
+  return {
+    u:
+      rotatedX + cx,
+
+    v:
+      rotatedY + cy
+  };
+}
+
+
+function applyTextureQuality() {
+  const gl =
+    drawingContext;
+
+  gl.texParameteri(
+    gl.TEXTURE_2D,
+    gl.TEXTURE_MIN_FILTER,
+    gl.LINEAR
+  );
+
+  gl.texParameteri(
+    gl.TEXTURE_2D,
+    gl.TEXTURE_MAG_FILTER,
+    gl.LINEAR
+  );
+
+  const anisotropic =
+    gl.getExtension(
+      "EXT_texture_filter_anisotropic"
+    ) ||
+    gl.getExtension(
+      "MOZ_EXT_texture_filter_anisotropic"
+    ) ||
+    gl.getExtension(
+      "WEBKIT_EXT_texture_filter_anisotropic"
+    );
+
+  if (anisotropic) {
+    const maxAnisotropy =
+      gl.getParameter(
+        anisotropic.MAX_TEXTURE_MAX_ANISOTROPY_EXT
+      );
+
+    gl.texParameterf(
+      gl.TEXTURE_2D,
+      anisotropic.TEXTURE_MAX_ANISOTROPY_EXT,
+      maxAnisotropy
+    );
+  }
+}
+
+
+/* ---------------------------------------------------------
+   DEBUG COLOR
+--------------------------------------------------------- */
+
+function getDebugColor() {
+  const c =
+    color(selectedColor);
+
+  const brightnessValue =
+    (
+      red(c) +
+      green(c) +
+      blue(c)
+    ) / 3;
+
+  if (brightnessValue > 145) {
+    return color(
+      3,
+      41,
+      50
+    );
+  }
+
+  return color(
+    254,
+    249,
+    243
+  );
+}
+
+
+/* ---------------------------------------------------------
+   TRUE ISOMETRIC CAMERA
+--------------------------------------------------------- */
+
+function getVerticalView(zoom) {
+  return 560 / zoom;
+}
+
+
+function setIsometricCamera(settings) {
+  const verticalView =
+    settings.verticalView;
+
+  const horizontalView =
+    verticalView *
+    (width / height);
+
+  ortho(
+    -horizontalView,
+    horizontalView,
+    -verticalView,
+    verticalView,
+    -10000,
+    10000
+  );
+
+  const elevation =
+    atan(1 / sqrt(2));
+
+  const azimuth =
+    QUARTER_PI;
+
+  const distance =
+    2400;
+
+  const horizontalDistance =
+    distance *
+    cos(elevation);
+
+  const eyeX =
+    horizontalDistance *
+    cos(azimuth);
+
+  const eyeY =
+    -distance *
+    sin(elevation);
+
+  const eyeZ =
+    horizontalDistance *
+    sin(azimuth);
+
+  camera(
+    eyeX,
+    eyeY,
+    eyeZ,
+
+    0,
+    0,
+    0,
+
+    0,
+    1,
+    0
+  );
+}
+
+
+/* ---------------------------------------------------------
+   SCREEN SPACE CAMERA
+--------------------------------------------------------- */
+
+function beginScreenSpaceCamera() {
+  ortho(
+    -width * 0.5,
+    width * 0.5,
+    -height * 0.5,
+    height * 0.5,
+    -1000,
+    1000
+  );
+
+  camera(
+    0,
+    0,
+    500,
+
+    0,
+    0,
+    0,
+
+    0,
+    1,
+    0
+  );
+}
+
+
+/* ---------------------------------------------------------
+   ISOMETRIC GRID
+--------------------------------------------------------- */
+
+function drawScreenIsometricGrid(settings) {
+  push();
+
+  beginScreenSpaceCamera();
+
+  const edge =
+    settings.gridSize;
+
+  const columnSpacing =
+    edge *
+    sqrt(3) *
+    0.5;
+
+  const overscan =
+    max(
+      width,
+      height
+    ) * 1.5;
+
+  const gridColor =
+    getGridColor(
+      settings.gridOpacity
+    );
+
+  stroke(gridColor);
+  strokeWeight(1);
+
+
+  /* ---------------- VERTICAL ---------------- */
+
+  const verticalCount =
+    ceil(
+      width /
+      columnSpacing
+    ) + 8;
+
+  for (
+    let column = -verticalCount;
+    column <= verticalCount;
+    column++
+  ) {
+    const x =
+      column *
+      columnSpacing;
+
+    line(
+      x,
+      -overscan,
+      0,
+
+      x,
+      overscan,
+      0
+    );
+  }
+
+
+  /* ---------------- DIAGONALS ---------------- */
+
+  const rowCount =
+    ceil(
+      height /
+      edge
+    ) +
+    ceil(
+      width /
+      edge
+    ) +
+    12;
+
+
+  for (
+    let row = -rowCount;
+    row <= rowCount;
+    row++
+  ) {
+    const intercept =
+      row *
+      edge;
+
+
+    /* DOWN-RIGHT */
+
+    line(
+      -overscan,
+
+      intercept -
+        overscan /
+        sqrt(3),
+
+      0,
+
+      overscan,
+
+      intercept +
+        overscan /
+        sqrt(3),
+
+      0
+    );
+
+
+    /* DOWN-LEFT */
+
+    line(
+      -overscan,
+
+      intercept +
+        overscan /
+        sqrt(3),
+
+      0,
+
+      overscan,
+
+      intercept -
+        overscan /
+        sqrt(3),
+
+      0
+    );
+  }
+
+  pop();
+}
+
+
+/* ---------------------------------------------------------
+   GRID COLOR
+--------------------------------------------------------- */
+
+function getGridColor(alphaAmount) {
+  const bg =
+    color(selectedColor);
+
+  const brightnessValue =
+    (
+      red(bg) +
+      green(bg) +
+      blue(bg)
+    ) / 3;
+
+  const a =
+    255 *
+    alphaAmount;
+
+  if (brightnessValue > 145) {
+    return color(
+      3,
+      41,
+      50,
+      a
+    );
+  }
+
+  return color(
+    254,
+    249,
+    243,
+    a
+  );
+}
+
+
+/* ---------------------------------------------------------
+   ANIMATION
+--------------------------------------------------------- */
+
+function playAnimation() {
+  const settings =
+    getSettings();
+
+  /*
+   * If RANDOM is selected, pick one direction
+   * only when the animation begins.
+   *
+   * This keeps the direction stable throughout
+   * the full animation.
+   */
+
+  if (
+    settings.revealDirection ===
+    "random"
+  ) {
+    activeRevealDirection =
+      getRandomRevealDirection();
+  } else {
+    activeRevealDirection =
+      settings.revealDirection;
+  }
+
+  animationProgress = 0;
+
+  animationRunning = true;
+
+  animationStartTime =
+    millis();
+}
+
+
+function resetAnimation() {
+  const settings =
+    getSettings();
+
+  if (
+    settings.revealDirection ===
+    "random"
+  ) {
+    activeRevealDirection =
+      getRandomRevealDirection();
+  } else {
+    activeRevealDirection =
+      settings.revealDirection;
+  }
+
+  animationProgress = 0;
+
+  animationRunning = false;
+}
+
+
+function updateAnimation(settings) {
+  if (!animationRunning) {
+    return;
+  }
+
+  const durationMs =
+    settings.animationDuration *
+    1000;
+
+  const elapsed =
+    millis() -
+    animationStartTime;
+
+  animationProgress =
+    constrain(
+      elapsed /
+      durationMs,
+      0,
+      1
+    );
+
+  if (
+    animationProgress >= 1
+  ) {
+    animationProgress = 1;
+
+    if (settings.autoLoop) {
+      if (
+        elapsed >
+        durationMs + 700
+      ) {
+        playAnimation();
+      }
+    } else {
+      animationRunning = false;
+    }
+  }
+}
+
+
+/* ---------------------------------------------------------
+   RANDOM DIRECTION
+--------------------------------------------------------- */
+
+function getRandomRevealDirection() {
+  const directions = [
+    "left",
+    "right",
+    "up",
+    "down",
+    "left-up",
+    "right-up",
+    "left-down",
+    "right-down"
+  ];
+
+  return random(
+    directions
+  );
+}
+
+
+/* ---------------------------------------------------------
+   EASING
+--------------------------------------------------------- */
+
+function easeInOutCubic(t) {
+  if (t < 0.5) {
+    return (
+      4 *
+      t *
+      t *
+      t
+    );
+  }
+
+  return (
+    1 -
+    pow(
+      -2 * t + 2,
+      3
+    ) / 2
+  );
+}
+
+
+/* ---------------------------------------------------------
+   IMAGE LOADING
+--------------------------------------------------------- */
+
+function loadImageFromInput(
+  file,
+  callback
+) {
+  if (!file) {
+    callback(null);
+    return;
+  }
+
+  const reader =
+    new FileReader();
+
+  reader.onload =
+    (event) => {
+      loadImage(
+        event.target.result,
+
+        (img) => {
+          callback(img);
+        },
+
+        () => {
+          console.error(
+            "Could not load image."
+          );
+
+          callback(null);
+        }
+      );
+    };
+
+  reader.readAsDataURL(
+    file
+  );
+}
+
+
+/* ---------------------------------------------------------
+   CONTROLS
+--------------------------------------------------------- */
+
+function getControls() {
+  const ids = [
+    "controls",
+
+    "palette",
+
+    "cubeSize",
+    "cubeSizeValue",
+
+    "cubeY",
+    "cubeYValue",
+
+    "debugMode",
+
+    "imageMode",
+
+    "oneFaceControls",
+    "twoFaceControls",
+
+    "oneFaceSide",
+
+    "singleImageInput",
+    "leftImageInput",
+    "rightImageInput",
+
+    "revealDirection",
+
+    "animationDuration",
+    "animationDurationValue",
+
+    "rotationAmount",
+    "rotationAmountValue",
+
+    "autoLoop",
+
+    "playButton",
+    "resetButton",
+
+    "showGrid",
+
+    "gridSize",
+    "gridSizeValue",
+
+    "gridOpacity",
+    "gridOpacityValue",
+
+    "cameraZoom",
+    "cameraZoomValue"
+  ];
+
+  for (const id of ids) {
+    controls[id] =
+      document.getElementById(id);
+  }
+}
+
+
+/* ---------------------------------------------------------
+   CONNECT CONTROLS
+--------------------------------------------------------- */
+
+function connectControls() {
+  const rangeControls = [
+    controls.cubeSize,
+    controls.cubeY,
+    controls.animationDuration,
+    controls.rotationAmount,
+    controls.gridSize,
+    controls.gridOpacity,
+    controls.cameraZoom
+  ];
+
+  rangeControls.forEach(
+    (control) => {
+      control.addEventListener(
+        "input",
+        updateControlUI
+      );
+    }
+  );
+
+
+  controls.imageMode.addEventListener(
+    "change",
+    updateControlUI
+  );
+
+
+  controls.revealDirection.addEventListener(
+    "change",
+    () => {
+      if (
+        controls.revealDirection.value !==
+        "random"
+      ) {
+        activeRevealDirection =
+          controls.revealDirection.value;
+      }
+    }
+  );
+
+
+  controls.playButton.addEventListener(
+    "click",
+    playAnimation
+  );
+
+
+  controls.resetButton.addEventListener(
+    "click",
+    resetAnimation
+  );
+
+
+  controls.singleImageInput.addEventListener(
+    "change",
+    (event) => {
+      const file =
+        event.target.files[0];
+
+      loadImageFromInput(
+        file,
+        (img) => {
+          singleImage = img;
+        }
+      );
+    }
+  );
+
+
+  controls.leftImageInput.addEventListener(
+    "change",
+    (event) => {
+      const file =
+        event.target.files[0];
+
+      loadImageFromInput(
+        file,
+        (img) => {
+          leftImage = img;
+        }
+      );
+    }
+  );
+
+
+  controls.rightImageInput.addEventListener(
+    "change",
+    (event) => {
+      const file =
+        event.target.files[0];
+
+      loadImageFromInput(
+        file,
+        (img) => {
+          rightImage = img;
+        }
+      );
+    }
+  );
+}
+
+
+/* ---------------------------------------------------------
+   UI
+--------------------------------------------------------- */
+
+function updateControlUI() {
+  controls.cubeSizeValue.textContent =
+    controls.cubeSize.value;
+
+  controls.cubeYValue.textContent =
+    controls.cubeY.value;
+
+  controls.animationDurationValue.textContent =
+    `${Number(
+      controls.animationDuration.value
+    ).toFixed(2)}s`;
+
+  controls.rotationAmountValue.textContent =
+    `${controls.rotationAmount.value}°`;
+
+  controls.gridSizeValue.textContent =
+    `${controls.gridSize.value}px`;
+
+  controls.gridOpacityValue.textContent =
+    `${controls.gridOpacity.value}%`;
+
+  controls.cameraZoomValue.textContent =
+    Number(
+      controls.cameraZoom.value
+    ).toFixed(2);
+
+
+  const mode =
+    controls.imageMode.value;
+
+  controls.oneFaceControls.classList.toggle(
+    "hidden-control",
+    mode !== "one"
+  );
+
+  controls.twoFaceControls.classList.toggle(
+    "hidden-control",
+    mode !== "two"
+  );
+}
+
+
+/* ---------------------------------------------------------
+   PALETTE
+--------------------------------------------------------- */
+
+function buildPalette() {
+  controls.palette.innerHTML =
+    "";
+
+  PALETTE.forEach(
+    (hex) => {
+      const swatch =
+        document.createElement(
+          "button"
+        );
+
+      swatch.type =
+        "button";
+
+      swatch.className =
+        "swatch";
+
+      swatch.style.background =
+        hex;
+
+      swatch.dataset.color =
+        hex;
+
+      swatch.title =
+        hex;
+
+      if (
+        hex === selectedColor
+      ) {
+        swatch.classList.add(
+          "selected"
+        );
+      }
+
+      swatch.addEventListener(
+        "click",
+        () => {
+          selectedColor =
+            hex;
+
+          refreshPalette();
+
+          applyBackgroundColor();
+        }
+      );
+
+      controls.palette.appendChild(
+        swatch
+      );
+    }
+  );
+}
+
+
+function refreshPalette() {
+  controls.palette
+    .querySelectorAll(
+      ".swatch"
+    )
+    .forEach(
+      (swatch) => {
+        swatch.classList.toggle(
+          "selected",
+
+          swatch.dataset.color ===
+            selectedColor
+        );
+      }
+    );
+}
+
+
+function applyBackgroundColor() {
+  document.body.style.background =
+    selectedColor;
+
+  document
+    .getElementById(
+      "canvas-container"
+    )
+    .style.background =
+      selectedColor;
+}
+
+
+/* ---------------------------------------------------------
+   KEYBOARD
+--------------------------------------------------------- */
+
+function keyPressed() {
+  if (
+    key === "p" ||
+    key === "P"
+  ) {
+    playAnimation();
+  }
+
+  if (
+    keyCode === ESCAPE
+  ) {
+    controls.controls
+      .classList
+      .toggle(
+        "hidden"
+      );
+
+    return false;
+  }
+}

@@ -185,11 +185,15 @@ const PRESET_FIELD_IDS = [
   "cubeCoverage",
   "cubeCount",
   "animationSpeed",
+  "oneAtATimeHold",
+  "oneAtATimeGap",
+  "compositionPlacement",
   "gridSize",
   "layoutSpacing",
   "cameraZoom",
   "backgroundTheme",
   "colorMode",
+  "lowContrastShift",
   "animateFolding",
   "quickToggle",
   "showDivisions",
@@ -221,6 +225,14 @@ let innerColor = PALETTE[3];
 let cascadeTravelers = [];
 let cascadeCacheKey = "";
 let cascadeTime = 0;
+
+let oneAtATimeState = {
+  placementsKey: "",
+  activeIndex: 0,
+  progress: 0,
+  phase: "folding",
+  phaseTimer: 0
+};
 
 let syncingQuickToggle = false;
 
@@ -279,6 +291,8 @@ function draw() {
     updateAnimation();
   } else if (settings.sketchMode === "cascade") {
     updateCascade(settings);
+  } else if (settings.sketchMode === "one-at-a-time") {
+    updateOneAtATime(settings);
   }
 
   if (settings.showCubeGrid) {
@@ -317,6 +331,8 @@ function draw() {
     drawCascadeNets(settings);
   } else if (settings.sketchMode === "gradient") {
     drawGradientNets(settings);
+  } else if (settings.sketchMode === "one-at-a-time") {
+    drawOneAtATimeNets(settings);
   } else {
     drawAllNets(settings);
   }
@@ -355,18 +371,89 @@ function getNetColor(index, settings) {
 
   if (
     settings.colorMode === "two-tone" ||
-    settings.colorMode === "two-tone-multi"
+    settings.colorMode === "two-tone-multi" ||
+    settings.colorMode === "low-contrast"
   ) {
-    return outerColor;
+    return getResolvedOuterColor();
   }
 
   return PALETTE[index % PALETTE.length];
 }
 
+function getResolvedOuterColor() {
+  if (controls.colorMode.value === "low-contrast") {
+    return deriveLowContrastOuter(
+      innerColor,
+      Number(controls.lowContrastShift.value)
+    );
+  }
+
+  return outerColor;
+}
+
+function parseHexColor(hex) {
+  const cleaned = String(hex).replace("#", "");
+
+  const full =
+    cleaned.length === 3
+      ? cleaned
+          .split("")
+          .map((ch) => ch + ch)
+          .join("")
+      : cleaned;
+
+  return {
+    r: parseInt(full.slice(0, 2), 16),
+    g: parseInt(full.slice(2, 4), 16),
+    b: parseInt(full.slice(4, 6), 16)
+  };
+}
+
+function rgbToHex(r, g, b) {
+  const toHex = (channel) => {
+    const value = constrain(round(channel), 0, 255);
+
+    return value.toString(16).padStart(2, "0");
+  };
+
+  return (
+    "#" +
+    toHex(r) +
+    toHex(g) +
+    toHex(b)
+  );
+}
+
+function deriveLowContrastOuter(innerHex, shiftPercent) {
+  const { r, g, b } =
+    parseHexColor(innerHex);
+
+  const t = constrain(
+    shiftPercent / 100,
+    -1,
+    1
+  );
+
+  const adjust = (channel) => {
+    if (t >= 0) {
+      return channel + (255 - channel) * t;
+    }
+
+    return channel * (1 + t);
+  };
+
+  return rgbToHex(
+    adjust(r),
+    adjust(g),
+    adjust(b)
+  );
+}
+
 function isTwoToneColorMode(mode) {
   return (
     mode === "two-tone" ||
-    mode === "two-tone-multi"
+    mode === "two-tone-multi" ||
+    mode === "low-contrast"
   );
 }
 
@@ -735,6 +822,7 @@ function syncColorModeUI() {
   const isMono = mode === "monochromatic";
   const isTwoTone = isTwoToneColorMode(mode);
   const isMultiOuter = mode === "two-tone-multi";
+  const isLowContrast = mode === "low-contrast";
 
   controls.monoColorGroup.classList.toggle(
     "hidden",
@@ -749,22 +837,39 @@ function syncColorModeUI() {
   if (controls.outerColorRow) {
     controls.outerColorRow.classList.toggle(
       "hidden",
-      isMultiOuter
+      isMultiOuter || isLowContrast
     );
   }
 
   if (controls.outerPalette) {
     controls.outerPalette.classList.toggle(
       "hidden",
-      isMultiOuter
+      isMultiOuter || isLowContrast
     );
+  }
+
+  if (controls.lowContrastControls) {
+    controls.lowContrastControls.classList.toggle(
+      "hidden",
+      !isLowContrast
+    );
+  }
+
+  if (controls.lowContrastOuterPreview) {
+    controls.lowContrastOuterPreview.style.background =
+      deriveLowContrastOuter(
+        innerColor,
+        Number(controls.lowContrastShift.value)
+      );
   }
 
   if (controls.twoToneNote) {
     controls.twoToneNote.textContent =
-      isMultiOuter
-        ? "Each plane uses a different outer palette color; the inside of every face shares the inner color."
-        : "Outside of each face uses the outer color; the inside uses the inner color.";
+      isLowContrast
+        ? "Pick an inner color; the outer side uses a similar shade you can brighten or darken."
+        : isMultiOuter
+          ? "Each plane uses a different outer palette color; the inside of every face shares the inner color."
+          : "Outside of each face uses the outer color; the inside uses the inner color.";
   }
 
   refreshPaletteSelection();
@@ -789,7 +894,8 @@ function buildPaletteSwatches() {
       outerColor = hex;
       if (
         controls.colorMode.value !== "two-tone" &&
-        controls.colorMode.value !== "two-tone-multi"
+        controls.colorMode.value !== "two-tone-multi" &&
+        controls.colorMode.value !== "low-contrast"
       ) {
         controls.colorMode.value = "two-tone";
       }
@@ -804,7 +910,8 @@ function buildPaletteSwatches() {
       innerColor = hex;
       if (
         controls.colorMode.value !== "two-tone" &&
-        controls.colorMode.value !== "two-tone-multi"
+        controls.colorMode.value !== "two-tone-multi" &&
+        controls.colorMode.value !== "low-contrast"
       ) {
         controls.colorMode.value = "two-tone";
       }
@@ -905,6 +1012,11 @@ function getControls() {
     "coverageCountControls",
     "cubeCount",
     "animationSpeed",
+    "oneAtATimeControls",
+    "oneAtATimeHold",
+    "oneAtATimeGap",
+    "compositionPlacement",
+    "compositionPlacementNote",
     "gridSize",
     "layoutSpacing",
     "cameraZoom",
@@ -917,6 +1029,9 @@ function getControls() {
     "outerPalette",
     "innerPalette",
     "twoToneNote",
+    "lowContrastControls",
+    "lowContrastShift",
+    "lowContrastOuterPreview",
     "animateFolding",
     "quickToggle",
     "showDivisions",
@@ -928,7 +1043,8 @@ function getControls() {
     "unfoldButton",
     "foldButton",
     "randomizePlacementsButton",
-    "exportButton"
+    "exportButton",
+    "exportSvgButton"
   ];
 
   for (const id of ids) {
@@ -954,6 +1070,8 @@ function connectControls() {
     "placementSkew",
     "cascadeCount",
     "animationSpeed",
+    "oneAtATimeHold",
+    "oneAtATimeGap",
     "gridSize",
     "layoutSpacing",
     "cameraZoom"
@@ -980,6 +1098,15 @@ function connectControls() {
     () => {
       syncSketchModeUI();
       cascadeCacheKey = "";
+      resetOneAtATimeState();
+    }
+  );
+
+  controls.compositionPlacement.addEventListener(
+    "change",
+    () => {
+      syncSketchModeUI();
+      resetOneAtATimeState();
     }
   );
 
@@ -1160,6 +1287,11 @@ function connectControls() {
     }
   );
 
+  controls.exportSvgButton.addEventListener(
+    "click",
+    exportSketchSvg
+  );
+
   controls.backgroundTheme.addEventListener(
     "change",
     () => {
@@ -1170,6 +1302,14 @@ function connectControls() {
   controls.colorMode.addEventListener(
     "change",
     syncColorModeUI
+  );
+
+  controls.lowContrastShift.addEventListener(
+    "input",
+    () => {
+      syncColorModeUI();
+      updateAllValueLabels();
+    }
   );
 }
 
@@ -1267,13 +1407,31 @@ function getSettings() {
     colorMode:
       controls.colorMode.value,
 
-    outerColor,
+    outerColor: getResolvedOuterColor(),
     innerColor,
+
+    lowContrastShift:
+      Number(
+        controls.lowContrastShift.value
+      ),
 
     animationSpeed:
       Number(
         controls.animationSpeed.value
       ),
+
+    oneAtATimeHold:
+      Number(
+        controls.oneAtATimeHold.value
+      ),
+
+    oneAtATimeGap:
+      Number(
+        controls.oneAtATimeGap.value
+      ),
+
+    compositionPlacement:
+      controls.compositionPlacement.value,
 
     /*
      * Authoring cell size in screen pixels at zoom 1.
@@ -1365,6 +1523,21 @@ function updateAllValueLabels() {
   );
 
   setValueLabel(
+    "lowContrastShift",
+    `${controls.lowContrastShift.value}`
+  );
+
+  setValueLabel(
+    "oneAtATimeHold",
+    `${Number(controls.oneAtATimeHold.value).toFixed(1)}s`
+  );
+
+  setValueLabel(
+    "oneAtATimeGap",
+    `${Number(controls.oneAtATimeGap.value).toFixed(1)}s`
+  );
+
+  setValueLabel(
     "gridSize",
     `${controls.gridSize.value}px`
   );
@@ -1393,10 +1566,11 @@ function syncSketchModeUI() {
   const isCascade = mode === "cascade";
   const isGridded = mode === "gridded";
   const isGradient = mode === "gradient";
+  const isOneAtATime = mode === "one-at-a-time";
 
   controls.cascadeDirectionGroup.classList.toggle(
     "hidden",
-    isGridded
+    isGridded || isOneAtATime
   );
 
   controls.cascadeCountGroup.classList.toggle(
@@ -1411,17 +1585,17 @@ function syncSketchModeUI() {
 
   controls.griddedPlacementControls.classList.toggle(
     "hidden",
-    !isGridded
+    !isGridded && !isOneAtATime
   );
 
   controls.sharedFoldControls.classList.toggle(
     "hidden",
-    !isGridded
+    !isGridded && !isOneAtATime
   );
 
   controls.griddedCoverageControls.classList.toggle(
     "hidden",
-    !isGridded && !isGradient
+    !isGridded && !isGradient && !isOneAtATime
   );
 
   controls.griddedActionControls.classList.toggle(
@@ -1433,6 +1607,25 @@ function syncSketchModeUI() {
     "hidden",
     !isGridded
   );
+
+  if (controls.oneAtATimeControls) {
+    controls.oneAtATimeControls.classList.toggle(
+      "hidden",
+      !isOneAtATime
+    );
+  }
+
+  if (controls.compositionPlacementNote) {
+    const placement =
+      controls.compositionPlacement.value;
+
+    controls.compositionPlacementNote.textContent =
+      placement === "edges"
+        ? "Favor cubes that fold near the edges of the frame."
+        : placement === "center-exclude"
+          ? "Only fold cubes in the top or bottom third of the frame."
+          : "Favor cubes that fold near the middle of the frame.";
+  }
 }
 
 function applyAspectRatio() {
@@ -1571,6 +1764,28 @@ function setIsometricCamera(settings) {
     1,
     0
   );
+}
+
+function getIsometricEyePosition() {
+  const elevation =
+    atan(1 / sqrt(2));
+
+  const azimuth =
+    QUARTER_PI;
+
+  const distance = 2400;
+
+  const horizontalDistance =
+    distance * cos(elevation);
+
+  return [
+    horizontalDistance *
+      cos(azimuth),
+    -distance *
+      sin(elevation),
+    horizontalDistance *
+      sin(azimuth)
+  ];
 }
 
 function beginScreenSpaceCamera() {
@@ -1959,6 +2174,607 @@ function drawAllNets(settings) {
       placement.creaseStyle,
       placement.seed,
       placement.foldDelay
+    );
+  }
+}
+
+function resetOneAtATimeState() {
+  oneAtATimeState.placementsKey = "";
+  oneAtATimeState.activeIndex = 0;
+  oneAtATimeState.progress = 0;
+  oneAtATimeState.phase = "folding";
+  oneAtATimeState.phaseTimer = 0;
+}
+
+function getPlacementFlatTransforms(
+  placement,
+  settings
+) {
+  return buildConnectedFaceTransforms(
+    placement.net,
+    placement.originX,
+    placement.originZ,
+    settings.faceSize,
+    0
+  );
+}
+
+function getPlacementFlatFaceCorners(
+  transform,
+  faceSize
+) {
+  const half = faceSize * 0.5;
+
+  const u =
+    scaleVector(
+      transform.u,
+      half
+    );
+
+  const v =
+    scaleVector(
+      transform.v,
+      half
+    );
+
+  const center =
+    transform.center;
+
+  return [
+    addVectors(
+      addVectors(
+        center,
+        scaleVector(u, -1)
+      ),
+      scaleVector(v, -1)
+    ),
+
+    addVectors(
+      addVectors(
+        center,
+        u
+      ),
+      scaleVector(v, -1)
+    ),
+
+    addVectors(
+      addVectors(
+        center,
+        u
+      ),
+      v
+    ),
+
+    addVectors(
+      addVectors(
+        center,
+        scaleVector(u, -1)
+      ),
+      v
+    )
+  ];
+}
+
+function projectWorldToScreen(
+  wx,
+  wy,
+  wz,
+  settings
+) {
+  const scale =
+    getPixelsPerWorldUnit(settings);
+
+  const axes =
+    getIsometricScreenAxes();
+
+  return {
+    x:
+      axes.toScreenX(wx, wy, wz) *
+      scale,
+    y:
+      axes.toScreenY(wx, wy, wz) *
+      scale
+  };
+}
+
+function getPlacementScreenBounds(
+  placement,
+  settings
+) {
+  const transforms =
+    getPlacementFlatTransforms(
+      placement,
+      settings
+    );
+
+  let minSX = Infinity;
+  let maxSX = -Infinity;
+  let minSY = Infinity;
+  let maxSY = -Infinity;
+
+  for (const transform of transforms) {
+    const corners =
+      getPlacementFlatFaceCorners(
+        transform,
+        settings.faceSize
+      );
+
+    for (const corner of corners) {
+      const screen =
+        projectWorldToScreen(
+          corner[0],
+          corner[1],
+          corner[2],
+          settings
+        );
+
+      minSX = min(minSX, screen.x);
+      maxSX = max(maxSX, screen.x);
+      minSY = min(minSY, screen.y);
+      maxSY = max(maxSY, screen.y);
+    }
+  }
+
+  return {
+    minSX,
+    maxSX,
+    minSY,
+    maxSY
+  };
+}
+
+function getPlacementScreenCenter(
+  placement,
+  settings
+) {
+  const transforms =
+    getPlacementFlatTransforms(
+      placement,
+      settings
+    );
+
+  let sumX = 0;
+  let sumY = 0;
+
+  for (const transform of transforms) {
+    const screen =
+      projectWorldToScreen(
+        transform.center[0],
+        transform.center[1],
+        transform.center[2],
+        settings
+      );
+
+    sumX += screen.x;
+    sumY += screen.y;
+  }
+
+  const count =
+    max(1, transforms.length);
+
+  const cx = sumX / count;
+  const cy = sumY / count;
+
+  const normX =
+    cx / max(1, width * 0.5);
+
+  const normY =
+    cy / max(1, height * 0.5);
+
+  return {
+    cx,
+    cy,
+    normX,
+    normY,
+    distSq: cx * cx + cy * cy
+  };
+}
+
+function isPlacementOnCanvas(
+  placement,
+  settings
+) {
+  const bounds =
+    getPlacementScreenBounds(
+      placement,
+      settings
+    );
+
+  const scale =
+    getPixelsPerWorldUnit(settings);
+
+  const pad =
+    settings.faceSize *
+    scale *
+    0.75;
+
+  const viewMinX =
+    -width * 0.5 + pad * 0.2;
+
+  const viewMaxX =
+    width * 0.5 - pad * 0.2;
+
+  const viewMinY =
+    -height * 0.5 + pad * 0.2;
+
+  const viewMaxY =
+    height * 0.5 - pad * 0.2;
+
+  return !(
+    bounds.maxSX + pad < viewMinX ||
+    bounds.minSX - pad > viewMaxX ||
+    bounds.maxSY + pad < viewMinY ||
+    bounds.minSY - pad > viewMaxY
+  );
+}
+
+function getOneAtATimeCompositionWeight(
+  center,
+  settings
+) {
+  const mode =
+    settings.compositionPlacement ||
+    "centered";
+
+  const normX = center.normX;
+  const normY = center.normY;
+
+  const radial = sqrt(
+    normX * normX +
+    normY * normY
+  );
+
+  const edgePull = max(
+    abs(normX),
+    abs(normY)
+  );
+
+  if (mode === "edges") {
+    return (
+      pow(
+        constrain(
+          edgePull,
+          0,
+          1.15
+        ),
+        2.2
+      ) + 0.03
+    );
+  }
+
+  if (mode === "center-exclude") {
+    const absY = abs(normY);
+
+    if (absY < 0.34) {
+      return 0.01;
+    }
+
+    return (
+      pow(absY, 1.6) + 0.05
+    );
+  }
+
+  return (
+    pow(
+      constrain(
+        1 - radial,
+        0,
+        1
+      ),
+      2.4
+    ) + 0.03
+  );
+}
+
+function buildOneAtATimeCandidates(
+  placements,
+  settings
+) {
+  const candidates = [];
+
+  for (
+    let index = 0;
+    index < placements.length;
+    index++
+  ) {
+    const placement =
+      placements[index];
+
+    if (
+      !isPlacementOnCanvas(
+        placement,
+        settings
+      )
+    ) {
+      continue;
+    }
+
+    const center =
+      getPlacementScreenCenter(
+        placement,
+        settings
+      );
+
+    const weight =
+      getOneAtATimeCompositionWeight(
+        center,
+        settings
+      );
+
+    if (weight <= 0.001) {
+      continue;
+    }
+
+    candidates.push({
+      index,
+      weight,
+      center
+    });
+  }
+
+  if (candidates.length > 0) {
+    return candidates;
+  }
+
+  return placements.map(
+    (placement, index) => {
+      return {
+        index,
+        weight: 1,
+        center:
+          getPlacementScreenCenter(
+            placement,
+            settings
+          )
+      };
+    }
+  );
+}
+
+function pickOneAtATimeCube(
+  placements,
+  settings,
+  avoidIndex = -1
+) {
+  let candidates =
+    buildOneAtATimeCandidates(
+      placements,
+      settings
+    );
+
+  if (
+    avoidIndex >= 0 &&
+    candidates.length > 1
+  ) {
+    candidates =
+      candidates.filter(
+        (entry) =>
+          entry.index !== avoidIndex
+      );
+  }
+
+  if (!candidates.length) {
+    oneAtATimeState.activeIndex = 0;
+    return;
+  }
+
+  if (candidates.length === 1) {
+    oneAtATimeState.activeIndex =
+      candidates[0].index;
+    return;
+  }
+
+  const total =
+    candidates.reduce(
+      (sum, entry) =>
+        sum + entry.weight,
+      0
+    );
+
+  let roll = random(total);
+
+  for (const entry of candidates) {
+    roll -= entry.weight;
+
+    if (roll <= 0) {
+      oneAtATimeState.activeIndex =
+        entry.index;
+      return;
+    }
+  }
+
+  oneAtATimeState.activeIndex =
+    candidates[
+      candidates.length - 1
+    ].index;
+}
+
+function pickNextOneAtATimeCube(
+  placements,
+  settings
+) {
+  pickOneAtATimeCube(
+    placements,
+    settings,
+    oneAtATimeState.activeIndex
+  );
+}
+
+function ensureOneAtATimeState(
+  placements,
+  settings
+) {
+  const key = [
+    packCacheKey,
+    placements.length,
+    settings.cameraZoom.toFixed(3),
+    settings.compositionPlacement,
+    width,
+    height
+  ].join("|");
+
+  if (oneAtATimeState.placementsKey === key) {
+    return;
+  }
+
+  oneAtATimeState.placementsKey = key;
+  oneAtATimeState.progress = 0;
+  oneAtATimeState.phase = "folding";
+  oneAtATimeState.phaseTimer = 0;
+
+  if (placements.length > 0) {
+    pickOneAtATimeCube(
+      placements,
+      settings
+    );
+  } else {
+    oneAtATimeState.activeIndex = 0;
+  }
+}
+
+function updateOneAtATime(settings) {
+  ensurePackedLayout(settings);
+
+  const placements = selectPlacementsForCoverage(
+    packedPlacements.placements,
+    settings
+  );
+
+  ensureOneAtATimeState(
+    placements,
+    settings
+  );
+
+  if (!placements.length) {
+    return;
+  }
+
+  const foldSpeed =
+    settings.animationSpeed;
+
+  const holdSeconds =
+    settings.oneAtATimeHold;
+
+  const gapSeconds =
+    settings.oneAtATimeGap;
+
+  const elapsed =
+    deltaTime / 1000;
+
+  switch (oneAtATimeState.phase) {
+    case "folding":
+      oneAtATimeState.progress += foldSpeed;
+
+      if (oneAtATimeState.progress >= 1) {
+        oneAtATimeState.progress = 1;
+
+        if (holdSeconds <= 0) {
+          oneAtATimeState.phase = "unfolding";
+        } else {
+          oneAtATimeState.phase = "holding";
+          oneAtATimeState.phaseTimer = 0;
+        }
+      }
+
+      break;
+
+    case "holding":
+      oneAtATimeState.phaseTimer += elapsed;
+
+      if (
+        oneAtATimeState.phaseTimer >=
+        holdSeconds
+      ) {
+        oneAtATimeState.phase = "unfolding";
+      }
+
+      break;
+
+    case "unfolding":
+      oneAtATimeState.progress -= foldSpeed;
+
+      if (oneAtATimeState.progress <= 0) {
+        oneAtATimeState.progress = 0;
+
+        if (gapSeconds <= 0) {
+          pickNextOneAtATimeCube(
+            placements,
+            settings
+          );
+          oneAtATimeState.phase = "folding";
+        } else {
+          oneAtATimeState.phase = "gap";
+          oneAtATimeState.phaseTimer = 0;
+        }
+      }
+
+      break;
+
+    case "gap":
+      oneAtATimeState.phaseTimer += elapsed;
+
+      if (
+        oneAtATimeState.phaseTimer >=
+        gapSeconds
+      ) {
+        pickNextOneAtATimeCube(
+          placements,
+          settings
+        );
+        oneAtATimeState.phase = "folding";
+        oneAtATimeState.phaseTimer = 0;
+      }
+
+      break;
+
+    default:
+      oneAtATimeState.phase = "folding";
+      break;
+  }
+}
+
+function drawOneAtATimeNets(settings) {
+  ensurePackedLayout(settings);
+
+  const placements = selectPlacementsForCoverage(
+    packedPlacements.placements,
+    settings
+  );
+
+  ensureOneAtATimeState(
+    placements,
+    settings
+  );
+
+  for (
+    let index = 0;
+    index < placements.length;
+    index++
+  ) {
+    const placement = placements[index];
+
+    const foldProgress =
+      index === oneAtATimeState.activeIndex
+        ? oneAtATimeState.progress
+        : 0;
+
+    drawNet(
+      placement.net,
+      placement.originX,
+      placement.originZ,
+      getNetColor(
+        placement.colorIndex,
+        settings
+      ),
+      settings,
+      placement.creaseStyle,
+      placement.seed,
+      placement.foldDelay,
+      {
+        drapeAmount: settings.drapeAmount,
+        foldProgress,
+        linearFold: true
+      }
     );
   }
 }
@@ -4403,12 +5219,230 @@ function drawNet(
           )
         : baseColor;
 
-    drawConnectedFace(
-      transform,
-      faceBaseColor,
-      shadeProgress,
+    if (options.svgCollector) {
+      appendConnectedFaceToSvgCollector(
+        options.svgCollector,
+        transform,
+        faceBaseColor,
+        shadeProgress,
+        settings,
+        innerBaseColor
+      );
+    } else {
+      drawConnectedFace(
+        transform,
+        faceBaseColor,
+        shadeProgress,
+        settings,
+        innerBaseColor
+      );
+    }
+  }
+}
+
+function collectSketchNetsSvg(
+  settings,
+  collector
+) {
+  const svgOptions = {
+    svgCollector: collector
+  };
+
+  if (settings.sketchMode === "cascade") {
+    ensureCascadeTravelers(settings);
+
+    const size = settings.faceSize;
+
+    for (const traveler of cascadeTravelers) {
+      const unraveling =
+        traveler.phase === "unravel";
+
+      const plantIndex = unraveling
+        ? traveler.trailingIndex
+        : traveler.leadingIndex;
+
+      const foldProgress = unraveling
+        ? 1 - traveler.animProgress
+        : traveler.animProgress;
+
+      const plantFace =
+        traveler.net.faces[plantIndex];
+
+      drawNet(
+        traveler.net,
+        (plantFace.gridX + 0.5) * size,
+        (plantFace.gridY + 0.5) * size,
+        getNetColor(
+          traveler.typeIndex,
+          settings
+        ),
+        settings,
+        traveler.creaseStyle,
+        traveler.seed,
+        0,
+        {
+          foldMode: "one-side",
+          foldProgress,
+          plantFaceIndex: plantIndex,
+          useOriginAsPlant: true,
+          drapeAmount: 0,
+          ...svgOptions
+        }
+      );
+    }
+
+    return;
+  }
+
+  if (settings.sketchMode === "gradient") {
+    const packSettings = {
+      ...settings,
+      cubeCoverage: 1,
+      gridPlacement: "random"
+    };
+
+    ensurePackedLayout(packSettings);
+
+    const placements =
+      packedPlacements.placements;
+
+    if (!placements.length) {
+      return;
+    }
+
+    let minScore = Infinity;
+    let maxScore = -Infinity;
+
+    const scored = placements.map((placement) => {
+      const score = getTidalScore(
+        placement,
+        settings.cascadeDirection
+      );
+
+      minScore = min(minScore, score);
+      maxScore = max(maxScore, score);
+
+      return { placement, score };
+    });
+
+    const range = max(0.0001, maxScore - minScore);
+    const coverage = constrain(
+      settings.cubeCoverage,
+      0,
+      1
+    );
+
+    for (const { placement, score } of scored) {
+      const t = (score - minScore) / range;
+      const falloff = pow(1 - t, 2.15);
+      const density =
+        falloff * (0.22 + 0.78 * coverage);
+
+      const keepChance = unitHash(
+        placement.seed * 0.61 +
+        placement.originX * 0.07 +
+        placement.originZ * 0.11 +
+        3.17
+      );
+
+      if (keepChance > density) {
+        continue;
+      }
+
+      drawNet(
+        placement.net,
+        placement.originX,
+        placement.originZ,
+        getNetColor(
+          placement.colorIndex,
+          settings
+        ),
+        settings,
+        placement.creaseStyle,
+        placement.seed,
+        0,
+        {
+          drapeAmount: settings.drapeAmount,
+          foldProgress: 0,
+          foldMode: "both",
+          ...svgOptions
+        }
+      );
+    }
+
+    return;
+  }
+
+  if (settings.sketchMode === "one-at-a-time") {
+    ensurePackedLayout(settings);
+
+    const placements = selectPlacementsForCoverage(
+      packedPlacements.placements,
+      settings
+    );
+
+    ensureOneAtATimeState(
+      placements,
+      settings
+    );
+
+    for (
+      let index = 0;
+      index < placements.length;
+      index++
+    ) {
+      const placement = placements[index];
+
+      const foldProgress =
+        index === oneAtATimeState.activeIndex
+          ? oneAtATimeState.progress
+          : 0;
+
+      drawNet(
+        placement.net,
+        placement.originX,
+        placement.originZ,
+        getNetColor(
+          placement.colorIndex,
+          settings
+        ),
+        settings,
+        placement.creaseStyle,
+        placement.seed,
+        placement.foldDelay,
+        {
+          drapeAmount: settings.drapeAmount,
+          foldProgress,
+          linearFold: true,
+          ...svgOptions
+        }
+      );
+    }
+
+    return;
+  }
+
+  ensurePackedLayout(settings);
+
+  const placements = selectPlacementsForCoverage(
+    packedPlacements.placements,
+    settings
+  );
+
+  for (const placement of placements) {
+    drawNet(
+      placement.net,
+      placement.originX,
+      placement.originZ,
+      getNetColor(
+        placement.colorIndex,
+        settings
+      ),
       settings,
-      innerBaseColor
+      placement.creaseStyle,
+      placement.seed,
+      placement.foldDelay,
+      svgOptions
     );
   }
 }
@@ -5136,63 +6170,67 @@ function drawConnectedFace(
   const normal =
     normalizeVector(transform.normal);
 
-  const separation = 0.12;
   const needsInner = Boolean(innerBaseColor);
 
-  const outerCorners =
-    offsetCorners(
-      corners,
-      normal,
-      needsInner ? separation : 0
-    );
+  if (needsInner) {
+    /*
+     * Draw only the shell facing the camera. Rendering
+     * both coplanar shells causes z-fighting; back-face
+     * culling alone is not enough at grazing angles.
+     */
+    const eye =
+      getIsometricEyePosition();
+
+    const toCamera =
+      subtractVectors(
+        eye,
+        transform.center
+      );
+
+    const outwardFacing =
+      dotVectors(
+        normal,
+        toCamera
+      ) > 0;
+
+    if (outwardFacing) {
+      drawFaceSide(
+        corners,
+        baseColor,
+        normal,
+        progress,
+        settings,
+        true
+      );
+    } else {
+      drawFaceSide(
+        corners.slice().reverse(),
+        innerBaseColor,
+        scaleVector(normal, -1),
+        progress,
+        settings,
+        false
+      );
+    }
+
+    return;
+  }
 
   drawFaceSide(
-    outerCorners,
+    corners,
     baseColor,
     normal,
     progress,
     settings,
     true
   );
-
-  if (!needsInner) {
-    return;
-  }
-
-  const inward =
-    scaleVector(normal, -1);
-
-  const innerCorners =
-    offsetCorners(
-      corners.slice().reverse(),
-      inward,
-      separation
-    );
-
-  drawFaceSide(
-    innerCorners,
-    innerBaseColor,
-    inward,
-    progress,
-    settings,
-    false
-  );
 }
 
-function offsetCorners(corners, direction, amount) {
-  if (amount === 0) {
-    return corners;
-  }
-
-  const step =
-    scaleVector(
-      normalizeVector(direction),
-      amount
-    );
-
-  return corners.map((corner) => {
-    return addVectors(corner, step);
-  });
+function getDivisionStrokeWeight(settings) {
+  return max(
+    1,
+    settings.faceSize * 0.022
+  );
 }
 
 function drawFaceSide(
@@ -5223,8 +6261,7 @@ function drawFaceSide(
   }
 
   if (!settings.showDivisions) {
-    stroke(faceColor);
-    strokeWeight(1.5);
+    noStroke();
     drawFaceQuad(corners);
     return;
   }
@@ -5240,10 +6277,23 @@ function drawFaceSide(
     getDivisionStrokeColor(settings);
 
   stroke(strokeColor);
-  strokeWeight(1);
+  strokeWeight(
+    getDivisionStrokeWeight(settings)
+  );
+  strokeCap(SQUARE);
 
   const filter =
     settings.divisionAngleFilter || "all";
+
+  /*
+   * Nudge lines slightly along the face normal so they
+   * sit on top of the fill and read as a solid color.
+   */
+  const lineNudge =
+    scaleVector(
+      normalizeVector(normal),
+      settings.faceSize * 0.002
+    );
 
   for (let i = 0; i < corners.length; i++) {
     const a = corners[i];
@@ -5260,14 +6310,16 @@ function drawFaceSide(
     }
 
     line(
-      a[0],
-      a[1],
-      a[2],
-      b[0],
-      b[1],
-      b[2]
+      a[0] + lineNudge[0],
+      a[1] + lineNudge[1],
+      a[2] + lineNudge[2],
+      b[0] + lineNudge[0],
+      b[1] + lineNudge[1],
+      b[2] + lineNudge[2]
     );
   }
+
+  noStroke();
 }
 
 function drawFaceQuad(corners) {
@@ -5294,10 +6346,10 @@ function getDivisionStrokeColor(settings) {
   }
 
   if (settings.backgroundTheme === "dark") {
-    return color(254, 249, 243, 160);
+    return color(254, 249, 243);
   }
 
-  return color(18, 185);
+  return color(3, 41, 50);
 }
 
 function edgeMatchesDivisionFilter(family, filter) {
@@ -5757,5 +6809,645 @@ function smootherstep(value) {
       ) +
       10
     )
+  );
+}
+
+function createSvgCollector() {
+  return {
+    screenPolygons: [],
+    screenLines: [],
+    polygons: [],
+    lines: []
+  };
+}
+
+function screenSpaceToSvg(sx, sy) {
+  return {
+    x: sx + width * 0.5,
+    y: height * 0.5 - sy
+  };
+}
+
+function worldCornerToSvg(
+  corner,
+  settings
+) {
+  const screen =
+    projectWorldToScreen(
+      corner[0],
+      corner[1],
+      corner[2],
+      settings
+    );
+
+  const point =
+    screenSpaceToSvg(
+      screen.x,
+      screen.y
+    );
+
+  return `${point.x.toFixed(2)},${point.y.toFixed(2)}`;
+}
+
+function colorToSvg(value) {
+  if (
+    typeof value === "string" &&
+    value.startsWith("#")
+  ) {
+    return value;
+  }
+
+  const opacity =
+    alpha(value) / 255;
+
+  if (opacity >= 0.999) {
+    return `rgb(${red(value)},${green(value)},${blue(value)})`;
+  }
+
+  return `rgba(${red(value)},${green(value)},${blue(value)},${opacity.toFixed(3)})`;
+}
+
+function getSvgFaceDepth(corners) {
+  let depth = 0;
+
+  for (const corner of corners) {
+    depth +=
+      corner[0] +
+      corner[2] -
+      corner[1] * 1.35;
+  }
+
+  return depth / corners.length;
+}
+
+function getConnectedFaceCorners(
+  transform,
+  faceSize
+) {
+  const half = faceSize * 0.5;
+
+  const u =
+    scaleVector(
+      transform.u,
+      half
+    );
+
+  const v =
+    scaleVector(
+      transform.v,
+      half
+    );
+
+  return [
+    addVectors(
+      addVectors(
+        transform.center,
+        scaleVector(u, -1)
+      ),
+      scaleVector(v, -1)
+    ),
+
+    addVectors(
+      addVectors(
+        transform.center,
+        u
+      ),
+      scaleVector(v, -1)
+    ),
+
+    addVectors(
+      addVectors(
+        transform.center,
+        u
+      ),
+      v
+    ),
+
+    addVectors(
+      addVectors(
+        transform.center,
+        scaleVector(u, -1)
+      ),
+      v
+    )
+  ];
+}
+
+function appendFaceSideToSvgCollector(
+  collector,
+  corners,
+  baseColor,
+  normal,
+  progress,
+  settings,
+  drawStroke
+) {
+  const faceColor =
+    !settings.showFaceShading
+      ? baseColor
+      : getFaceColor(
+          baseColor,
+          normal,
+          progress,
+          settings.showFaceShading
+        );
+
+  const points =
+    corners
+      .map((corner) =>
+        worldCornerToSvg(
+          corner,
+          settings
+        )
+      )
+      .join(" ");
+
+  collector.polygons.push({
+    points,
+    fill: colorToSvg(faceColor),
+    depth: getSvgFaceDepth(corners)
+  });
+
+  if (
+    !drawStroke ||
+    !settings.showDivisions
+  ) {
+    return;
+  }
+
+  const strokeColor =
+    getDivisionStrokeColor(settings);
+
+  const strokeWidth =
+    getDivisionStrokeWeight(settings);
+
+  const filter =
+    settings.divisionAngleFilter || "all";
+
+  const lineNudge =
+    scaleVector(
+      normalizeVector(normal),
+      settings.faceSize * 0.002
+    );
+
+  for (let i = 0; i < corners.length; i++) {
+    const a = corners[i];
+    const b =
+      corners[
+        (i + 1) %
+          corners.length
+      ];
+
+    if (
+      filter !== "all" &&
+      !edgeMatchesDivisionFilter(
+        edgeScreenFamily(a, b),
+        filter
+      )
+    ) {
+      continue;
+    }
+
+    const aN = addVectors(a, lineNudge);
+    const bN = addVectors(b, lineNudge);
+
+    const aScreen =
+      projectWorldToScreen(
+        aN[0],
+        aN[1],
+        aN[2],
+        settings
+      );
+
+    const bScreen =
+      projectWorldToScreen(
+        bN[0],
+        bN[1],
+        bN[2],
+        settings
+      );
+
+    const aSvg =
+      screenSpaceToSvg(
+        aScreen.x,
+        aScreen.y
+      );
+
+    const bSvg =
+      screenSpaceToSvg(
+        bScreen.x,
+        bScreen.y
+      );
+
+    collector.lines.push({
+      x1: aSvg.x,
+      y1: aSvg.y,
+      x2: bSvg.x,
+      y2: bSvg.y,
+      stroke: colorToSvg(strokeColor),
+      strokeWidth
+    });
+  }
+}
+
+function appendConnectedFaceToSvgCollector(
+  collector,
+  transform,
+  baseColor,
+  progress,
+  settings,
+  innerBaseColor = null
+) {
+  const corners =
+    getConnectedFaceCorners(
+      transform,
+      settings.faceSize
+    );
+
+  const normal =
+    normalizeVector(transform.normal);
+
+  const needsInner = Boolean(innerBaseColor);
+
+  if (needsInner) {
+    const eye =
+      getIsometricEyePosition();
+
+    const toCamera =
+      subtractVectors(
+        eye,
+        transform.center
+      );
+
+    const outwardFacing =
+      dotVectors(
+        normal,
+        toCamera
+      ) > 0;
+
+    if (outwardFacing) {
+      appendFaceSideToSvgCollector(
+        collector,
+        corners,
+        baseColor,
+        normal,
+        progress,
+        settings,
+        true
+      );
+    } else {
+      appendFaceSideToSvgCollector(
+        collector,
+        corners.slice().reverse(),
+        innerBaseColor,
+        scaleVector(normal, -1),
+        progress,
+        settings,
+        false
+      );
+    }
+
+    return;
+  }
+
+  appendFaceSideToSvgCollector(
+    collector,
+    corners,
+    baseColor,
+    normal,
+    progress,
+    settings,
+    true
+  );
+}
+
+function collectScreenQuadSvg(
+  collector,
+  corners,
+  fill
+) {
+  const points =
+    corners
+      .map((corner) => {
+        const point =
+          screenSpaceToSvg(
+            corner[0],
+            corner[1]
+          );
+
+        return `${point.x.toFixed(2)},${point.y.toFixed(2)}`;
+      })
+      .join(" ");
+
+  collector.screenPolygons.push({
+    points,
+    fill: colorToSvg(fill)
+  });
+}
+
+function collectScreenIsometricGridSvg(
+  settings,
+  collector
+) {
+  const edge =
+    settings.screenGridSize;
+
+  const columnSpacing =
+    edge * sqrt(3) * 0.5;
+
+  const overscan =
+    max(width, height) * 1.5;
+
+  const strokeColor =
+    settings.backgroundTheme === "dark"
+      ? color(254, 249, 243, 36)
+      : color(3, 41, 50, 28);
+
+  const verticalCount =
+    ceil(
+      width / columnSpacing
+    ) + 8;
+
+  for (
+    let column = -verticalCount;
+    column <= verticalCount;
+    column++
+  ) {
+    const x =
+      column * columnSpacing;
+
+    const start =
+      screenSpaceToSvg(
+        x,
+        -overscan
+      );
+
+    const end =
+      screenSpaceToSvg(
+        x,
+        overscan
+      );
+
+    collector.screenLines.push({
+      x1: start.x,
+      y1: start.y,
+      x2: end.x,
+      y2: end.y,
+      stroke: colorToSvg(strokeColor),
+      strokeWidth: 1
+    });
+  }
+
+  const rowCount =
+    ceil(
+      height / edge
+    ) +
+    ceil(
+      width / edge
+    ) +
+    12;
+
+  for (
+    let row = -rowCount;
+    row <= rowCount;
+    row++
+  ) {
+    const intercept =
+      row * edge;
+
+    const drStart =
+      screenSpaceToSvg(
+        -overscan,
+        intercept -
+          overscan / sqrt(3)
+      );
+
+    const drEnd =
+      screenSpaceToSvg(
+        overscan,
+        intercept +
+          overscan / sqrt(3)
+      );
+
+    collector.screenLines.push({
+      x1: drStart.x,
+      y1: drStart.y,
+      x2: drEnd.x,
+      y2: drEnd.y,
+      stroke: colorToSvg(strokeColor),
+      strokeWidth: 1
+    });
+
+    const dlStart =
+      screenSpaceToSvg(
+        -overscan,
+        intercept +
+          overscan / sqrt(3)
+      );
+
+    const dlEnd =
+      screenSpaceToSvg(
+        overscan,
+        intercept -
+          overscan / sqrt(3)
+      );
+
+    collector.screenLines.push({
+      x1: dlStart.x,
+      y1: dlStart.y,
+      x2: dlEnd.x,
+      y2: dlEnd.y,
+      stroke: colorToSvg(strokeColor),
+      strokeWidth: 1
+    });
+  }
+}
+
+function collectIsometricCubeGridSvg(
+  settings,
+  collector
+) {
+  const edge = settings.screenGridSize;
+  const columnSpacing = edge * sqrt(3) * 0.5;
+
+  const hexRangeI =
+    ceil(width / (columnSpacing * 2)) + 3;
+
+  const hexRangeJ =
+    ceil(height / (edge * 1.5)) + 3;
+
+  const isDark =
+    settings.backgroundTheme === "dark";
+
+  for (
+    let hexJ = -hexRangeJ;
+    hexJ <= hexRangeJ;
+    hexJ++
+  ) {
+    for (
+      let hexI = -hexRangeI;
+      hexI <= hexRangeI;
+      hexI++
+    ) {
+      const center =
+        getHexCenterScreen(
+          hexI,
+          hexJ,
+          edge
+        );
+
+      const v =
+        getHexVertices(
+          center.x,
+          center.y,
+          edge
+        );
+
+      const c = [center.x, center.y];
+
+      const top = [v[5], v[0], v[1], c];
+      const right = [c, v[1], v[2], v[3]];
+      const left = [c, v[3], v[4], v[5]];
+
+      if (isDark) {
+        collectScreenQuadSvg(
+          collector,
+          top,
+          color(254, 249, 243, 22)
+        );
+        collectScreenQuadSvg(
+          collector,
+          left,
+          color(254, 249, 243, 38)
+        );
+        collectScreenQuadSvg(
+          collector,
+          right,
+          color(254, 249, 243, 14)
+        );
+      } else {
+        collectScreenQuadSvg(
+          collector,
+          top,
+          color(3, 41, 50, 16)
+        );
+        collectScreenQuadSvg(
+          collector,
+          left,
+          color(3, 41, 50, 28)
+        );
+        collectScreenQuadSvg(
+          collector,
+          right,
+          color(3, 41, 50, 10)
+        );
+      }
+    }
+  }
+}
+
+function buildSvgDocument(
+  collector,
+  settings
+) {
+  collector.polygons.sort((a, b) => {
+    return a.depth - b.depth;
+  });
+
+  const background =
+    getBackgroundColor(settings);
+
+  let svg =
+    '<?xml version="1.0" encoding="UTF-8"?>\n';
+
+  svg +=
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">\n`;
+
+  svg +=
+    `<rect width="100%" height="100%" fill="${background}"/>\n`;
+
+  for (const polygon of collector.screenPolygons) {
+    svg +=
+      `<polygon points="${polygon.points}" fill="${polygon.fill}"/>\n`;
+  }
+
+  for (const line of collector.screenLines) {
+    svg +=
+      `<line x1="${line.x1.toFixed(2)}" y1="${line.y1.toFixed(2)}" x2="${line.x2.toFixed(2)}" y2="${line.y2.toFixed(2)}" stroke="${line.stroke}" stroke-width="${line.strokeWidth}"/>\n`;
+  }
+
+  for (const polygon of collector.polygons) {
+    svg +=
+      `<polygon points="${polygon.points}" fill="${polygon.fill}"/>\n`;
+  }
+
+  for (const line of collector.lines) {
+    svg +=
+      `<line x1="${line.x1.toFixed(2)}" y1="${line.y1.toFixed(2)}" x2="${line.x2.toFixed(2)}" y2="${line.y2.toFixed(2)}" stroke="${line.stroke}" stroke-width="${line.strokeWidth.toFixed(2)}" stroke-linecap="square"/>\n`;
+  }
+
+  svg += "</svg>";
+
+  return svg;
+}
+
+function downloadSvgFile(
+  filename,
+  content
+) {
+  const blob =
+    new Blob(
+      [content],
+      {
+        type:
+          "image/svg+xml;charset=utf-8"
+      }
+    );
+
+  const url =
+    URL.createObjectURL(blob);
+
+  const link =
+    document.createElement("a");
+
+  link.href = url;
+  link.download = filename;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+function exportSketchSvg() {
+  const settings = getSettings();
+  const collector = createSvgCollector();
+
+  if (settings.showCubeGrid) {
+    collectIsometricCubeGridSvg(
+      settings,
+      collector
+    );
+  }
+
+  if (settings.showGrid) {
+    collectScreenIsometricGridSvg(
+      settings,
+      collector
+    );
+  }
+
+  collectSketchNetsSvg(
+    settings,
+    collector
+  );
+
+  const svg =
+    buildSvgDocument(
+      collector,
+      settings
+    );
+
+  downloadSvgFile(
+    "connected-isometric-cube-nets.svg",
+    svg
   );
 }

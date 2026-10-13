@@ -314,6 +314,9 @@
         <option value="cascade">
           Cascade
         </option>
+        <option value="one-at-a-time">
+          One at a time
+        </option>
       </select>
     </div>
 
@@ -670,6 +673,9 @@
         <option value="two-tone-multi">
           Two-tone multicolor
         </option>
+        <option value="low-contrast">
+          Low contrast
+        </option>
       </select>
     </div>
 
@@ -710,6 +716,47 @@
         role="group"
       ></div>
 
+      <div id="lowContrastControls" class="hidden">
+        <div class="control-row" style="margin-top: 10px">
+          <label for="lowContrastShift">
+            Outer brightness
+          </label>
+
+          <span
+            id="lowContrastShiftValue"
+            class="value"
+          ></span>
+        </div>
+
+        <input
+          id="lowContrastShift"
+          type="range"
+          min="-40"
+          max="40"
+          step="1"
+          value="18"
+        />
+
+        <p class="note">
+          Outer color is derived from inner. Slide left
+          for darker, right for brighter.
+        </p>
+
+        <div class="control-row" style="margin-top: 8px">
+          <span>Outer preview</span>
+        </div>
+
+        <div
+          id="lowContrastOuterPreview"
+          style="
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            border: 1px solid rgba(0, 0, 0, 0.18);
+          "
+        ></div>
+      </div>
+
       <p class="note" id="twoToneNote">
         Outside of each face uses the outer color;
         the inside uses the inner color.
@@ -736,6 +783,87 @@
         step="0.001"
         value="0.008"
       />
+    </div>
+
+    <div id="oneAtATimeControls" class="hidden">
+      <div class="control-group">
+        <div class="control-row">
+          <label for="compositionPlacement">
+            Composition placement
+          </label>
+        </div>
+
+        <select id="compositionPlacement">
+          <option value="centered" selected>
+            Centered
+          </option>
+          <option value="edges">
+            Edges
+          </option>
+          <option value="center-exclude">
+            Center exclude
+          </option>
+        </select>
+
+        <p class="note" id="compositionPlacementNote">
+          Favor cubes that fold near the middle of the
+          frame.
+        </p>
+      </div>
+
+      <div class="control-group">
+        <div class="control-row">
+          <label for="oneAtATimeHold">
+            Hold when folded
+          </label>
+
+          <span
+            id="oneAtATimeHoldValue"
+            class="value"
+          ></span>
+        </div>
+
+        <input
+          id="oneAtATimeHold"
+          type="range"
+          min="0"
+          max="5"
+          step="0.1"
+          value="1.5"
+        />
+
+        <p class="note">
+          How long each cube stays fully folded before
+          unfolding.
+        </p>
+      </div>
+
+      <div class="control-group">
+        <div class="control-row">
+          <label for="oneAtATimeGap">
+            Gap between cubes
+          </label>
+
+          <span
+            id="oneAtATimeGapValue"
+            class="value"
+          ></span>
+        </div>
+
+        <input
+          id="oneAtATimeGap"
+          type="range"
+          min="0"
+          max="5"
+          step="0.1"
+          value="0.75"
+        />
+
+        <p class="note">
+          Pause after a cube unfolds before the next one
+          begins folding.
+        </p>
+      </div>
     </div>
 
     <div class="control-group">
@@ -937,6 +1065,13 @@
       type="button"
     >
       Export PNG
+    </button>
+
+    <button
+      id="exportSvgButton"
+      type="button"
+    >
+      Export SVG
     </button>
 
     <div class="control-group" id="presetControls">
