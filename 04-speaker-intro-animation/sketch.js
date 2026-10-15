@@ -55,6 +55,7 @@ function getCanvasDimensions() {
 
 const PALETTE = [
   "#FFFFFF",
+  "#FEF9F3",
   "#032932",
   "#0A4552",
   "#32EEFF",
@@ -89,6 +90,16 @@ let animationRunning = false;
 let animationStartTime = 0;
 
 let activeRevealDirection = "left";
+
+/*
+ * 2-way loop phases:
+ * reveal — rotate in from the start pose
+ * spin   — continue a full turn in the same direction
+ * hide   — rotate back out to the start pose
+ */
+let loopPhase = "reveal";
+
+const LOOP_HOLD_MS = 700;
 
 
 /* ---------------------------------------------------------
@@ -204,6 +215,9 @@ function getSettings() {
     autoLoop:
       controls.autoLoop.checked,
 
+    loopStyle:
+      controls.loopStyle.value,
+
     showGrid:
       controls.showGrid.checked,
 
@@ -235,6 +249,12 @@ function drawCube(settings) {
 
   const eased =
     easeInOutCubic(animationProgress);
+
+  if (isTwoWayActive(settings)) {
+    drawTwoWayCubes(settings, eased);
+    pop();
+    return;
+  }
 
   const rotations =
     getRevealRotation(
@@ -300,6 +320,141 @@ function drawCube(settings) {
   drawCubeFaces(settings);
 
   pop();
+}
+
+
+/* ---------------------------------------------------------
+   2-WAY REVEALS
+
+   Each image is its own face so the two can turn in
+   opposite directions, pivoting about the cube center.
+   At rest they sit where the cube's left / right faces
+   would be.
+--------------------------------------------------------- */
+
+function isTwoWayReveal(direction) {
+  return (
+    direction === "2-way-horizontal" ||
+    direction === "2-way-vertical"
+  );
+}
+
+
+function isTwoWayActive(settings) {
+  return (
+    settings.imageMode === "two" &&
+    isTwoWayReveal(activeRevealDirection)
+  );
+}
+
+
+function drawTwoWayCubes(settings, eased) {
+  const amount =
+    loopPhase === "spin"
+      ? TWO_PI
+      : settings.rotationAmount;
+
+  const remaining =
+    amount * (1 - eased);
+
+  const horizontal =
+    activeRevealDirection === "2-way-horizontal";
+
+  /*
+   * Left image (+Z): horizontal swings in from the left
+   * moving right; vertical rolls up from underneath.
+   */
+  push();
+
+  if (horizontal) {
+    rotateY(-remaining);
+  } else {
+    rotateX(-remaining);
+  }
+
+  drawImageFaceOnly(settings, "left");
+  pop();
+
+  /*
+   * Right image (+X): horizontal swings in from the right
+   * moving left; vertical rolls down over the top.
+   */
+  push();
+
+  if (horizontal) {
+    rotateY(remaining);
+  } else {
+    rotateZ(-remaining);
+  }
+
+  drawImageFaceOnly(settings, "right");
+  pop();
+}
+
+
+/*
+ * Only the image face is drawn: blank sides would
+ * clip through the other image's cube mid-turn.
+ */
+function drawImageFaceOnly(settings, side) {
+  if (!shouldShowFaceTextures()) {
+    return;
+  }
+
+  const h = settings.cubeSize * 0.5;
+
+  /*
+   * Solid backing just behind the image so its reverse
+   * side reads as the background + cube color.
+   */
+  const b = h - 0.1;
+
+  if (side === "left") {
+    drawSolidQuad(
+      [
+        [-h, -h, b],
+        [ h, -h, b],
+        [ h,  h, b],
+        [-h,  h, b]
+      ],
+      settings
+    );
+
+    drawTexturedQuad(
+      getLeftTexture(settings),
+      [
+        [-h, -h, h],
+        [ h, -h, h],
+        [ h,  h, h],
+        [-h,  h, h]
+      ],
+      settings,
+      0
+    );
+    return;
+  }
+
+  drawSolidQuad(
+    [
+      [b, -h, -h],
+      [b,  h, -h],
+      [b,  h,  h],
+      [b, -h,  h]
+    ],
+    settings
+  );
+
+  drawTexturedQuad(
+    getRightTexture(settings),
+    [
+      [h, -h, -h],
+      [h,  h, -h],
+      [h,  h,  h],
+      [h, -h,  h]
+    ],
+    settings,
+    HALF_PI
+  );
 }
 
 
@@ -553,7 +708,14 @@ function shouldShowFaceTextures() {
    * Keep PNGs hidden at animation start. Diagonal reveal
    * directions can leave a textured face facing camera
    * even when the cube is fully rotated away.
+   *
+   * A 2-way spin starts and ends at the rest pose, where
+   * the images are already showing.
    */
+  if (loopPhase === "spin") {
+    return true;
+  }
+
   return animationProgress > 0.001;
 }
 
@@ -1139,6 +1301,8 @@ function playAnimation() {
       settings.revealDirection;
   }
 
+  loopPhase = "reveal";
+
   animationProgress = 0;
 
   animationRunning = true;
@@ -1163,9 +1327,53 @@ function resetAnimation() {
       settings.revealDirection;
   }
 
+  loopPhase = "reveal";
+
   animationProgress = 0;
 
   animationRunning = false;
+}
+
+
+function getPhaseDurationMs(settings) {
+  const durationMs =
+    settings.animationDuration *
+    1000;
+
+  /*
+   * A full-turn spin keeps the same angular speed as
+   * the reveal, so it takes proportionally longer.
+   */
+  if (loopPhase === "spin") {
+    return (
+      durationMs *
+      TWO_PI /
+      max(settings.rotationAmount, 0.001)
+    );
+  }
+
+  return durationMs;
+}
+
+
+function startNextTwoWayLoop(settings) {
+  if (settings.loopStyle === "reverse") {
+    loopPhase =
+      loopPhase === "hide"
+        ? "reveal"
+        : "hide";
+  } else {
+    loopPhase =
+      loopPhase === "hide"
+        ? "reveal"
+        : "spin";
+  }
+
+  animationProgress =
+    loopPhase === "hide" ? 1 : 0;
+
+  animationStartTime =
+    millis();
 }
 
 
@@ -1175,14 +1383,13 @@ function updateAnimation(settings) {
   }
 
   const durationMs =
-    settings.animationDuration *
-    1000;
+    getPhaseDurationMs(settings);
 
   const elapsed =
     millis() -
     animationStartTime;
 
-  animationProgress =
+  const t =
     constrain(
       elapsed /
       durationMs,
@@ -1190,21 +1397,28 @@ function updateAnimation(settings) {
       1
     );
 
-  if (
-    animationProgress >= 1
-  ) {
-    animationProgress = 1;
+  animationProgress =
+    loopPhase === "hide"
+      ? 1 - t
+      : t;
 
-    if (settings.autoLoop) {
-      if (
-        elapsed >
-        durationMs + 700
-      ) {
-        playAnimation();
-      }
-    } else {
-      animationRunning = false;
-    }
+  if (t < 1) {
+    return;
+  }
+
+  if (!settings.autoLoop) {
+    animationRunning = false;
+    return;
+  }
+
+  if (elapsed <= durationMs + LOOP_HOLD_MS) {
+    return;
+  }
+
+  if (isTwoWayActive(settings)) {
+    startNextTwoWayLoop(settings);
+  } else {
+    playAnimation();
   }
 }
 
@@ -1334,6 +1548,8 @@ function getControls() {
     "rotationAmountValue",
 
     "autoLoop",
+    "loopStyleControls",
+    "loopStyle",
 
     "playButton",
     "resetButton",
@@ -1398,7 +1614,15 @@ function connectControls() {
         activeRevealDirection =
           controls.revealDirection.value;
       }
+
+      updateControlUI();
     }
+  );
+
+
+  controls.autoLoop.addEventListener(
+    "change",
+    updateControlUI
   );
 
 
@@ -1505,6 +1729,37 @@ function updateControlUI() {
   controls.twoFaceControls.classList.toggle(
     "hidden-control",
     mode !== "two"
+  );
+
+
+  /* 2-way reveals only exist in Two images mode */
+
+  const twoImages =
+    mode === "two";
+
+  controls.revealDirection
+    .querySelectorAll("[data-two-images]")
+    .forEach(
+      (option) => {
+        option.hidden = !twoImages;
+        option.disabled = !twoImages;
+      }
+    );
+
+  if (
+    !twoImages &&
+    isTwoWayReveal(controls.revealDirection.value)
+  ) {
+    controls.revealDirection.value = "left";
+    activeRevealDirection = "left";
+  }
+
+  controls.loopStyleControls.classList.toggle(
+    "hidden-control",
+    !(
+      controls.autoLoop.checked &&
+      isTwoWayReveal(controls.revealDirection.value)
+    )
   );
 }
 

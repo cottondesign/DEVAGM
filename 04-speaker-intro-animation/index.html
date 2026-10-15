@@ -381,6 +381,12 @@
           <option value="right-up-old">Right + Up (old)</option>
           <option value="left-down-old">Left + Down (old)</option>
           <option value="right-down-old">Right + Down (old)</option>
+          <option value="2-way-horizontal" data-two-images hidden disabled>
+            2-way horizontal
+          </option>
+          <option value="2-way-vertical" data-two-images hidden disabled>
+            2-way vertical
+          </option>
           <option value="random">Random</option>
         </select>
       </div>
@@ -425,6 +431,19 @@
         />
       </div>
 
+      <div id="loopStyleControls" class="control hidden-control">
+        <label for="loopStyle">Loop style</label>
+
+        <select id="loopStyle">
+          <option value="continue" selected>
+            Continue rotating
+          </option>
+          <option value="reverse">
+            Rotate back
+          </option>
+        </select>
+      </div>
+
       <div class="button-row">
         <button id="playButton">Play</button>
         <button id="resetButton">Reset</button>
@@ -432,7 +451,11 @@
 
       <p class="note">
         Press P to replay. Random chooses a new direction
-        every time the animation starts.
+        every time the animation starts. 2-way modes
+        (Two images only) turn each image as its own face:
+        horizontal swings them in from opposite sides,
+        vertical rolls the left image up and the right
+        image down.
       </p>
     </div>
 
