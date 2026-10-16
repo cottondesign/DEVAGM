@@ -444,7 +444,9 @@ function setup() {
    * Restore the last session when present. Otherwise
    * start flat with the HTML defaults.
    */
-  if (!restoreSessionSettings()) {
+  if (isKioskMode()) {
+    startKioskPlayback();
+  } else if (!restoreSessionSettings()) {
     controls.foldProgress.value = 0;
     controls.drapeAmount.value = 1;
     controls.cubeCoverage.value = 100;
@@ -475,7 +477,7 @@ function setup() {
     }
   );
 
-  if (typeof initReel === "function") {
+  if (!isKioskMode() && typeof initReel === "function") {
     initReel();
   }
 }
@@ -1129,6 +1131,46 @@ const RANDOMIZE_RANGE_LIMITS = {
   oneAtATimeGap: [0, 3]
 };
 
+const KIOSK_RANDOMIZE_RANGE_LIMITS = {
+  cameraZoom: [0.55, 1.35],
+  cascadeCount: [4, 48],
+  gridSize: [32, 80],
+  animationSpeed: [0.004, 0.022],
+  wanderSpeed: [0.004, 0.022]
+};
+
+const KIOSK_CAMERA_ZOOM = [0.55, 1.35];
+const KIOSK_RANDOMIZE_MS = 5000;
+
+function isKioskMode() {
+  return document.body.classList.contains("kiosk");
+}
+
+function randomizeRangeLimit(id) {
+  if (isKioskMode() && KIOSK_RANDOMIZE_RANGE_LIMITS[id]) {
+    return KIOSK_RANDOMIZE_RANGE_LIMITS[id];
+  }
+
+  return RANDOMIZE_RANGE_LIMITS[id];
+}
+
+function startKioskPlayback() {
+  controls.aspectRatio.value = "16:9";
+  applyAspectRatio();
+  controls.animateFolding.checked = true;
+  randomizeEverything();
+  controls.animateFolding.checked = true;
+
+  setInterval(() => {
+    if (reelRendering) {
+      return;
+    }
+
+    randomizeEverything();
+    controls.animateFolding.checked = true;
+  }, KIOSK_RANDOMIZE_MS);
+}
+
 function pickRandomFrom(list) {
   return list[floor(Math.random() * list.length)];
 }
@@ -1138,9 +1180,11 @@ function randomRangeValue(el, id) {
   let lo = Number(el.min);
   let hi = Number(el.max);
 
-  if (RANDOMIZE_RANGE_LIMITS[id]) {
-    lo = max(lo, RANDOMIZE_RANGE_LIMITS[id][0]);
-    hi = min(hi, RANDOMIZE_RANGE_LIMITS[id][1]);
+  const limits = randomizeRangeLimit(id);
+
+  if (limits) {
+    lo = max(lo, limits[0]);
+    hi = min(hi, limits[1]);
   }
 
   const steps = floor((hi - lo) / step + 1e-9);
@@ -1245,7 +1289,7 @@ function writePresetStore(store) {
 }
 
 function scheduleSessionSave() {
-  if (sessionRestoring || reelRendering) {
+  if (isKioskMode() || sessionRestoring || reelRendering) {
     return;
   }
 
@@ -1261,6 +1305,7 @@ function scheduleSessionSave() {
 
 function saveSessionSettings() {
   if (
+    isKioskMode() ||
     sessionRestoring ||
     reelRendering ||
     !controls.foldProgress
@@ -1282,6 +1327,10 @@ function saveSessionSettings() {
 }
 
 function restoreSessionSettings() {
+  if (isKioskMode()) {
+    return false;
+  }
+
   let preset = null;
 
   try {
@@ -2281,8 +2330,16 @@ function getSettings() {
   const gridSize =
     Number(controls.gridSize.value);
 
-  const cameraZoom =
+  let cameraZoom =
     Number(controls.cameraZoom.value);
+
+  if (isKioskMode()) {
+    cameraZoom = constrain(
+      cameraZoom,
+      KIOSK_CAMERA_ZOOM[0],
+      KIOSK_CAMERA_ZOOM[1]
+    );
+  }
 
   const verticalView =
     getVerticalView(cameraZoom);

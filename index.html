@@ -666,10 +666,56 @@
         width: auto;
       }
     }
+
+    body.kiosk {
+      display: block;
+      padding: 0;
+      gap: 0;
+      overflow: hidden;
+      min-height: 100vh;
+      min-height: 100dvh;
+    }
+
+    body.kiosk #controls,
+    body.kiosk #reel-panel,
+    body.kiosk #fps-meter {
+      display: none !important;
+    }
+
+    body.kiosk #canvas-container {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: var(--page-bg, #032932);
+    }
+
+    body.kiosk #canvas-stage {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+
+    body.kiosk #canvas-stage canvas {
+      position: absolute;
+      inset: 0;
+      display: block;
+      width: 100% !important;
+      height: 100% !important;
+      max-width: none !important;
+      object-fit: cover;
+      object-position: center center;
+    }
   </style>
 </head>
 
-<body>
+<body class="kiosk">
   <aside id="controls">
     <div class="control-group">
       <div class="control-row">
@@ -2389,8 +2435,6 @@
     </div>
   </aside>
 
-  <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.js"></script>
   <script src="sketch.js"></script>
-  <script src="reel.js"></script>
 </body>
 </html>
