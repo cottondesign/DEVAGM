@@ -355,9 +355,57 @@
 
       </div>
 
+      <div class="control" style="margin-top: 12px">
+        <label for="leftImageAlign">Left frame alignment</label>
+
+        <select id="leftImageAlign">
+          <option value="top">Top</option>
+          <option value="center" selected>Center</option>
+          <option value="bottom">Bottom</option>
+        </select>
+      </div>
+
+      <div class="control">
+        <label for="rightImageAlign">Right frame alignment</label>
+
+        <select id="rightImageAlign">
+          <option value="top">Top</option>
+          <option value="center" selected>Center</option>
+          <option value="bottom">Bottom</option>
+        </select>
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="backingGrow">Backing padding</label>
+          <span id="backingGrowValue" class="value">0.5%</span>
+        </div>
+
+        <input
+          id="backingGrow"
+          type="range"
+          min="0"
+          max="10"
+          step="0.1"
+          value="0.5"
+        />
+      </div>
+
+      <div class="control checkbox-row">
+        <label for="backingOutline">Outline image backing</label>
+        <input
+          id="backingOutline"
+          type="checkbox"
+        />
+      </div>
+
       <p class="note">
-        Square transparent PNGs work best. The right face
-        image is oriented so its top faces the top of the screen.
+        PNGs fill the square frame's width; alignment places
+        shorter ones at the top, middle, or bottom. Transparent
+        pixels are see-through on both sides, and the backing
+        is a box around the PNG's visible artwork, padded by
+        the padding amount. The right face image is oriented
+        so its top faces the top of the screen.
       </p>
     </div>
 
@@ -404,6 +452,22 @@
           max="8"
           step="0.05"
           value="2.5"
+        />
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="holdDuration">Hold in view</label>
+          <span id="holdDurationValue" class="value">0.70s</span>
+        </div>
+
+        <input
+          id="holdDuration"
+          type="range"
+          min="0"
+          max="10"
+          step="0.05"
+          value="0.7"
         />
       </div>
 

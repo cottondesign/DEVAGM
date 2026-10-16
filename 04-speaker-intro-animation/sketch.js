@@ -201,11 +201,26 @@ function getSettings() {
     oneFaceSide:
       controls.oneFaceSide.value,
 
+    leftImageAlign:
+      controls.leftImageAlign.value,
+
+    rightImageAlign:
+      controls.rightImageAlign.value,
+
+    backingOutline:
+      controls.backingOutline.checked,
+
+    backingGrow:
+      Number(controls.backingGrow.value) / 100,
+
     revealDirection:
       controls.revealDirection.value,
 
     animationDuration:
       Number(controls.animationDuration.value),
+
+    holdDuration:
+      Number(controls.holdDuration.value),
 
     rotationAmount:
       radians(
@@ -404,24 +419,30 @@ function drawImageFaceOnly(settings, side) {
   const h = settings.cubeSize * 0.5;
 
   /*
-   * Solid backing just behind the image so its reverse
-   * side reads as the background + cube color.
+   * Backing just behind the image so its reverse side
+   * reads as the background + cube color. It covers only
+   * the image's rectangle inside the square frame.
    */
   const b = h - 0.1;
 
   if (side === "left") {
-    drawSolidQuad(
+    const img = getLeftTexture(settings);
+
+    drawFramedImageBacking(
+      img,
       [
         [-h, -h, b],
         [ h, -h, b],
         [ h,  h, b],
         [-h,  h, b]
       ],
-      settings
+      settings,
+      0,
+      settings.leftImageAlign
     );
 
-    drawTexturedQuad(
-      getLeftTexture(settings),
+    drawFramedImage(
+      img,
       [
         [-h, -h, h],
         [ h, -h, h],
@@ -429,23 +450,29 @@ function drawImageFaceOnly(settings, side) {
         [-h,  h, h]
       ],
       settings,
-      0
+      0,
+      settings.leftImageAlign
     );
     return;
   }
 
-  drawSolidQuad(
+  const img = getRightTexture(settings);
+
+  drawFramedImageBacking(
+    img,
     [
       [b, -h, -h],
       [b,  h, -h],
       [b,  h,  h],
       [b, -h,  h]
     ],
-    settings
+    settings,
+    HALF_PI,
+    settings.rightImageAlign
   );
 
-  drawTexturedQuad(
-    getRightTexture(settings),
+  drawFramedImage(
+    img,
     [
       [h, -h, -h],
       [h,  h, -h],
@@ -453,7 +480,8 @@ function drawImageFaceOnly(settings, side) {
       [h, -h,  h]
     ],
     settings,
-    HALF_PI
+    HALF_PI,
+    settings.rightImageAlign
   );
 }
 
@@ -602,7 +630,7 @@ function drawCubeFaces(settings) {
   /* ---------------- LEFT / +Z ---------------- */
 
   if (leftTexture) {
-    drawTexturedQuad(
+    drawFramedImage(
       leftTexture,
       [
         [-h, -h, h],
@@ -611,7 +639,8 @@ function drawCubeFaces(settings) {
         [-h,  h, h]
       ],
       settings,
-      0
+      0,
+      settings.leftImageAlign
     );
   } else {
     drawSolidQuad(
@@ -629,7 +658,7 @@ function drawCubeFaces(settings) {
   /* ---------------- RIGHT / +X ---------------- */
 
   if (rightTexture) {
-    drawTexturedQuad(
+    drawFramedImage(
       rightTexture,
       [
         [h, -h, -h],
@@ -644,7 +673,8 @@ function drawCubeFaces(settings) {
        * 90° CCW aligns texture top with screen top
        * on this +X face in isometric view.
        */
-      HALF_PI
+      HALF_PI,
+      settings.rightImageAlign
     );
   } else {
     drawSolidQuad(
@@ -888,6 +918,365 @@ function drawTexturedQuad(
     uv3.u,
     uv3.v
   );
+
+  endShape(CLOSE);
+
+  pop();
+}
+
+
+/* ---------------------------------------------------------
+   FRAMED IMAGE
+
+   PNGs cropped to their artwork are fit inside the square
+   face: the longer side spans the frame and the image is
+   placed along the other axis by `align` (top / center /
+   bottom), keeping its aspect. `points` are the full
+   square face; textureRotation orients the image the same
+   way drawTexturedQuad would.
+--------------------------------------------------------- */
+
+function getFramedImageQuad(
+  img,
+  points,
+  textureRotation,
+  align = "center"
+) {
+  const aspect = img.width / img.height;
+
+  let u0 = 0;
+  let u1 = 1;
+  let v0 = 0;
+  let v1 = 1;
+
+  if (aspect >= 1) {
+    const span = 1 / aspect;
+    const slack = 1 - span;
+
+    v0 =
+      align === "top"
+        ? 0
+        : align === "bottom"
+          ? slack
+          : slack * 0.5;
+    v1 = v0 + span;
+  } else {
+    const span = aspect;
+    u0 = (1 - span) * 0.5;
+    u1 = u0 + span;
+  }
+
+  /*
+   * Image-space corners → face parameters (undo the UV
+   * rotation) → 3D point on the face.
+   */
+  const toFace = (u, v) => {
+    const p = rotateUV(u, v, -textureRotation);
+    const a = p.u;
+    const b = p.v;
+
+    return [0, 1, 2].map((axis) =>
+      points[0][axis] +
+      (points[1][axis] - points[0][axis]) * a +
+      (points[3][axis] - points[0][axis]) * b
+    );
+  };
+
+  return [
+    toFace(u0, v0),
+    toFace(u1, v0),
+    toFace(u1, v1),
+    toFace(u0, v1)
+  ];
+}
+
+
+function drawFramedImage(
+  img,
+  points,
+  settings,
+  textureRotation = 0,
+  align = "center"
+) {
+  if (!img) {
+    drawSolidQuad(points, settings);
+    return;
+  }
+
+  drawAlphaMaskedQuad(
+    img,
+    getFramedImageQuad(
+      img,
+      points,
+      textureRotation,
+      align
+    ),
+    settings
+  );
+}
+
+
+/*
+ * With an image, the backing is a box around the PNG's
+ * opaque pixels, padded by the overshoot setting.
+ */
+function drawFramedImageBacking(
+  img,
+  points,
+  settings,
+  textureRotation = 0,
+  align = "center"
+) {
+  let quad = points;
+
+  if (img) {
+    const bounds =
+      getOpaqueBounds(img);
+
+    if (!bounds) {
+      return;
+    }
+
+    const padding =
+      max(img.width, img.height) *
+      settings.backingGrow;
+
+    const pu = padding / img.width;
+    const pv = padding / img.height;
+
+    quad = getSubQuad(
+      getFramedImageQuad(
+        img,
+        points,
+        textureRotation,
+        align
+      ),
+      bounds.u0 - pu,
+      bounds.v0 - pv,
+      bounds.u1 + pu,
+      bounds.v1 + pv
+    );
+  }
+
+  drawSolidQuad(quad, settings);
+
+  if (settings.backingOutline) {
+    drawBackingOutline(quad);
+  }
+}
+
+
+/* Point on a quad at image coordinates (u, v). */
+function getSubQuad(points, u0, v0, u1, v1) {
+  const at = (u, v) =>
+    [0, 1, 2].map((axis) =>
+      points[0][axis] +
+      (points[1][axis] - points[0][axis]) * u +
+      (points[3][axis] - points[0][axis]) * v
+    );
+
+  return [
+    at(u0, v0),
+    at(u1, v0),
+    at(u1, v1),
+    at(u0, v1)
+  ];
+}
+
+
+/* ---------------------------------------------------------
+   OPAQUE BOUNDS
+
+   Bounding box of the PNG's visible pixels in image
+   coordinates (0–1). Scanned once per image.
+--------------------------------------------------------- */
+
+const OPAQUE_ALPHA_THRESHOLD = 8;
+
+const opaqueBoundsCache = new WeakMap();
+
+
+function getOpaqueBounds(img) {
+  if (opaqueBoundsCache.has(img)) {
+    return opaqueBoundsCache.get(img);
+  }
+
+  img.loadPixels();
+
+  const pixels = img.pixels;
+
+  const density =
+    Math.sqrt(
+      pixels.length /
+      4 /
+      (img.width * img.height)
+    );
+
+  const pw = Math.round(img.width * density);
+  const ph = Math.round(img.height * density);
+
+  let minX = pw;
+  let minY = ph;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < ph; y++) {
+    const row = y * pw * 4;
+
+    for (let x = 0; x < pw; x++) {
+      if (pixels[row + x * 4 + 3] > OPAQUE_ALPHA_THRESHOLD) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  const bounds =
+    maxX < 0
+      ? null
+      : {
+        u0: minX / pw,
+        v0: minY / ph,
+        u1: (maxX + 1) / pw,
+        v1: (maxY + 1) / ph
+      };
+
+  opaqueBoundsCache.set(img, bounds);
+
+  return bounds;
+}
+
+
+/* ---------------------------------------------------------
+   ALPHA-MASKED QUADS
+
+   p5's default texture shader still writes depth for
+   fully transparent pixels, so an invisible part of one
+   plane hides whatever passes behind it. This shader
+   discards those pixels instead.
+--------------------------------------------------------- */
+
+const ALPHA_MASK_VERT = `
+precision highp float;
+
+attribute vec3 aPosition;
+attribute vec2 aTexCoord;
+
+uniform mat4 uModelViewMatrix;
+uniform mat4 uProjectionMatrix;
+
+varying vec2 vTexCoord;
+
+void main() {
+  vTexCoord = aTexCoord;
+  gl_Position =
+    uProjectionMatrix *
+    uModelViewMatrix *
+    vec4(aPosition, 1.0);
+}
+`;
+
+const ALPHA_MASK_FRAG = `
+precision highp float;
+
+varying vec2 vTexCoord;
+
+uniform sampler2D uImage;
+uniform float uCutoff;
+
+void main() {
+  vec4 texel = texture2D(uImage, vTexCoord);
+
+  if (texel.a <= uCutoff) {
+    discard;
+  }
+
+  gl_FragColor = vec4(texel.rgb * texel.a, texel.a);
+}
+`;
+
+const IMAGE_ALPHA_CUTOFF = 0.01;
+
+let alphaMaskShader = null;
+
+
+function getAlphaMaskShader() {
+  if (!alphaMaskShader) {
+    alphaMaskShader = createShader(
+      ALPHA_MASK_VERT,
+      ALPHA_MASK_FRAG
+    );
+  }
+
+  return alphaMaskShader;
+}
+
+
+function drawAlphaMaskedQuad(
+  img,
+  points,
+  settings
+) {
+  const maskShader =
+    getAlphaMaskShader();
+
+  push();
+
+  shader(maskShader);
+
+  maskShader.setUniform("uImage", img);
+  maskShader.setUniform("uCutoff", IMAGE_ALPHA_CUTOFF);
+
+  noStroke();
+
+  beginShape(QUADS);
+
+  vertex(points[0][0], points[0][1], points[0][2], 0, 0);
+  vertex(points[1][0], points[1][1], points[1][2], 1, 0);
+  vertex(points[2][0], points[2][1], points[2][2], 1, 1);
+  vertex(points[3][0], points[3][1], points[3][2], 0, 1);
+
+  endShape(CLOSE);
+
+  resetShader();
+
+  pop();
+
+  if (settings.debugMode) {
+    push();
+    noFill();
+    stroke(getDebugColor());
+    strokeWeight(2);
+    beginShape();
+
+    for (const point of points) {
+      vertex(point[0], point[1], point[2]);
+    }
+
+    endShape(CLOSE);
+    pop();
+  }
+}
+
+
+function drawBackingOutline(quad) {
+  push();
+
+  noFill();
+  stroke(255, 0, 0);
+  strokeWeight(3);
+
+  beginShape();
+
+  for (const point of quad) {
+    vertex(
+      point[0],
+      point[1],
+      point[2]
+    );
+  }
 
   endShape(CLOSE);
 
@@ -1411,7 +1800,16 @@ function updateAnimation(settings) {
     return;
   }
 
-  if (elapsed <= durationMs + LOOP_HOLD_MS) {
+  /*
+   * Reveal and spin end with the images in view; hide
+   * ends with them turned away.
+   */
+  const holdMs =
+    loopPhase === "hide"
+      ? LOOP_HOLD_MS
+      : settings.holdDuration * 1000;
+
+  if (elapsed <= durationMs + holdMs) {
     return;
   }
 
@@ -1535,6 +1933,12 @@ function getControls() {
 
     "oneFaceSide",
 
+    "leftImageAlign",
+    "rightImageAlign",
+    "backingOutline",
+    "backingGrow",
+    "backingGrowValue",
+
     "singleImageInput",
     "leftImageInput",
     "rightImageInput",
@@ -1543,6 +1947,9 @@ function getControls() {
 
     "animationDuration",
     "animationDurationValue",
+
+    "holdDuration",
+    "holdDurationValue",
 
     "rotationAmount",
     "rotationAmountValue",
@@ -1582,10 +1989,12 @@ function connectControls() {
     controls.cubeSize,
     controls.cubeY,
     controls.animationDuration,
+    controls.holdDuration,
     controls.rotationAmount,
     controls.gridSize,
     controls.gridOpacity,
-    controls.cameraZoom
+    controls.cameraZoom,
+    controls.backingGrow
   ];
 
   rangeControls.forEach(
@@ -1703,6 +2112,11 @@ function updateControlUI() {
       controls.animationDuration.value
     ).toFixed(2)}s`;
 
+  controls.holdDurationValue.textContent =
+    `${Number(
+      controls.holdDuration.value
+    ).toFixed(2)}s`;
+
   controls.rotationAmountValue.textContent =
     `${controls.rotationAmount.value}°`;
 
@@ -1711,6 +2125,9 @@ function updateControlUI() {
 
   controls.gridOpacityValue.textContent =
     `${controls.gridOpacity.value}%`;
+
+  controls.backingGrowValue.textContent =
+    `${controls.backingGrow.value}%`;
 
   controls.cameraZoomValue.textContent =
     Number(
