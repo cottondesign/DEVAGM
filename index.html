@@ -274,9 +274,277 @@
       max-width: 100%;
     }
 
+    body {
+      --reel-panel-width: 270px;
+    }
+
+    body.reel-expanded {
+      --reel-panel-width: min(780px, 56vw);
+    }
+
+    #reel-panel {
+      width: var(--reel-panel-width);
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      height: 100%;
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding-right: 6px;
+    }
+
+    .reel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      font-size: 11px;
+    }
+
+    body.reel-busy #controls,
+    body.reel-busy .reel-lockable {
+      pointer-events: none;
+      opacity: 0.4;
+    }
+
+    button:disabled,
+    select:disabled,
+    input:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
+    button:disabled:hover {
+      background: transparent;
+      color: inherit;
+    }
+
+    .reel-clip-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .reel-clip-list:empty {
+      display: none;
+    }
+
+    body.reel-expanded .reel-clip-list {
+      display: grid;
+      grid-template-columns: repeat(
+        auto-fill,
+        minmax(200px, 1fr)
+      );
+      gap: 12px;
+    }
+
+    .reel-clip {
+      position: relative;
+      display: grid;
+      grid-template-columns: 72px 1fr;
+      gap: 8px;
+      align-items: center;
+      padding: 6px;
+      border: 1px solid var(--page-border, rgba(244, 241, 234, 0.18));
+      font-size: 10px;
+      line-height: 1.35;
+      cursor: grab;
+      user-select: none;
+    }
+
+    body.reel-expanded .reel-clip {
+      grid-template-columns: 1fr;
+      align-items: stretch;
+      padding: 8px;
+    }
+
+    .reel-clip.dragging {
+      opacity: 0.35;
+    }
+
+    .reel-clip.drop-before::before,
+    .reel-clip.drop-after::after {
+      content: "";
+      position: absolute;
+      background: var(--page-fg, #f4f1ea);
+      left: 0;
+      right: 0;
+      height: 2px;
+    }
+
+    .reel-clip.drop-before::before {
+      top: -5px;
+    }
+
+    .reel-clip.drop-after::after {
+      bottom: -5px;
+    }
+
+    body.reel-expanded .reel-clip.drop-before::before,
+    body.reel-expanded .reel-clip.drop-after::after {
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      height: auto;
+    }
+
+    body.reel-expanded .reel-clip.drop-before::before {
+      left: -7px;
+      right: auto;
+    }
+
+    body.reel-expanded .reel-clip.drop-after::after {
+      left: auto;
+      right: -7px;
+    }
+
+    .reel-thumb {
+      width: 100%;
+      aspect-ratio: var(--reel-aspect, 16 / 9);
+      background: var(--page-input-bg, rgba(254, 249, 243, 0.08));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .reel-thumb img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      pointer-events: none;
+    }
+
+    .reel-clip-index {
+      opacity: 0.55;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .reel-clip-name {
+      word-break: break-word;
+    }
+
+    .reel-clip-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      opacity: 0.55;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .reel-clip-trim {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+
+    .reel-clip-trim label {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      opacity: 0.8;
+    }
+
+    .reel-clip-trim input {
+      padding: 5px 6px;
+      font-size: 10px;
+    }
+
+    .reel-clip-actions {
+      display: grid;
+      grid-template-columns: 1fr auto auto 1fr;
+      gap: 4px;
+    }
+
+    .reel-clip-actions button {
+      padding: 5px 6px;
+      font-size: 10px;
+    }
+
+    .reel-editor-only {
+      display: none;
+    }
+
+    body.reel-expanded .reel-editor-only {
+      display: flex;
+    }
+
+    body.reel-expanded .reel-clip-trim.reel-editor-only,
+    body.reel-expanded .reel-clip-actions.reel-editor-only {
+      display: grid;
+    }
+
+    .reel-progress {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .reel-preview {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    body.reel-previewing #reelPreviewControls {
+      position: fixed;
+      left: 50%;
+      bottom: 20px;
+      z-index: 30;
+      transform: translateX(
+        calc(
+          -50% -
+            (
+              var(--reel-panel-width) + 20px
+            ) / 2
+        )
+      );
+      width: min(520px, calc(100vw - 320px - 80px));
+      margin: 0;
+      padding: 12px 14px;
+      border: 1px solid var(--page-border, rgba(244, 241, 234, 0.18));
+      background: var(--page-bg, #032932);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+    }
+
+    body.reel-previewing #reelPreviewControls input[type="range"] {
+      width: 100%;
+    }
+
+    .reel-preview-clip {
+      min-width: 0;
+      word-break: break-word;
+    }
+
+    .reel-preview .value {
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+    }
+
+    #reelPresetControls {
+      padding-top: 14px;
+      border-top: 1px solid var(--page-border, rgba(244, 241, 234, 0.18));
+    }
+
+    .reel-progress-track {
+      height: 4px;
+      background: var(--page-border, rgba(244, 241, 234, 0.18));
+    }
+
+    .reel-progress-bar {
+      height: 100%;
+      width: 0;
+      background: var(--page-fg, #f4f1ea);
+    }
+
     #fps-meter {
       position: fixed;
-      right: 20px;
+      right: calc(var(--reel-panel-width) + 40px);
       bottom: 20px;
       z-index: 20;
       width: 220px;
@@ -374,6 +642,28 @@
       #canvas-container {
         height: auto;
         min-height: 50vh;
+      }
+
+      body,
+      body.reel-expanded {
+        --reel-panel-width: 100%;
+      }
+
+      #reel-panel {
+        height: auto;
+        overflow: visible;
+      }
+
+      #fps-meter {
+        right: 20px;
+      }
+
+      body.reel-previewing #reelPreviewControls {
+        left: 20px;
+        right: 20px;
+        bottom: 16px;
+        transform: none;
+        width: auto;
       }
     }
   </style>
@@ -851,6 +1141,9 @@
         <option value="16:9" selected>16:9</option>
         <option value="1:1">1:1</option>
         <option value="4:5">4:5</option>
+        <option value="960:1536">960×1536</option>
+        <option value="1440:768">1440×768</option>
+        <option value="2496:768">2496×768</option>
         <option value="2496:786">2496×786</option>
         <option value="1824:2304">1824×2304</option>
       </select>
@@ -1418,6 +1711,54 @@
           (1824×1026 on the 1824×2304 canvas).
         </p>
       </div>
+
+      <div
+        id="presentationPlacementControls"
+        class="control-group hidden"
+      >
+        <div class="control-row">
+          <label for="presentationPaletteBrightness">
+            Palette brightness
+          </label>
+
+          <span
+            id="presentationPaletteBrightnessValue"
+            class="value"
+          ></span>
+        </div>
+
+        <input
+          id="presentationPaletteBrightness"
+          type="range"
+          min="25"
+          max="200"
+          step="1"
+          value="100"
+        />
+
+        <div
+          class="control-row"
+          style="margin-top: 8px"
+        >
+          <label for="presentationDivisionWeight">
+            Division line thickness
+          </label>
+
+          <span
+            id="presentationDivisionWeightValue"
+            class="value"
+          ></span>
+        </div>
+
+        <input
+          id="presentationDivisionWeight"
+          type="range"
+          min="0.25"
+          max="4"
+          step="0.05"
+          value="1"
+        />
+      </div>
     </div>
 
     <div class="control-group">
@@ -1760,6 +2101,251 @@
     <div id="canvas-stage"></div>
   </main>
 
+  <aside id="reel-panel" aria-label="Reel compiler">
+    <div class="reel-head">
+      <span class="heading">Reel</span>
+      <span id="reelSummary" class="value">No clips</span>
+    </div>
+
+    <button id="reelAddClipButton" type="button">
+      Add Clip to Sequence
+    </button>
+
+    <div id="reelEditorHead" class="control-group hidden">
+      <button id="reelBackButton" type="button">
+        ← Back to Sketch Controls
+      </button>
+
+      <div class="button-row">
+        <button id="reelAutoArrangeButton" type="button">
+          Auto Arrange
+        </button>
+
+        <button id="reelAlternateArrangeButton" type="button">
+          Alternate Arrange
+        </button>
+      </div>
+
+      <p class="note" id="reelContrastNote">
+        Drag clips to reorder. Auto Arrange picks the
+        strongest contrast order; Alternate Arrange
+        cycles other high-scoring orders from the same
+        logic.
+      </p>
+    </div>
+
+    <div class="control-group">
+      <div class="control-row">
+        <label for="reelAspectRatio">
+          Sequence aspect ratio
+        </label>
+      </div>
+
+      <select id="reelAspectRatio"></select>
+
+      <p class="note">
+        Every clip is re-rendered at this ratio when
+        it plays or exports; other clip settings stay
+        as saved.
+      </p>
+    </div>
+
+    <div class="control-group">
+      <div class="control-row">
+        <label for="reelCameraZoomScale">
+          Sequence camera zoom
+        </label>
+
+        <span
+          id="reelCameraZoomScaleValue"
+          class="value"
+        ></span>
+      </div>
+
+      <input
+        id="reelCameraZoomScale"
+        type="range"
+        min="0.25"
+        max="4"
+        step="0.05"
+        value="1"
+      />
+
+      <p class="note">
+        Scales every clip's saved camera zoom
+        proportionally for preview and export.
+      </p>
+    </div>
+
+    <div class="control-group">
+      <div class="control-row">
+        <label for="reelDefaultDuration">
+          Clip duration
+        </label>
+
+        <span
+          id="reelDefaultDurationValue"
+          class="value"
+        ></span>
+      </div>
+
+      <input
+        id="reelDefaultDuration"
+        type="range"
+        min="0.5"
+        max="1200"
+        step="0.5"
+        value="4"
+      />
+
+      <p class="note">
+        Default length for every clip. Trim a clip in
+        the sequence editor to override it.
+      </p>
+    </div>
+
+    <div
+      id="reelClipList"
+      class="reel-clip-list"
+      aria-label="Saved clips"
+    ></div>
+
+    <p id="reelEmptyNote" class="note">
+      Dial in a sketch you like, then add it as a
+      clip. Each clip keeps its own settings.
+    </p>
+
+    <div class="button-row">
+      <button id="reelArrangeButton" type="button">
+        Arrange Sequence
+      </button>
+
+      <button id="reelClearSequenceButton" type="button">
+        Clear Sequence
+      </button>
+    </div>
+
+    <div id="reelExportControls" class="control-group">
+      <div class="control-row">
+        <label for="reelFps">Frame rate</label>
+      </div>
+
+      <select id="reelFps">
+        <option value="30" selected>30 fps</option>
+        <option value="60">60 fps</option>
+      </select>
+
+      <div class="control-row" style="margin-top: 10px">
+        <label for="reelResolution">
+          Export resolution
+        </label>
+      </div>
+
+      <select id="reelResolution">
+        <option value="1" selected>Full</option>
+        <option value="0.75">75%</option>
+        <option value="0.5">50%</option>
+      </select>
+
+      <div class="button-row" style="margin-top: 12px">
+        <button id="reelPreviewButton" type="button">
+          Preview
+        </button>
+
+        <button id="reelExportButton" type="button">
+          Export Reel
+        </button>
+
+        <button id="reelSavePresetButton" type="button">
+          Add Sequence as Preset
+        </button>
+      </div>
+
+      <div
+        id="reelPreviewControls"
+        class="reel-preview hidden"
+      >
+        <input
+          id="reelScrubber"
+          type="range"
+          min="0"
+          max="1"
+          step="0.01"
+          value="0"
+          aria-label="Preview position"
+        />
+
+        <div class="control-row">
+          <span
+            id="reelPreviewClip"
+            class="reel-preview-clip"
+          ></span>
+          <span id="reelPreviewTime" class="value"></span>
+        </div>
+
+        <div class="button-row">
+          <button id="reelPlayButton" type="button">
+            Pause
+          </button>
+
+          <button id="reelExitPreviewButton" type="button">
+            Exit Preview
+          </button>
+        </div>
+      </div>
+
+      <div id="reelProgress" class="reel-progress hidden">
+        <div class="reel-progress-track">
+          <div
+            id="reelProgressBar"
+            class="reel-progress-bar"
+          ></div>
+        </div>
+
+        <div class="control-row">
+          <span id="reelProgressText"></span>
+          <span id="reelProgressPercent" class="value"></span>
+        </div>
+
+        <button id="reelCancelButton" type="button">
+          Cancel
+        </button>
+      </div>
+
+      <p id="reelExportNote" class="note">
+        Renders each clip's live animation frame by
+        frame and downloads one video file.
+      </p>
+    </div>
+
+    <div id="reelPresetControls" class="control-group hidden">
+      <div class="control-row">
+        <label for="reelPresetSelect">
+          Sequence presets
+        </label>
+      </div>
+
+      <select id="reelPresetSelect">
+        <option value="">Load a sequence…</option>
+      </select>
+
+      <div class="button-row">
+        <button id="reelLoadPresetButton" type="button">
+          Load
+        </button>
+
+        <button id="reelDeletePresetButton" type="button">
+          Delete
+        </button>
+      </div>
+
+      <p class="note">
+        Loading replaces the current sequence. Image
+        clips use the currently uploaded image.
+      </p>
+    </div>
+  </aside>
+
   <aside id="fps-meter" aria-label="Frame rate">
     <div class="fps-meter-head">
       <span
@@ -1803,6 +2389,8 @@
     </div>
   </aside>
 
+  <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.js"></script>
   <script src="sketch.js"></script>
+  <script src="reel.js"></script>
 </body>
 </html>

@@ -2,6 +2,21 @@ const ASPECT_PRESETS = {
   "16:9": { width: 1440, height: 810 },
   "1:1": { width: 1000, height: 1000 },
   "4:5": { width: 960, height: 1200 },
+  "960:1536": {
+    width: 960,
+    height: 1536,
+    outputPixels: true
+  },
+  "1440:768": {
+    width: 1440,
+    height: 768,
+    outputPixels: true
+  },
+  "2496:768": {
+    width: 2496,
+    height: 768,
+    outputPixels: true
+  },
   "2496:786": {
     width: 2496,
     height: 786,
@@ -213,6 +228,27 @@ const SESSION_SETTINGS_KEY =
 let sessionSaveTimer = null;
 let sessionRestoring = false;
 
+/*
+ * Reel renderer (reel.js) drives frames manually with
+ * redraw(). While it runs, stray loop frames are
+ * skipped, time advances by a fixed step, and the
+ * session / page chrome stay on the user's settings.
+ */
+let reelRendering = false;
+let reelFrameStep = false;
+let reelSimulateOnly = false;
+let fixedFrameDeltaMs = null;
+
+function frameDeltaMs() {
+  if (fixedFrameDeltaMs !== null) {
+    return fixedFrameDeltaMs;
+  }
+
+  return typeof deltaTime === "number" && deltaTime > 0
+    ? deltaTime
+    : 1000 / 60;
+}
+
 const PRESET_FIELD_IDS = [
   "sketchMode",
   "netTypeMode",
@@ -254,6 +290,8 @@ const PRESET_FIELD_IDS = [
   "oneAtATimeGap",
   "compositionPlacement",
   "presentationPlacement",
+  "presentationPaletteBrightness",
+  "presentationDivisionWeight",
   "gridSize",
   "cubeScale1",
   "cubeScale2",
@@ -436,10 +474,31 @@ function setup() {
       }
     }
   );
+
+  if (typeof initReel === "function") {
+    initReel();
+  }
 }
 
 function draw() {
+  if (reelRendering && !reelFrameStep) {
+    return;
+  }
+
   const settings = getSettings();
+
+  /*
+   * Shuffle modes pick colors with random() while
+   * drawing, so skipping the draw would change every
+   * later random pick — those always render.
+   */
+  if (
+    reelSimulateOnly &&
+    !isShuffleColorMode(settings.colorMode)
+  ) {
+    advanceSimulation(settings);
+    return;
+  }
 
   background(getBackgroundColor(settings));
   applyBackgroundTheme(settings);
@@ -517,6 +576,22 @@ function draw() {
   updateFpsMeter(settings);
 }
 
+function advanceSimulation(settings) {
+  if (settings.sketchMode === "gridded" || settings.sketchMode === "image") {
+    updateAnimation();
+  } else if (settings.sketchMode === "cascade") {
+    updateCascade(settings);
+  } else if (settings.sketchMode === "roll-grid") {
+    updateRollGrid(settings);
+  } else if (settings.sketchMode === "inside-out") {
+    updateInsideOut(settings);
+  } else if (settings.sketchMode === "one-at-a-time") {
+    updateOneAtATime(settings);
+  } else if (isWanderMode(settings.sketchMode)) {
+    updateWander(settings);
+  }
+}
+
 function applyDefaultSceneLights(settings) {
   ambientLight(
     settings.backgroundTheme === "dark" ? 160 : 205
@@ -550,6 +625,10 @@ function getBackgroundColor(settings) {
 }
 
 function applyBackgroundTheme(settings) {
+  if (reelRendering) {
+    return;
+  }
+
   const theme =
     settings
       ? settings.backgroundTheme
@@ -627,19 +706,59 @@ function paletteColorForFace(index, settings) {
   return palette[slot];
 }
 
-function getNetColor(index, settings) {
-  if (settings.colorMode === "monochromatic") {
-    return monoColor;
+function adjustHexBrightness(hex, percent) {
+  const factor = (Number(percent) || 100) / 100;
+
+  if (factor === 1) {
+    return hex;
   }
 
-  if (
+  const { r, g, b } = hexToRgb(hex);
+
+  return rgbToHex(r * factor, g * factor, b * factor);
+}
+
+function presentationFaceColor(hex, settings) {
+  if (!settings.presentationPlacement) {
+    return hex;
+  }
+
+  const pct = Number(settings.presentationPaletteBrightness);
+
+  if (!Number.isFinite(pct) || pct === 100) {
+    return hex;
+  }
+
+  return adjustHexBrightness(hex, pct);
+}
+
+function getDivisionStrokeWeight(settings) {
+  if (!settings.presentationPlacement) {
+    return 1;
+  }
+
+  const weight = Number(settings.presentationDivisionWeight);
+
+  return Number.isFinite(weight) && weight > 0
+    ? weight
+    : 1;
+}
+
+function getNetColor(index, settings) {
+  let color;
+
+  if (settings.colorMode === "monochromatic") {
+    color = monoColor;
+  } else if (
     settings.colorMode === "two-tone" ||
     isShuffleColorMode(settings.colorMode)
   ) {
-    return outerColor;
+    color = outerColor;
+  } else {
+    color = paletteColorForFace(index, settings);
   }
 
-  return paletteColorForFace(index, settings);
+  return presentationFaceColor(color, settings);
 }
 
 function isShuffleColorMode(mode) {
@@ -1088,6 +1207,7 @@ function randomizeEverything() {
 
   fields.drapeAmount = Math.random() < 0.5 ? "0" : "1";
   fields.presentationPlacement = false;
+  fields.showFaceShading = false;
   fields.cascadeMotionCurve = "ease";
 
   if (fields.showDivisions) {
@@ -1125,7 +1245,7 @@ function writePresetStore(store) {
 }
 
 function scheduleSessionSave() {
-  if (sessionRestoring) {
+  if (sessionRestoring || reelRendering) {
     return;
   }
 
@@ -1140,7 +1260,11 @@ function scheduleSessionSave() {
 }
 
 function saveSessionSettings() {
-  if (sessionRestoring || !controls.foldProgress) {
+  if (
+    sessionRestoring ||
+    reelRendering ||
+    !controls.foldProgress
+  ) {
     return;
   }
 
@@ -1610,6 +1734,9 @@ function getControls() {
     "compositionPlacement",
     "compositionPlacementNote",
     "presentationPlacement",
+    "presentationPlacementControls",
+    "presentationPaletteBrightness",
+    "presentationDivisionWeight",
     "gridSize",
     "cubeScale1",
     "cubeScale2",
@@ -1731,7 +1858,34 @@ function connectControls() {
 
   controls.presentationPlacement.addEventListener(
     "change",
-    resetOneAtATimeState
+    () => {
+      syncPresentationPlacementUI();
+      resetOneAtATimeState();
+    }
+  );
+
+  controls.presentationPaletteBrightness.addEventListener(
+    "input",
+    () => {
+      setValueLabel(
+        "presentationPaletteBrightness",
+        `${controls.presentationPaletteBrightness.value}%`
+      );
+      resetOneAtATimeState();
+    }
+  );
+
+  controls.presentationDivisionWeight.addEventListener(
+    "input",
+    () => {
+      setValueLabel(
+        "presentationDivisionWeight",
+        Number(
+          controls.presentationDivisionWeight.value
+        ).toFixed(2)
+      );
+      resetOneAtATimeState();
+    }
   );
 
   controls.wanderGridFullness.addEventListener(
@@ -2298,6 +2452,16 @@ function getSettings() {
     presentationPlacement:
       controls.presentationPlacement.checked,
 
+    presentationPaletteBrightness:
+      Number(
+        controls.presentationPaletteBrightness.value
+      ) || 100,
+
+    presentationDivisionWeight:
+      Number(
+        controls.presentationDivisionWeight.value
+      ) || 1,
+
     /*
      * Authoring cell size in screen pixels at zoom 1.
      */
@@ -2449,6 +2613,18 @@ function updateAllValueLabels() {
     "cameraZoom",
     Number(
       controls.cameraZoom.value
+    ).toFixed(2)
+  );
+
+  setValueLabel(
+    "presentationPaletteBrightness",
+    `${controls.presentationPaletteBrightness.value}%`
+  );
+
+  setValueLabel(
+    "presentationDivisionWeight",
+    Number(
+      controls.presentationDivisionWeight.value
     ).toFixed(2)
   );
 
@@ -2635,6 +2811,8 @@ function syncSketchModeUI() {
     "hidden",
     !isOneAtATime
   );
+
+  syncPresentationPlacementUI();
 
   const composition =
     controls.compositionPlacement.value;
@@ -2847,9 +3025,7 @@ function updateAnimation() {
   );
 
   const dt =
-    (typeof deltaTime === "number" && deltaTime > 0
-      ? deltaTime
-      : 1000 / 60) / 1000;
+    frameDeltaMs() / 1000;
 
   if (animationPauseTimer > 0) {
     animationPauseTimer = max(
@@ -4127,7 +4303,7 @@ function updateOneAtATime(settings) {
   const foldSpeed = settings.animationSpeed;
   const holdSeconds = settings.oneAtATimeHold;
   const gapSeconds = settings.oneAtATimeGap;
-  const elapsed = deltaTime / 1000;
+  const elapsed = frameDeltaMs() / 1000;
 
   switch (oneAtATimeState.phase) {
     case "folding":
@@ -4192,6 +4368,17 @@ function updateOneAtATime(settings) {
       oneAtATimeState.phase = "folding";
       break;
   }
+}
+
+function syncPresentationPlacementUI() {
+  const show =
+    controls.sketchMode.value === "one-at-a-time" &&
+    controls.presentationPlacement.checked;
+
+  controls.presentationPlacementControls.classList.toggle(
+    "hidden",
+    !show
+  );
 }
 
 function applyOneAtATimeDivisionDefaults() {
@@ -5324,9 +5511,7 @@ function updateRollGrid(settings) {
   ensureRollGrid(settings);
 
   const dt =
-    (typeof deltaTime === "number" && deltaTime > 0
-      ? deltaTime
-      : 1000 / 60) / 1000;
+    frameDeltaMs() / 1000;
 
   const tipRate = rollGridTipRatePerSec(settings);
 
@@ -6258,9 +6443,7 @@ function updateInsideOut(settings) {
   ensureInsideOut(settings);
 
   const dt =
-    (typeof deltaTime === "number" && deltaTime > 0
-      ? deltaTime
-      : 1000 / 60) / 1000;
+    frameDeltaMs() / 1000;
 
   insideOutTime += dt * insideOutFlipRatePerSec(settings);
 }
@@ -7008,9 +7191,7 @@ function updateWander(settings) {
   ensureWanderAgents(settings);
 
   const dt =
-    (typeof deltaTime === "number" && deltaTime > 0
-      ? deltaTime
-      : 1000 / 60) / 1000;
+    frameDeltaMs() / 1000;
   const foldSpeed = wanderFoldRate(settings) * dt;
   const rollSpeed = wanderRollRate(settings) * dt;
 
@@ -8392,9 +8573,7 @@ function updateCascade(settings) {
 
   const pauseSec = max(0, settings.cascadePause || 0);
   const dt =
-    (typeof deltaTime === "number" && deltaTime > 0
-      ? deltaTime
-      : 1000 / 60) / 1000;
+    frameDeltaMs() / 1000;
 
   cascadeTime += speed;
 
@@ -12817,7 +12996,7 @@ function drawFaceSide(
     getDivisionStrokeColor(settings);
 
   stroke(strokeColor);
-  strokeWeight(1);
+  strokeWeight(getDivisionStrokeWeight(settings));
 
   const filter =
     settings.divisionAngleFilter || "all";
