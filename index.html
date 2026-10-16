@@ -405,8 +405,14 @@
         <option value="wander">
           Wander
         </option>
+        <option value="wander-roll">
+          Wander · only movement
+        </option>
         <option value="inside-out">
           Inside out
+        </option>
+        <option value="one-at-a-time">
+          One at a time
         </option>
       </select>
     </div>
@@ -499,30 +505,59 @@
       />
 
       <div class="control-row" style="margin-top: 10px">
-        <label for="wanderActionInterval">
-          Avg. time between actions
+        <label for="wanderFrequency">
+          Wander frequency
         </label>
 
         <span
-          id="wanderActionIntervalValue"
+          id="wanderFrequencyValue"
           class="value"
         ></span>
       </div>
 
       <input
-        id="wanderActionInterval"
+        id="wanderFrequency"
         type="range"
-        min="0.1"
-        max="8"
-        step="0.1"
-        value="2"
+        min="0"
+        max="100"
+        step="1"
+        value="70"
       />
 
-      <p class="note">
+      <div class="control-row" style="margin-top: 10px">
+        <label for="wanderSpeed">
+          Wander speed
+        </label>
+
+        <span
+          id="wanderSpeedValue"
+          class="value"
+        ></span>
+      </div>
+
+      <input
+        id="wanderSpeed"
+        type="range"
+        min="0.001"
+        max="0.03"
+        step="0.001"
+        value="0.008"
+      />
+
+      <p class="note hidden" id="wanderRollNote">
+        Cubes start folded on a random subset of the
+        visible grid and only roll from cell to cell —
+        they never unfold. Higher frequency means
+        shorter waits between rolls.
+      </p>
+
+      <p class="note" id="wanderNote">
         Cubes start folded on a random subset of the
         visible grid, then roll or unfold on their own.
-        Each wait is random from 0 up to the interval
-        above. Nothing spawns after the start.
+        Frequency is the chance a cube rolls once
+        between folds (never more than once); at 100%
+        every cube rolls once. Lower values also wait
+        longer between moves.
       </p>
     </div>
 
@@ -817,6 +852,7 @@
         <option value="1:1">1:1</option>
         <option value="4:5">4:5</option>
         <option value="2496:786">2496×786</option>
+        <option value="1824:2304">1824×2304</option>
       </select>
     </div>
 
@@ -864,9 +900,9 @@
         value="8"
       />
       <p class="note">
-        Target stream size. Cubes claim lattice space
-        as they fold and unfold, so the live count may
-        be lower when the board is crowded.
+        How many cubes stay in the cascade stream.
+        Recycled cubes re-enter from the source so
+        this count holds after the first pass.
       </p>
     </div>
 
@@ -1212,6 +1248,12 @@
         <option value="two-tone-multi">
           Two-tone multicolor
         </option>
+        <option value="two-tone-shuffle">
+          Two-tone · shuffle inside
+        </option>
+        <option value="two-tone-shuffle-sync">
+          Two-tone · shuffle inside (shared)
+        </option>
       </select>
     </div>
 
@@ -1278,6 +1320,104 @@
         step="0.001"
         value="0.008"
       />
+    </div>
+
+    <div id="oneAtATimeControls" class="hidden">
+      <div class="control-group">
+        <div class="control-row">
+          <label for="compositionPlacement">
+            Composition placement
+          </label>
+        </div>
+
+        <select id="compositionPlacement">
+          <option value="centered" selected>
+            Centered
+          </option>
+          <option value="edges">
+            Edges
+          </option>
+          <option value="center-exclude">
+            Center exclude
+          </option>
+        </select>
+
+        <p class="note" id="compositionPlacementNote">
+          Favor cubes that fold near the middle of the
+          frame.
+        </p>
+      </div>
+
+      <div class="control-group">
+        <div class="control-row">
+          <label for="oneAtATimeHold">
+            Hold when folded
+          </label>
+
+          <span
+            id="oneAtATimeHoldValue"
+            class="value"
+          ></span>
+        </div>
+
+        <input
+          id="oneAtATimeHold"
+          type="range"
+          min="0"
+          max="5"
+          step="0.1"
+          value="1.5"
+        />
+
+        <p class="note">
+          How long each cube stays fully folded before
+          unfolding.
+        </p>
+      </div>
+
+      <div class="control-group">
+        <div class="control-row">
+          <label for="oneAtATimeGap">
+            Gap between cubes
+          </label>
+
+          <span
+            id="oneAtATimeGapValue"
+            class="value"
+          ></span>
+        </div>
+
+        <input
+          id="oneAtATimeGap"
+          type="range"
+          min="0"
+          max="15"
+          step="0.1"
+          value="0.75"
+        />
+
+        <p class="note">
+          Pause after a cube unfolds before the next one
+          begins folding.
+        </p>
+      </div>
+
+      <div class="control-group">
+        <label class="checkbox-row">
+          <input
+            id="presentationPlacement"
+            type="checkbox"
+          />
+
+          Enable presentation placement
+        </label>
+
+        <p class="note">
+          Keeps folding cubes out of an invisible
+          full-width 16:9 band in the middle of the frame
+          (1824×1026 on the 1824×2304 canvas).
+        </p>
+      </div>
     </div>
 
     <div class="control-group">
@@ -1410,7 +1550,7 @@
       <input
         id="cameraZoom"
         type="range"
-        min="0.45"
+        min="0.15"
         max="4.5"
         step="0.01"
         value="1"
@@ -1494,7 +1634,6 @@
           <input
             id="showGrid"
             type="checkbox"
-            checked
           />
 
           Show isometric grid
@@ -1504,7 +1643,6 @@
           <input
             id="showCubeGrid"
             type="checkbox"
-            checked
           />
 
           Show cube grid
@@ -1609,6 +1747,13 @@
         seed) to this browser’s local storage.
       </p>
     </div>
+
+    <button
+      id="randomizeEverythingButton"
+      type="button"
+    >
+      Randomize everything
+    </button>
   </aside>
 
   <main id="canvas-container">

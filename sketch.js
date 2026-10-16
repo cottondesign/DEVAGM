@@ -6,6 +6,11 @@ const ASPECT_PRESETS = {
     width: 2496,
     height: 786,
     outputPixels: true
+  },
+  "1824:2304": {
+    width: 1824,
+    height: 2304,
+    outputPixels: true
   }
 };
 
@@ -231,7 +236,8 @@ const PRESET_FIELD_IDS = [
   "insideOutFlatStop",
   "insideOutPause",
   "wanderGridFullness",
-  "wanderActionInterval",
+  "wanderFrequency",
+  "wanderSpeed",
   "imageScaleBias",
   "imageColorMode",
   "gridPlacement",
@@ -244,6 +250,10 @@ const PRESET_FIELD_IDS = [
   "cubeCoverage",
   "cubeCount",
   "animationSpeed",
+  "oneAtATimeHold",
+  "oneAtATimeGap",
+  "compositionPlacement",
+  "presentationPlacement",
   "gridSize",
   "cubeScale1",
   "cubeScale2",
@@ -282,6 +292,26 @@ let monoColor = PALETTE[2];
 let outerColor = PALETTE[1];
 let innerColor = PALETTE[3];
 
+/*
+ * Two-tone shuffle: per-cube inside color, keyed by the
+ * cube's own placement / agent object (seeds repeat in
+ * some modes). `closed` tracks whether the cube was at
+ * its swap moment last time it drew, so a new color is
+ * picked once per cycle. Modes listed here swap when
+ * the net lies fully flat; the rest swap when sealed.
+ */
+const SHUFFLE_SWAP_WHEN_FLAT = new Set([
+  "gridded",
+  "gradient",
+  "cascade",
+  "one-at-a-time"
+]);
+
+let shuffleInnerColors = new WeakMap();
+let shuffleInnerColorsBySeed = new Map();
+let shuffleInnerVersion = 0;
+let shuffleInnerFrozen = false;
+
 let cascadeTravelers = [];
 let cascadeCacheKey = "";
 let cascadeTime = 0;
@@ -312,6 +342,18 @@ let wanderTime = 0;
 let insideOutCubes = [];
 let insideOutCacheKey = "";
 let insideOutTime = 0;
+
+/*
+ * One-at-a-time mode: the packed layout stays unfolded
+ * while a single net folds, holds, and unfolds.
+ */
+let oneAtATimeState = {
+  placementsKey: "",
+  activeIndex: 0,
+  progress: 0,
+  phase: "folding",
+  phaseTimer: 0
+};
 let insideOutBoard = null;
 
 const ROLL_GRID_DIRS = [
@@ -410,6 +452,11 @@ function draw() {
     updateRollGrid(settings);
   } else if (settings.sketchMode === "inside-out") {
     updateInsideOut(settings);
+  } else if (settings.sketchMode === "one-at-a-time") {
+    updateOneAtATime(settings);
+    drawOneAtATimeFrame(settings);
+    updateFpsMeter(settings);
+    return;
   }
 
   if (settings.showCubeGrid) {
@@ -447,27 +494,7 @@ function draw() {
      */
     noLights();
   } else {
-    ambientLight(
-      settings.backgroundTheme === "dark" ? 160 : 205
-    );
-
-    directionalLight(
-      255,
-      255,
-      255,
-      -0.55,
-      -1,
-      -0.35
-    );
-
-    directionalLight(
-      115,
-      115,
-      115,
-      0.7,
-      0.35,
-      0.55
-    );
+    applyDefaultSceneLights(settings);
   }
 
   if (settings.sketchMode === "cascade") {
@@ -480,7 +507,7 @@ function draw() {
     drawRollGrid(settings);
   } else if (settings.sketchMode === "inside-out") {
     drawInsideOut(settings);
-  } else if (settings.sketchMode === "wander") {
+  } else if (isWanderMode(settings.sketchMode)) {
     drawWanderAgents(settings);
     updateWander(settings);
   } else {
@@ -488,6 +515,30 @@ function draw() {
   }
 
   updateFpsMeter(settings);
+}
+
+function applyDefaultSceneLights(settings) {
+  ambientLight(
+    settings.backgroundTheme === "dark" ? 160 : 205
+  );
+
+  directionalLight(
+    255,
+    255,
+    255,
+    -0.55,
+    -1,
+    -0.35
+  );
+
+  directionalLight(
+    115,
+    115,
+    115,
+    0.7,
+    0.35,
+    0.55
+  );
 }
 
 
@@ -583,7 +634,7 @@ function getNetColor(index, settings) {
 
   if (
     settings.colorMode === "two-tone" ||
-    settings.colorMode === "two-tone-multi"
+    isShuffleColorMode(settings.colorMode)
   ) {
     return outerColor;
   }
@@ -591,11 +642,101 @@ function getNetColor(index, settings) {
   return paletteColorForFace(index, settings);
 }
 
+function isShuffleColorMode(mode) {
+  return (
+    mode === "two-tone-shuffle" ||
+    mode === "two-tone-shuffle-sync"
+  );
+}
+
 function isTwoToneColorMode(mode) {
   return (
     mode === "two-tone" ||
-    mode === "two-tone-multi"
+    mode === "two-tone-multi" ||
+    isShuffleColorMode(mode)
   );
+}
+
+/*
+ * Shared shuffle: one color per round. The first cube
+ * to swap again after a round began starts the next
+ * round; every other cube adopts the latest round color
+ * at its own swap moment.
+ */
+let sharedShuffleRound = 0;
+let sharedShuffleColor = null;
+
+function resetShuffleInnerColors() {
+  shuffleInnerColors = new WeakMap();
+  shuffleInnerColorsBySeed = new Map();
+  sharedShuffleRound = 0;
+  sharedShuffleColor = null;
+  shuffleInnerVersion++;
+}
+
+function pickShuffleInnerColor(current, settings) {
+  const avoid = new Set([
+    String(current).toLowerCase(),
+    String(outerColor).toLowerCase(),
+    String(getBackgroundColor(settings)).toLowerCase()
+  ]);
+
+  const options = PALETTE.filter(
+    (hex) => !avoid.has(hex.toLowerCase())
+  );
+
+  return options.length
+    ? options[floor(random(options.length))]
+    : current;
+}
+
+function getInnerColorFor(key, closed, settings) {
+  if (!isShuffleColorMode(settings.colorMode)) {
+    return settings.innerColor;
+  }
+
+  const store =
+    key !== null && typeof key === "object"
+      ? shuffleInnerColors
+      : shuffleInnerColorsBySeed;
+
+  let entry = store.get(key);
+
+  if (!entry) {
+    entry = { hex: settings.innerColor, closed, round: 0 };
+    store.set(key, entry);
+    return entry.hex;
+  }
+
+  if (shuffleInnerFrozen) {
+    return entry.hex;
+  }
+
+  if (closed && !entry.closed) {
+    if (settings.colorMode === "two-tone-shuffle-sync") {
+      if (entry.round === sharedShuffleRound) {
+        sharedShuffleColor = pickShuffleInnerColor(
+          sharedShuffleColor || settings.innerColor,
+          settings
+        );
+        sharedShuffleRound++;
+      }
+
+      entry.round = sharedShuffleRound;
+      entry.hex = sharedShuffleColor || settings.innerColor;
+    } else {
+      entry.hex = pickShuffleInnerColor(
+        entry.hex,
+        settings
+      );
+    }
+
+    shuffleInnerVersion++;
+  }
+
+  entry.closed = closed;
+
+  return entry.hex;
 }
 
 function getFaceOuterColor(
@@ -841,6 +982,122 @@ function randomizePlacements() {
   scheduleSessionSave();
 }
 
+const RANDOMIZE_EXCLUDED_FIELDS = new Set([
+  "aspectRatio",
+  "animateFolding",
+  "quickToggle",
+  "foldProgress",
+  "drapeAmount",
+  "presentationPlacement",
+  "cascadeMotionCurve"
+]);
+
+const RANDOMIZE_EXCLUDED_MODES = new Set([
+  "image",
+  "gradient"
+]);
+
+/*
+ * Narrower ranges keep "randomize everything" from
+ * landing on settings that stall the frame rate.
+ */
+const RANDOMIZE_RANGE_LIMITS = {
+  cameraZoom: [0.5, 2.5],
+  cascadeCount: [4, 80],
+  animationSpeed: [0.004, 0.03],
+  wanderSpeed: [0.004, 0.03],
+  oneAtATimeHold: [0.2, 2],
+  oneAtATimeGap: [0, 3]
+};
+
+function pickRandomFrom(list) {
+  return list[floor(Math.random() * list.length)];
+}
+
+function randomRangeValue(el, id) {
+  const step = Number(el.step) || 1;
+  let lo = Number(el.min);
+  let hi = Number(el.max);
+
+  if (RANDOMIZE_RANGE_LIMITS[id]) {
+    lo = max(lo, RANDOMIZE_RANGE_LIMITS[id][0]);
+    hi = min(hi, RANDOMIZE_RANGE_LIMITS[id][1]);
+  }
+
+  const steps = floor((hi - lo) / step + 1e-9);
+  const value =
+    lo + floor(Math.random() * (steps + 1)) * step;
+  const decimals =
+    (String(el.step).split(".")[1] || "").length;
+
+  return value.toFixed(decimals);
+}
+
+function randomizeEverything() {
+  const snapshot = collectPresetSnapshot();
+  const fields = snapshot.fields;
+
+  for (const id of PRESET_FIELD_IDS) {
+    const el = controls[id];
+
+    if (!el || RANDOMIZE_EXCLUDED_FIELDS.has(id)) {
+      continue;
+    }
+
+    if (el.type === "checkbox") {
+      fields[id] = Math.random() < 0.5;
+    } else if (el.type === "range") {
+      fields[id] = randomRangeValue(el, id);
+    } else if (el.tagName === "SELECT") {
+      const options = [...el.options]
+        .filter((option) => !option.disabled)
+        .map((option) => option.value)
+        .filter((value) =>
+          id !== "sketchMode" ||
+          (!RANDOMIZE_EXCLUDED_MODES.has(value) &&
+            !REMOVED_SKETCH_MODES.has(value))
+        );
+
+      if (options.length) {
+        fields[id] = pickRandomFrom(options);
+      }
+    }
+  }
+
+  const scaleIds = ["cubeScale1", "cubeScale2", "cubeScale3"];
+
+  if (scaleIds.every((id) => Number(fields[id]) <= 0)) {
+    fields[pickRandomFrom(scaleIds)] =
+      controls.cubeScale1.max;
+  }
+
+  const background = (
+    BACKGROUNDS[fields.backgroundTheme] || ""
+  ).toLowerCase();
+  const colors = PALETTE.filter(
+    (hex) => hex.toLowerCase() !== background
+  );
+
+  snapshot.monoColor = pickRandomFrom(colors);
+  snapshot.outerColor = pickRandomFrom(colors);
+  snapshot.innerColor = pickRandomFrom(
+    colors.filter((hex) => hex !== snapshot.outerColor)
+  );
+  snapshot.placementSeed =
+    floor(Math.random() * 1000000000);
+
+  fields.drapeAmount = Math.random() < 0.5 ? "0" : "1";
+  fields.presentationPlacement = false;
+  fields.cascadeMotionCurve = "ease";
+
+  if (fields.showDivisions) {
+    fields.divisionMatchBackground = true;
+  }
+
+  applyPresetSnapshot(snapshot);
+  resetShuffleInnerColors();
+}
+
 function readPresetStore() {
   try {
     const raw =
@@ -1066,6 +1323,9 @@ function applyPresetSnapshot(preset) {
     }
   }
 
+  controls.showGrid.checked = false;
+  controls.showCubeGrid.checked = false;
+
   if (typeof preset.monoColor === "string") {
     monoColor = preset.monoColor;
   }
@@ -1110,7 +1370,6 @@ function applyPresetSnapshot(preset) {
   syncingQuickToggle = true;
   controls.quickToggle.checked =
     controls.showDivisions.checked &&
-    controls.showCubeGrid.checked &&
     controls.showFaceShading.checked;
   syncingQuickToggle = false;
 
@@ -1167,7 +1426,11 @@ function syncColorModeUI() {
     controls.twoToneNote.textContent =
       isMultiOuter
         ? "Each plane uses a different outer palette color; the inside of every face shares the inner color."
-        : "Outside of each face uses the outer color; the inside uses the inner color.";
+        : mode === "two-tone-shuffle"
+          ? "Cubes start with the inner color, then switch to a random palette color once per fold cycle — when flat in Gridded, Cascade and One at a time; while closed in Wander, Inside out and Roll grid."
+          : mode === "two-tone-shuffle-sync"
+            ? "Like shuffle inside, but every cube moves to the same new random color each round, switching at its own fold moment."
+            : "Outside of each face uses the outer color; the inside uses the inner color.";
   }
 
   refreshPaletteSelection();
@@ -1194,10 +1457,7 @@ function buildPaletteSwatches() {
     () => outerColor,
     (hex) => {
       outerColor = hex;
-      if (
-        controls.colorMode.value !== "two-tone" &&
-        controls.colorMode.value !== "two-tone-multi"
-      ) {
+      if (!isTwoToneColorMode(controls.colorMode.value)) {
         controls.colorMode.value = "two-tone";
       }
       syncColorModeUI();
@@ -1210,10 +1470,8 @@ function buildPaletteSwatches() {
     () => innerColor,
     (hex) => {
       innerColor = hex;
-      if (
-        controls.colorMode.value !== "two-tone" &&
-        controls.colorMode.value !== "two-tone-multi"
-      ) {
+      resetShuffleInnerColors();
+      if (!isTwoToneColorMode(controls.colorMode.value)) {
         controls.colorMode.value = "two-tone";
       }
       syncColorModeUI();
@@ -1314,7 +1572,8 @@ function getControls() {
     "insideOutPause",
     "wanderControls",
     "wanderGridFullness",
-    "wanderActionInterval",
+    "wanderFrequency",
+    "wanderSpeed",
     "imageModeControls",
     "imageUpload",
     "imageUploadNote",
@@ -1345,6 +1604,12 @@ function getControls() {
     "coverageCountControls",
     "cubeCount",
     "animationSpeed",
+    "oneAtATimeControls",
+    "oneAtATimeHold",
+    "oneAtATimeGap",
+    "compositionPlacement",
+    "compositionPlacementNote",
+    "presentationPlacement",
     "gridSize",
     "cubeScale1",
     "cubeScale2",
@@ -1373,7 +1638,8 @@ function getControls() {
     "unfoldButton",
     "foldButton",
     "randomizePlacementsButton",
-    "exportButton"
+    "exportButton",
+    "randomizeEverythingButton"
   ];
 
   for (const id of ids) {
@@ -1415,7 +1681,10 @@ function connectControls() {
     "insideOutFlatStop",
     "insideOutPause",
     "wanderGridFullness",
-    "wanderActionInterval"
+    "wanderFrequency",
+    "wanderSpeed",
+    "oneAtATimeHold",
+    "oneAtATimeGap"
   ];
 
   for (const id of rangeIds) {
@@ -1443,7 +1712,26 @@ function connectControls() {
       rollGridCacheKey = "";
       insideOutCacheKey = "";
       wanderCacheKey = "";
+      resetOneAtATimeState();
+      resetShuffleInnerColors();
+
+      if (controls.sketchMode.value === "one-at-a-time") {
+        applyOneAtATimeDivisionDefaults();
+      }
     }
+  );
+
+  controls.compositionPlacement.addEventListener(
+    "change",
+    () => {
+      syncSketchModeUI();
+      resetOneAtATimeState();
+    }
+  );
+
+  controls.presentationPlacement.addEventListener(
+    "change",
+    resetOneAtATimeState
   );
 
   controls.wanderGridFullness.addEventListener(
@@ -1453,12 +1741,22 @@ function connectControls() {
     }
   );
 
-  controls.wanderActionInterval.addEventListener(
+  controls.wanderFrequency.addEventListener(
     "input",
     () => {
       setValueLabel(
-        "wanderActionInterval",
-        `${Number(controls.wanderActionInterval.value).toFixed(1)}s`
+        "wanderFrequency",
+        `${controls.wanderFrequency.value}%`
+      );
+    }
+  );
+
+  controls.wanderSpeed.addEventListener(
+    "input",
+    () => {
+      setValueLabel(
+        "wanderSpeed",
+        Number(controls.wanderSpeed.value).toFixed(3)
       );
     }
   );
@@ -1609,7 +1907,6 @@ function connectControls() {
 
       syncingQuickToggle = true;
       controls.showDivisions.checked = on;
-      controls.showCubeGrid.checked = on;
       controls.showFaceShading.checked = on;
       syncingQuickToggle = false;
     }
@@ -1623,17 +1920,11 @@ function connectControls() {
     syncingQuickToggle = true;
     controls.quickToggle.checked =
       controls.showDivisions.checked &&
-      controls.showCubeGrid.checked &&
       controls.showFaceShading.checked;
     syncingQuickToggle = false;
   };
 
   controls.showDivisions.addEventListener(
-    "change",
-    syncQuickFromParts
-  );
-
-  controls.showCubeGrid.addEventListener(
     "change",
     syncQuickFromParts
   );
@@ -1759,6 +2050,11 @@ function connectControls() {
     randomizePlacements
   );
 
+  controls.randomizeEverythingButton.addEventListener(
+    "click",
+    randomizeEverything
+  );
+
   controls.savePresetButton.addEventListener(
     "click",
     saveCurrentPreset
@@ -1804,7 +2100,10 @@ function connectControls() {
 
   controls.colorMode.addEventListener(
     "change",
-    syncColorModeUI
+    () => {
+      resetShuffleInnerColors();
+      syncColorModeUI();
+    }
   );
 
   /*
@@ -1932,8 +2231,11 @@ function getSettings() {
     wanderGridFullness:
       Number(controls.wanderGridFullness.value) / 100,
 
-    wanderActionInterval:
-      Number(controls.wanderActionInterval.value) || 2,
+    wanderFrequency:
+      Number(controls.wanderFrequency.value) / 100,
+
+    wanderSpeed:
+      Number(controls.wanderSpeed.value) || 0.008,
 
     gridPlacement:
       controls.gridPlacement.value,
@@ -1979,6 +2281,22 @@ function getSettings() {
       Number(
         controls.animationSpeed.value
       ),
+
+    oneAtATimeHold:
+      Number(
+        controls.oneAtATimeHold.value
+      ),
+
+    oneAtATimeGap:
+      Number(
+        controls.oneAtATimeGap.value
+      ),
+
+    compositionPlacement:
+      controls.compositionPlacement.value,
+
+    presentationPlacement:
+      controls.presentationPlacement.checked,
 
     /*
      * Authoring cell size in screen pixels at zoom 1.
@@ -2165,8 +2483,23 @@ function updateAllValueLabels() {
   );
 
   setValueLabel(
-    "wanderActionInterval",
-    `${Number(controls.wanderActionInterval.value).toFixed(1)}s`
+    "wanderFrequency",
+    `${controls.wanderFrequency.value}%`
+  );
+
+  setValueLabel(
+    "wanderSpeed",
+    Number(controls.wanderSpeed.value).toFixed(3)
+  );
+
+  setValueLabel(
+    "oneAtATimeHold",
+    `${Number(controls.oneAtATimeHold.value).toFixed(1)}s`
+  );
+
+  setValueLabel(
+    "oneAtATimeGap",
+    `${Number(controls.oneAtATimeGap.value).toFixed(1)}s`
   );
 
   syncFoldProgressRange();
@@ -2288,7 +2621,30 @@ function syncSketchModeUI() {
   const isImage = mode === "image";
   const isRollGrid = mode === "roll-grid";
   const isInsideOut = mode === "inside-out";
-  const isWander = mode === "wander";
+  const isWander = isWanderMode(mode);
+  const isOneAtATime = mode === "one-at-a-time";
+
+  document
+    .getElementById("wanderNote")
+    ?.classList.toggle("hidden", mode !== "wander");
+  document
+    .getElementById("wanderRollNote")
+    ?.classList.toggle("hidden", mode !== "wander-roll");
+
+  controls.oneAtATimeControls.classList.toggle(
+    "hidden",
+    !isOneAtATime
+  );
+
+  const composition =
+    controls.compositionPlacement.value;
+
+  controls.compositionPlacementNote.textContent =
+    composition === "edges"
+      ? "Favor cubes that fold near the edges of the frame."
+      : composition === "center-exclude"
+        ? "Only fold cubes in the top or bottom third of the frame."
+        : "Favor cubes that fold near the middle of the frame.";
 
   controls.imageModeControls.classList.toggle(
     "hidden",
@@ -2312,7 +2668,12 @@ function syncSketchModeUI() {
 
   controls.cascadeDirectionGroup.classList.toggle(
     "hidden",
-    isGridded || isImage || isRollGrid || isInsideOut || isWander
+    isGridded ||
+      isImage ||
+      isRollGrid ||
+      isInsideOut ||
+      isWander ||
+      isOneAtATime
   );
 
   controls.cascadeCountGroup.classList.toggle(
@@ -2337,17 +2698,17 @@ function syncSketchModeUI() {
 
   controls.griddedPlacementControls.classList.toggle(
     "hidden",
-    !isGridded
+    !isGridded && !isOneAtATime
   );
 
   controls.sharedFoldControls.classList.toggle(
     "hidden",
-    !isGridded && !isImage
+    !isGridded && !isImage && !isOneAtATime
   );
 
   controls.griddedCoverageControls.classList.toggle(
     "hidden",
-    !isGridded && !isGradient && !isImage
+    !isGridded && !isGradient && !isImage && !isOneAtATime
   );
 
   controls.griddedActionControls.classList.toggle(
@@ -2605,6 +2966,56 @@ function setIsometricCamera(settings) {
     1,
     0
   );
+}
+
+function getIsometricEyePosition() {
+  const elevation =
+    atan(1 / sqrt(2));
+
+  const azimuth =
+    QUARTER_PI;
+
+  const distance = 2400;
+
+  const horizontalDistance =
+    distance * cos(elevation);
+
+  return [
+    horizontalDistance * cos(azimuth),
+    -distance * sin(elevation),
+    horizontalDistance * sin(azimuth)
+  ];
+}
+
+function getFaceViewerDistance(center) {
+  return vectorLength(
+    subtractVectors(
+      getIsometricEyePosition(),
+      center
+    )
+  );
+}
+
+function beginCloserFaceDepthBias(units) {
+  const gl = drawingContext;
+
+  if (!gl || gl.POLYGON_OFFSET_FILL == null) {
+    return;
+  }
+
+  gl.enable(gl.POLYGON_OFFSET_FILL);
+  gl.polygonOffset(-1, units);
+}
+
+function endCloserFaceDepthBias() {
+  const gl = drawingContext;
+
+  if (!gl || gl.POLYGON_OFFSET_FILL == null) {
+    return;
+  }
+
+  gl.polygonOffset(0, 0);
+  gl.disable(gl.POLYGON_OFFSET_FILL);
 }
 
 function beginScreenSpaceCamera() {
@@ -3167,10 +3578,868 @@ function drawAllNets(settings) {
       placement.seed,
       placement.foldDelay,
       {
-        cubeScale: placement.scale || 1
+        cubeScale: placement.scale || 1,
+        colorKey: placement
       }
     );
   }
+}
+
+
+/* ---------------------------------------------------------
+   ONE AT A TIME — single cube folds on a flat layout
+--------------------------------------------------------- */
+
+function resetOneAtATimeState() {
+  oneAtATimeState.placementsKey = "";
+  oneAtATimeState.activeIndex = 0;
+  oneAtATimeState.progress = 0;
+  oneAtATimeState.phase = "folding";
+  oneAtATimeState.phaseTimer = 0;
+}
+
+function getPlacementFlatTransforms(
+  placement,
+  settings
+) {
+  return buildConnectedFaceTransforms(
+    placement.net,
+    placement.originX,
+    placement.originZ,
+    settings.faceSize * (placement.scale || 1),
+    0
+  );
+}
+
+function getPlacementFlatFaceCorners(
+  transform,
+  faceSize
+) {
+  const half = faceSize * 0.5;
+  const u = scaleVector(transform.u, half);
+  const v = scaleVector(transform.v, half);
+  const center = transform.center;
+
+  return [
+    addVectors(
+      addVectors(center, scaleVector(u, -1)),
+      scaleVector(v, -1)
+    ),
+    addVectors(
+      addVectors(center, u),
+      scaleVector(v, -1)
+    ),
+    addVectors(
+      addVectors(center, u),
+      v
+    ),
+    addVectors(
+      addVectors(center, scaleVector(u, -1)),
+      v
+    )
+  ];
+}
+
+function projectWorldToScreen(
+  wx,
+  wy,
+  wz,
+  settings
+) {
+  const scale =
+    getPixelsPerWorldUnit(settings);
+
+  const axes =
+    getIsometricScreenAxes();
+
+  return {
+    x: axes.toScreenX(wx, wy, wz) * scale,
+    y: axes.toScreenY(wx, wy, wz) * scale
+  };
+}
+
+function getPlacementScreenBounds(
+  placement,
+  settings
+) {
+  const transforms =
+    getPlacementFlatTransforms(
+      placement,
+      settings
+    );
+
+  const faceSize =
+    settings.faceSize * (placement.scale || 1);
+
+  let minSX = Infinity;
+  let maxSX = -Infinity;
+  let minSY = Infinity;
+  let maxSY = -Infinity;
+
+  for (const transform of transforms) {
+    const corners =
+      getPlacementFlatFaceCorners(
+        transform,
+        faceSize
+      );
+
+    for (const corner of corners) {
+      const screen =
+        projectWorldToScreen(
+          corner[0],
+          corner[1],
+          corner[2],
+          settings
+        );
+
+      minSX = min(minSX, screen.x);
+      maxSX = max(maxSX, screen.x);
+      minSY = min(minSY, screen.y);
+      maxSY = max(maxSY, screen.y);
+    }
+  }
+
+  return {
+    minSX,
+    maxSX,
+    minSY,
+    maxSY
+  };
+}
+
+function getPlacementScreenCenter(
+  placement,
+  settings
+) {
+  const transforms =
+    getPlacementFlatTransforms(
+      placement,
+      settings
+    );
+
+  let sumX = 0;
+  let sumY = 0;
+
+  for (const transform of transforms) {
+    const screen =
+      projectWorldToScreen(
+        transform.center[0],
+        transform.center[1],
+        transform.center[2],
+        settings
+      );
+
+    sumX += screen.x;
+    sumY += screen.y;
+  }
+
+  const count = max(1, transforms.length);
+  const cx = sumX / count;
+  const cy = sumY / count;
+
+  return {
+    cx,
+    cy,
+    normX: cx / max(1, width * 0.5),
+    normY: cy / max(1, height * 0.5),
+    distSq: cx * cx + cy * cy
+  };
+}
+
+function getOneAtATimeCompositionWeight(
+  center,
+  settings
+) {
+  const mode =
+    settings.compositionPlacement ||
+    "centered";
+
+  const normX = center.normX;
+  const normY = center.normY;
+
+  const radial = sqrt(
+    normX * normX +
+    normY * normY
+  );
+
+  const edgePull = max(
+    abs(normX),
+    abs(normY)
+  );
+
+  if (mode === "edges") {
+    return (
+      pow(constrain(edgePull, 0, 1.15), 2.2) +
+      0.03
+    );
+  }
+
+  if (mode === "center-exclude") {
+    const absY = abs(normY);
+
+    if (absY < 0.34) {
+      return 0.01;
+    }
+
+    return pow(absY, 1.6) + 0.05;
+  }
+
+  return (
+    pow(constrain(1 - radial, 0, 1), 2.4) +
+    0.03
+  );
+}
+
+function getTransformsScreenRect(
+  transforms,
+  faceSize,
+  settings
+) {
+  const rect = {
+    minX: Infinity,
+    maxX: -Infinity,
+    minY: Infinity,
+    maxY: -Infinity
+  };
+
+  for (const transform of transforms) {
+    for (const corner of getPlacementFlatFaceCorners(
+      transform,
+      faceSize
+    )) {
+      const screen = projectWorldToScreen(
+        corner[0],
+        corner[1],
+        corner[2],
+        settings
+      );
+
+      rect.minX = min(rect.minX, screen.x);
+      rect.maxX = max(rect.maxX, screen.x);
+      rect.minY = min(rect.minY, screen.y);
+      rect.maxY = max(rect.maxY, screen.y);
+    }
+  }
+
+  return rect;
+}
+
+/*
+ * Mirrors drawNet's plant / reroot logic at full fold
+ * so the rect matches where the finished cube lands.
+ */
+function getOneAtATimeFoldedCubeRect(
+  placement,
+  settings
+) {
+  const cubeScale = max(1, placement.scale || 1);
+  const faceSize = settings.faceSize * cubeScale;
+
+  let net = placement.net;
+  let plantX = placement.originX;
+  let plantZ = placement.originZ;
+
+  if (settings.foldMode === "one-side") {
+    const fromMaxX =
+      unitHash(placement.seed * 0.91 + 2.3) < 0.5;
+
+    const endIndex =
+      getExtremeFaceIndex(net, fromMaxX);
+
+    net = rerootNet(net, endIndex);
+
+    const endFace = net.faces[endIndex];
+
+    const plant = worldOriginForFace(
+      endFace.gridX,
+      endFace.gridY,
+      cubeScale,
+      settings.faceSize
+    );
+
+    plantX = plant.x;
+    plantZ = plant.z;
+  }
+
+  const transforms = buildConnectedFaceTransforms(
+    net,
+    plantX,
+    plantZ,
+    faceSize,
+    HALF_PI
+  );
+
+  return getTransformsScreenRect(
+    transforms,
+    faceSize,
+    settings
+  );
+}
+
+function isScreenRectInsideCanvas(rect) {
+  return (
+    rect.minX >= -width * 0.5 &&
+    rect.maxX <= width * 0.5 &&
+    rect.minY >= -height * 0.5 &&
+    rect.maxY <= height * 0.5
+  );
+}
+
+/*
+ * Screen area to repaint while a cube folds: flat net
+ * and finished cube, plus headroom for faces swinging
+ * up through the fold.
+ */
+function getOneAtATimeRedrawRect(placement, settings) {
+  const flat =
+    getPlacementScreenBounds(placement, settings);
+
+  const folded =
+    getOneAtATimeFoldedCubeRect(placement, settings);
+
+  const faceScreen =
+    settings.faceSize *
+    (placement.scale || 1) *
+    getPixelsPerWorldUnit(settings);
+
+  return {
+    minX: min(flat.minSX, folded.minX) - faceScreen,
+    maxX: max(flat.maxSX, folded.maxX) + faceScreen,
+    minY:
+      min(flat.minSY, folded.minY) - faceScreen * 3,
+    maxY: max(flat.maxSY, folded.maxY) + faceScreen
+  };
+}
+
+/*
+ * Full-width 16:9 band centered in the frame —
+ * 1824×1026 on the 1824×2304 canvas.
+ */
+const PRESENTATION_BAND_ASPECT = 1026 / 1824;
+
+function getPresentationBand() {
+  const halfHeight =
+    width * PRESENTATION_BAND_ASPECT * 0.5;
+
+  return {
+    minX: -width * 0.5,
+    maxX: width * 0.5,
+    minY: -halfHeight,
+    maxY: halfHeight
+  };
+}
+
+function screenRectsOverlap(a, b) {
+  return (
+    a.minX < b.maxX &&
+    a.maxX > b.minX &&
+    a.minY < b.maxY &&
+    a.maxY > b.minY
+  );
+}
+
+function buildOneAtATimeCandidates(
+  placements,
+  settings
+) {
+  const band = settings.presentationPlacement
+    ? getPresentationBand()
+    : null;
+
+  const allowed = [];
+  const candidates = [];
+
+  for (
+    let index = 0;
+    index < placements.length;
+    index++
+  ) {
+    const placement = placements[index];
+
+    /* only the finished cube must stay clear */
+    const cubeRect =
+      getOneAtATimeFoldedCubeRect(placement, settings);
+
+    if (!isScreenRectInsideCanvas(cubeRect)) {
+      continue;
+    }
+
+    if (band && screenRectsOverlap(cubeRect, band)) {
+      continue;
+    }
+
+    allowed.push(index);
+
+    const center =
+      getPlacementScreenCenter(
+        placement,
+        settings
+      );
+
+    const weight =
+      getOneAtATimeCompositionWeight(
+        center,
+        settings
+      );
+
+    if (weight <= 0.001) {
+      continue;
+    }
+
+    candidates.push({
+      index,
+      weight,
+      center
+    });
+  }
+
+  if (candidates.length > 0) {
+    return candidates;
+  }
+
+  return allowed.map((index) => {
+    return {
+      index,
+      weight: 1,
+      center:
+        getPlacementScreenCenter(
+          placements[index],
+          settings
+        )
+    };
+  });
+}
+
+function pickOneAtATimeCube(
+  placements,
+  settings,
+  avoidIndex = -1
+) {
+  let candidates =
+    buildOneAtATimeCandidates(
+      placements,
+      settings
+    );
+
+  if (avoidIndex >= 0 && candidates.length > 1) {
+    candidates = candidates.filter(
+      (entry) => entry.index !== avoidIndex
+    );
+  }
+
+  /* −1: nothing may fold (e.g. all inside the band) */
+  if (!candidates.length) {
+    oneAtATimeState.activeIndex = -1;
+    return;
+  }
+
+  if (candidates.length === 1) {
+    oneAtATimeState.activeIndex =
+      candidates[0].index;
+    return;
+  }
+
+  const total = candidates.reduce(
+    (sum, entry) => sum + entry.weight,
+    0
+  );
+
+  let roll = random(total);
+
+  for (const entry of candidates) {
+    roll -= entry.weight;
+
+    if (roll <= 0) {
+      oneAtATimeState.activeIndex = entry.index;
+      return;
+    }
+  }
+
+  oneAtATimeState.activeIndex =
+    candidates[candidates.length - 1].index;
+}
+
+function pickNextOneAtATimeCube(
+  placements,
+  settings
+) {
+  pickOneAtATimeCube(
+    placements,
+    settings,
+    oneAtATimeState.activeIndex
+  );
+}
+
+function ensureOneAtATimeState(
+  placements,
+  settings
+) {
+  const key = [
+    packCacheKey,
+    placements.length,
+    settings.cameraZoom.toFixed(3),
+    settings.compositionPlacement,
+    settings.presentationPlacement,
+    width,
+    height
+  ].join("|");
+
+  if (oneAtATimeState.placementsKey === key) {
+    return;
+  }
+
+  oneAtATimeState.placementsKey = key;
+  oneAtATimeState.progress = 0;
+  oneAtATimeState.phase = "folding";
+  oneAtATimeState.phaseTimer = 0;
+
+  if (placements.length > 0) {
+    pickOneAtATimeCube(placements, settings);
+  } else {
+    oneAtATimeState.activeIndex = 0;
+  }
+}
+
+function getOneAtATimePlacements(settings) {
+  ensurePackedLayout(settings);
+
+  const placements = selectPlacementsForCoverage(
+    packedPlacements.placements,
+    settings
+  );
+
+  ensureOneAtATimeState(placements, settings);
+
+  return placements;
+}
+
+function updateOneAtATime(settings) {
+  const placements =
+    getOneAtATimePlacements(settings);
+
+  if (
+    !placements.length ||
+    oneAtATimeState.activeIndex < 0
+  ) {
+    return;
+  }
+
+  const foldSpeed = settings.animationSpeed;
+  const holdSeconds = settings.oneAtATimeHold;
+  const gapSeconds = settings.oneAtATimeGap;
+  const elapsed = deltaTime / 1000;
+
+  switch (oneAtATimeState.phase) {
+    case "folding":
+      oneAtATimeState.progress += foldSpeed;
+
+      if (oneAtATimeState.progress >= 1) {
+        oneAtATimeState.progress = 1;
+
+        if (holdSeconds <= 0) {
+          oneAtATimeState.phase = "unfolding";
+        } else {
+          oneAtATimeState.phase = "holding";
+          oneAtATimeState.phaseTimer = 0;
+        }
+      }
+
+      break;
+
+    case "holding":
+      oneAtATimeState.phaseTimer += elapsed;
+
+      if (oneAtATimeState.phaseTimer >= holdSeconds) {
+        oneAtATimeState.phase = "unfolding";
+      }
+
+      break;
+
+    case "unfolding":
+      oneAtATimeState.progress -= foldSpeed;
+
+      if (oneAtATimeState.progress <= 0) {
+        oneAtATimeState.progress = 0;
+        getInnerColorFor(
+          placements[oneAtATimeState.activeIndex],
+          true,
+          settings
+        );
+
+        if (gapSeconds <= 0) {
+          pickNextOneAtATimeCube(placements, settings);
+          oneAtATimeState.phase = "folding";
+        } else {
+          oneAtATimeState.phase = "gap";
+          oneAtATimeState.phaseTimer = 0;
+        }
+      }
+
+      break;
+
+    case "gap":
+      oneAtATimeState.phaseTimer += elapsed;
+
+      if (oneAtATimeState.phaseTimer >= gapSeconds) {
+        pickNextOneAtATimeCube(placements, settings);
+        oneAtATimeState.phase = "folding";
+        oneAtATimeState.phaseTimer = 0;
+      }
+
+      break;
+
+    default:
+      oneAtATimeState.phase = "folding";
+      break;
+  }
+}
+
+function applyOneAtATimeDivisionDefaults() {
+  controls.showDivisions.checked = true;
+  controls.divisionMatchBackground.checked = true;
+  controls.divisionAngleFilter.value =
+    "diagonal-up-vertical";
+
+  controls.showDivisions.dispatchEvent(
+    new Event("change")
+  );
+  controls.divisionMatchBackground.dispatchEvent(
+    new Event("change")
+  );
+  controls.divisionAngleFilter.dispatchEvent(
+    new Event("change")
+  );
+}
+
+/*
+ * Only one cube moves at a time, so the static scene is
+ * rendered once into framebuffers. "base" holds the
+ * background + grids, "full" adds every flat net. Each
+ * frame blits "full", then repaints just the scissored
+ * region around the folding cube.
+ */
+let oneAtATimeLayers = {
+  key: "",
+  base: null,
+  full: null,
+  regions: []
+};
+
+function getOneAtATimeLayerKey(settings, placements) {
+  const { foldProgress, ...stable } = settings;
+
+  return JSON.stringify([
+    stable,
+    monoColor,
+    outerColor,
+    innerColor,
+    shuffleInnerVersion,
+    packCacheKey,
+    placements.length,
+    width,
+    height,
+    pixelDensity()
+  ]);
+}
+
+function renderOneAtATimeLayer(
+  layer,
+  settings,
+  placements
+) {
+  layer.begin();
+  clear();
+  background(getBackgroundColor(settings));
+
+  if (settings.showCubeGrid) {
+    drawIsometricCubeGrid(settings);
+  }
+
+  if (settings.showGrid) {
+    drawScreenIsometricGrid(settings);
+  }
+
+  if (placements) {
+    setIsometricCamera(settings);
+    applyDefaultSceneLights(settings);
+
+    /* cache draws at rest must not reset shuffle state */
+    shuffleInnerFrozen = true;
+
+    for (const placement of placements) {
+      drawOneAtATimePlacement(placement, settings, 0);
+    }
+
+    shuffleInnerFrozen = false;
+    noLights();
+  }
+
+  layer.end();
+}
+
+function ensureOneAtATimeLayers(settings, placements) {
+  const key =
+    getOneAtATimeLayerKey(settings, placements);
+
+  if (
+    oneAtATimeLayers.full &&
+    oneAtATimeLayers.key === key
+  ) {
+    return oneAtATimeLayers;
+  }
+
+  if (!oneAtATimeLayers.full) {
+    oneAtATimeLayers.base =
+      createFramebuffer({ antialias: true });
+    oneAtATimeLayers.full =
+      createFramebuffer({ antialias: true });
+  }
+
+  oneAtATimeLayers.key = key;
+
+  renderOneAtATimeLayer(
+    oneAtATimeLayers.base,
+    settings,
+    null
+  );
+  renderOneAtATimeLayer(
+    oneAtATimeLayers.full,
+    settings,
+    placements
+  );
+
+  oneAtATimeLayers.regions = placements.map(
+    (placement) =>
+      getOneAtATimeRedrawRect(placement, settings)
+  );
+
+  return oneAtATimeLayers;
+}
+
+function blitOneAtATimeLayer(layer) {
+  push();
+  noLights();
+  noStroke();
+  beginScreenSpaceCamera();
+  imageMode(CORNER);
+  image(layer, -width * 0.5, -height * 0.5, width, height);
+  pop();
+}
+
+function drawOneAtATimeFrame(settings) {
+  const placements =
+    getOneAtATimePlacements(settings);
+
+  const layers =
+    ensureOneAtATimeLayers(settings, placements);
+
+  blitOneAtATimeLayer(layers.full);
+
+  const activeIndex = oneAtATimeState.activeIndex;
+  const active = placements[activeIndex];
+
+  if (!active || oneAtATimeState.progress <= 0) {
+    return;
+  }
+
+  const region = layers.regions[activeIndex];
+
+  const neighbours = [];
+
+  for (
+    let index = 0;
+    index < placements.length;
+    index++
+  ) {
+    if (
+      index === activeIndex ||
+      screenRectsOverlap(layers.regions[index], region)
+    ) {
+      neighbours.push(index);
+    }
+  }
+
+  const density = pixelDensity();
+
+  const left = floor(
+    (constrain(region.minX, -width / 2, width / 2) +
+      width / 2) *
+      density
+  );
+  const right = ceil(
+    (constrain(region.maxX, -width / 2, width / 2) +
+      width / 2) *
+      density
+  );
+  const top = floor(
+    (constrain(region.minY, -height / 2, height / 2) +
+      height / 2) *
+      density
+  );
+  const bottom = ceil(
+    (constrain(region.maxY, -height / 2, height / 2) +
+      height / 2) *
+      density
+  );
+
+  if (right <= left || bottom <= top) {
+    return;
+  }
+
+  const gl = drawingContext;
+
+  gl.enable(gl.SCISSOR_TEST);
+  gl.scissor(
+    left,
+    height * density - bottom,
+    right - left,
+    bottom - top
+  );
+
+  blitOneAtATimeLayer(layers.base);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+
+  setIsometricCamera(settings);
+  applyDefaultSceneLights(settings);
+
+  for (const index of neighbours) {
+    drawOneAtATimePlacement(
+      placements[index],
+      settings,
+      index === activeIndex
+        ? oneAtATimeState.progress
+        : 0
+    );
+  }
+
+  noLights();
+  gl.disable(gl.SCISSOR_TEST);
+}
+
+function drawOneAtATimePlacement(
+  placement,
+  settings,
+  foldProgress
+) {
+  drawNet(
+    placement.net,
+    placement.originX,
+    placement.originZ,
+    getNetColor(
+      placement.colorIndex,
+      settings
+    ),
+    settings,
+    placement.creaseStyle,
+    placement.seed,
+    placement.foldDelay,
+    {
+      cubeScale: placement.scale || 1,
+      drapeAmount: settings.drapeAmount,
+      foldProgress,
+      colorKey: placement
+    }
+  );
 }
 
 
@@ -3358,6 +4627,44 @@ function getRollGridDirForStep(stepIndex, settings) {
   return ROLL_GRID_DIRS[((stepIndex % 4) + 4) % 4];
 }
 
+function withEvenRollGridSpan(board, extra = {}) {
+  let minI = board.minI;
+  let maxI = board.maxI;
+  let minJ = board.minJ;
+  let maxJ = board.maxJ;
+
+  /*
+   * Odd spans flip i/j parity on wrap, so the row
+   * re-entering from off-canvas sits on the neighboring
+   * isometric diagonal and reads too close.
+   */
+  if (((maxI - minI + 1) & 1) !== 0) {
+    maxI += 1;
+  }
+
+  if (((maxJ - minJ + 1) & 1) !== 0) {
+    maxJ += 1;
+  }
+
+  const cells = [];
+
+  for (let j = minJ; j <= maxJ; j++) {
+    for (let i = minI; i <= maxI; i++) {
+      cells.push(coordinateKey(i, j));
+    }
+  }
+
+  return {
+    ...board,
+    ...extra,
+    minI,
+    maxI,
+    minJ,
+    maxJ,
+    cells
+  };
+}
+
 function getRollGridBoard(settings) {
   const visible = getVisibleFaceBoard(settings);
 
@@ -3367,7 +4674,7 @@ function getRollGridBoard(settings) {
    * seen popping in at the frame.
    */
   if (settings.rollGridMotion !== "one-way") {
-    return visible;
+    return withEvenRollGridSpan(visible);
   }
 
   const margin = 8;
@@ -3391,22 +4698,10 @@ function getRollGridBoard(settings) {
     maxJ += margin;
   }
 
-  const cells = [];
-
-  for (let j = minJ; j <= maxJ; j++) {
-    for (let i = minI; i <= maxI; i++) {
-      cells.push(coordinateKey(i, j));
-    }
-  }
-
-  return {
-    minI,
-    maxI,
-    minJ,
-    maxJ,
-    cells,
-    visible
-  };
+  return withEvenRollGridSpan(
+    { minI, maxI, minJ, maxJ },
+    { visible }
+  );
 }
 
 function wrapRollGridPose(i, j, ex, ez, board) {
@@ -3473,53 +4768,36 @@ function rollGridWrapCoord(value, min, span) {
 }
 
 /*
- * Map a lattice position into 0–1 across the visible
- * board along travel, folding through the wrap.
+ * Phase along the stream, entry → exit, with no wrap.
+ * Wrapping through the visible board jumped off-canvas
+ * entry cubes to t≈1, so they started one tip ahead of
+ * the first on-canvas row and sat a cell too close.
+ *
+ * t stays in [0, 1) so a 100% destination lead never
+ * floors the last row onto an extra completed tip.
  */
-function rollGridVisibleTravelT(
-  i,
-  j,
-  ex,
-  ez,
-  visible,
-  dir
-) {
-  const spanI = visible.maxI - visible.minI + 1;
-  const spanJ = visible.maxJ - visible.minJ + 1;
-  const posI =
-    rollGridWrapCoord(
-      i + ex * 0.5,
-      visible.minI,
-      spanI
-    );
-  const posJ =
-    rollGridWrapCoord(
-      j + ez * 0.5,
-      visible.minJ,
-      spanJ
-    );
-
+function rollGridLinearTravelT(i, j, ex, ez, board, dir) {
   if (dir.di !== 0) {
-    let t =
-      (posI - visible.minI) /
-      max(0.0001, spanI - 1);
+    const span = board.maxI - board.minI + 1;
+    const pos = i + ex * 0.5 - board.minI;
+    let t = pos / max(1, span);
 
     if (dir.di < 0) {
       t = 1 - t;
     }
 
-    return constrain(t, 0, 1);
+    return constrain(t, 0, 0.999999);
   }
 
-  let t =
-    (posJ - visible.minJ) /
-    max(0.0001, spanJ - 1);
+  const span = board.maxJ - board.minJ + 1;
+  const pos = j + ez * 0.5 - board.minJ;
+  let t = pos / max(1, span);
 
   if (dir.dj < 0) {
     t = 1 - t;
   }
 
-  return constrain(t, 0, 1);
+  return constrain(t, 0, 0.999999);
 }
 
 function rollGridUsesPerCubeTime(settings) {
@@ -3534,6 +4812,19 @@ function rollGridUsesPerCubeTime(settings) {
   );
 }
 
+/*
+ * Drop odd completed tips so a destination lead can't
+ * shift a cube onto the neighboring isometric diagonal.
+ * Fractional progress still carries the wave.
+ */
+function rollGridEvenLatticeLead(lead) {
+  const steps = Math.floor(max(0, lead));
+  const frac = lead - steps;
+  const evenSteps = steps - (steps & 1);
+
+  return evenSteps + frac;
+}
+
 function initRollGridOneWayPhases(settings, cubes) {
   const bias = max(0, settings.rollGridDestOffset || 0);
 
@@ -3545,21 +4836,20 @@ function initRollGridOneWayPhases(settings, cubes) {
     return;
   }
 
-  const visible =
-    rollGridBoard.visible || rollGridBoard;
+  const board = rollGridBoard;
   const dir = getRollGridTravelDir(settings);
 
   for (const cube of cubes) {
-    const t = rollGridVisibleTravelT(
+    const t = rollGridLinearTravelT(
       cube.homeI,
       cube.homeJ,
       cube.homeEx,
       cube.homeEz,
-      visible,
+      board,
       dir
     );
 
-    cube.localTime = bias * t;
+    cube.localTime = rollGridEvenLatticeLead(bias * t);
   }
 }
 
@@ -3589,7 +4879,27 @@ function rollGridFootprintKeys(i, j, ex, ez, pad = 0) {
   return keys;
 }
 
-function rollGridFootprintFits(board, occupied, i, j, ex, ez) {
+function rollGridOnLattice(i, j, originI, originJ) {
+  return (
+    ((i - originI) & 1) === 0 &&
+    ((j - originJ) & 1) === 0
+  );
+}
+
+/*
+ * One empty isometric diagonal between cube diagonals
+ * means a single 2×2 lattice: (2,0) / (0,2), never
+ * (2,1) or (3,1) phase slips that hug the next row.
+ */
+function rollGridFootprintFits(
+  board,
+  occupied,
+  i,
+  j,
+  ex,
+  ez,
+  lattice = true
+) {
   for (let jj = j; jj < j + ez; jj++) {
     for (let ii = i; ii < i + ex; ii++) {
       if (
@@ -3601,16 +4911,26 @@ function rollGridFootprintFits(board, occupied, i, j, ex, ez) {
       ) {
         return false;
       }
-    }
-  }
 
-  /*
-   * Keep a 1-cell moat around each footprint so
-   * neighbors never share an edge or corner gap.
-   */
-  for (const key of rollGridFootprintKeys(i, j, ex, ez, 1)) {
-    if (occupied.has(key)) {
-      return false;
+      for (const key of occupied) {
+        const cell = parseCoordinateKey(key);
+        const di = ii - cell[0];
+        const dj = jj - cell[1];
+
+        if (di === 0 && dj === 0) {
+          return false;
+        }
+
+        if (lattice) {
+          if ((di & 1) !== 0 || (dj & 1) !== 0) {
+            return false;
+          }
+        } else if (
+          Math.max(Math.abs(di), Math.abs(dj)) < 2
+        ) {
+          return false;
+        }
+      }
     }
   }
 
@@ -3739,9 +5059,18 @@ function buildRollGridCubes(settings) {
 
   const occupied = new Set();
   const candidates = [];
+  const originI = board.minI;
+  const originJ = board.minJ;
 
   for (let j = board.minJ; j <= board.maxJ; j++) {
     for (let i = board.minI; i <= board.maxI; i++) {
+      if (
+        !allowBoxes &&
+        !rollGridOnLattice(i, j, originI, originJ)
+      ) {
+        continue;
+      }
+
       candidates.push({
         i,
         j,
@@ -3761,27 +5090,15 @@ function buildRollGridCubes(settings) {
       allowBoxes
     );
 
-    /*
-     * Reserve a square covering every tip orientation
-     * of this box, plus the motion moat.
-     */
-    const reserve = allowBoxes
-      ? rollGridStepForExtents(
-          extents.ex,
-          extents.ey,
-          extents.ez,
-          settings
-        ) - 1
-      : 1;
-
     if (
       !rollGridFootprintFits(
         board,
         occupied,
         slot.i,
         slot.j,
-        reserve,
-        reserve
+        extents.ex,
+        extents.ez,
+        !allowBoxes
       )
     ) {
       continue;
@@ -3797,8 +5114,8 @@ function buildRollGridCubes(settings) {
     for (const key of rollGridFootprintKeys(
       slot.i,
       slot.j,
-      reserve,
-      reserve,
+      extents.ex,
+      extents.ez,
       0
     )) {
       occupied.add(key);
@@ -4058,7 +5375,8 @@ function drawRollGrid(settings) {
       getNetColor(cube.colorIndex, settings),
       settings,
       cube.colorIndex,
-      cube.facePaint
+      cube.facePaint,
+      cube
     );
   }
 }
@@ -4081,7 +5399,8 @@ function drawRollingCube(
   netColor,
   settings,
   seed = 0,
-  facePaint = null
+  facePaint = null,
+  colorKey = seed
 ) {
   const faceSize = settings.faceSize;
   const wx = ex * faceSize;
@@ -4125,7 +5444,8 @@ function drawRollingCube(
     netColor,
     settings,
     seed,
-    facePaint
+    facePaint,
+    colorKey
   );
   pop();
 }
@@ -4139,15 +5459,18 @@ function drawSolidBox(
   netColor,
   settings,
   seed = 0,
-  facePaint = null
+  facePaint = null,
+  colorKey = seed
 ) {
   const hx = wx * 0.5;
   const hz = wz * 0.5;
   const hy2 = hy * 0.5;
-  const innerBaseColor =
-    isTwoToneColorMode(settings.colorMode)
-      ? color(settings.innerColor)
-      : null;
+  /*
+   * A solid box is always sealed, so only its outside
+   * is drawn. Facing tests run in the unrotated pose
+   * and would flash the inner color mid-tip.
+   */
+  const innerBaseColor = null;
 
   const paint =
     facePaint || [0, 1, 2, 3, 4, 5];
@@ -4207,8 +5530,16 @@ function drawSolidBox(
     }
   ];
 
-  for (let faceIndex = 0; faceIndex < faces.length; faceIndex++) {
-    const face = faces[faceIndex];
+  const drawOrder = faces
+    .map((face, faceIndex) => ({
+      face,
+      faceIndex,
+      dist: getFaceViewerDistance(face.center)
+    }))
+    .sort((a, b) => b.dist - a.dist);
+
+  for (let order = 0; order < drawOrder.length; order++) {
+    const { face, faceIndex } = drawOrder[order];
     const paintIndex = paint[faceIndex];
     const faceColor = color(
       getFaceOuterColor(
@@ -4231,9 +5562,69 @@ function drawSolidBox(
       flatSettings,
       innerBaseColor,
       face.faceSize,
-      true
+      true,
+      order,
+      null,
+      getSolidBoxEdgeMask(faceIndex, face, paint, settings)
     );
   }
+}
+
+const SOLID_BOX_SLOT_AXIS = [1, 1, 0, 0, 2, 2];
+
+function solidBoxSlotForDirection(dir) {
+  const ax = abs(dir[0]);
+  const ay = abs(dir[1]);
+  const az = abs(dir[2]);
+
+  if (ay >= ax && ay >= az) {
+    return dir[1] < 0 ? 0 : 1;
+  }
+
+  if (ax >= az) {
+    return dir[0] > 0 ? 2 : 3;
+  }
+
+  return dir[2] > 0 ? 4 : 5;
+}
+
+/*
+ * Division edges are chosen once, in the cube's spawn
+ * orientation, and keyed by the pair of physical faces
+ * that share them so the lines roll with the cube.
+ * Edge k of a face runs corner k → k+1, bordering the
+ * −v, +u, +v, −u neighbor in turn.
+ */
+function getSolidBoxEdgeMask(slot, face, paint, settings) {
+  const filter = settings.divisionAngleFilter || "all";
+
+  if (!settings.showDivisions || filter === "all") {
+    return null;
+  }
+
+  const neighborDirs = [
+    scaleVector(face.v, -1),
+    face.u,
+    face.v,
+    scaleVector(face.u, -1)
+  ];
+  const physical = paint[slot];
+
+  return neighborDirs.map((dir) => {
+    const neighbor =
+      paint[solidBoxSlotForDirection(dir)];
+    const axis = 3 -
+      SOLID_BOX_SLOT_AXIS[physical] -
+      SOLID_BOX_SLOT_AXIS[neighbor];
+    const end = [0, 0, 0];
+
+    end[axis] = 1;
+
+    return edgeMatchesDivisionFilter(
+      edgeScreenFamily([0, 0, 0], end),
+      filter
+    );
+  });
 }
 
 function drawSolidCube(
@@ -4476,8 +5867,8 @@ function insideOutPlanFits(
 }
 
 function getInsideOutRestDrawState(cube, settings) {
-  if (cube.inverted) {
-    if (insideOutUsesFlatPause(settings)) {
+  if (insideOutUsesFlatPause(settings)) {
+    if (cube.inverted) {
       return {
         foldProgress: 1,
         plantIndex: cube.destIndex,
@@ -4488,17 +5879,22 @@ function getInsideOutRestDrawState(cube, settings) {
 
     return {
       foldProgress: 1,
-      plantIndex: cube.hingeIndex,
+      plantIndex: cube.startIndex,
       invertFold: false,
-      insideOutFlow: true
+      insideOutFlow: false
     };
   }
 
+  /*
+   * Continuous flow stays planted on the hinge so the
+   * pose at progress 0/1 matches the rest cube. Planting
+   * on start vs hinge while folded looks like a jump.
+   */
   return {
-    foldProgress: 1,
-    plantIndex: cube.startIndex,
+    foldProgress: cube.inverted ? 1 : 0,
+    plantIndex: cube.hingeIndex,
     invertFold: false,
-    insideOutFlow: false
+    insideOutFlow: true
   };
 }
 
@@ -4577,6 +5973,7 @@ function drawInsideOutNet(
       cubeScale: scale,
       invertFold: drawState.invertFold,
       insideOutFlow: drawState.insideOutFlow,
+      colorKey: cube,
       motionCurve:
         settings.cascadeMotionCurve || "ease"
     }
@@ -4732,17 +6129,21 @@ function getInsideOutDrawState(
 
     return {
       foldProgress: 1 - progress,
-      plantIndex: cube.hingeIndex,
+      plantIndex: cube.startIndex,
       invertFold: false,
       insideOutFlow: false
     };
   }
 
   if (phase === "refold") {
+    const open = progress <= 0.0001;
+
     if (cube.inverted) {
       return {
         foldProgress: progress,
-        plantIndex: cube.startIndex,
+        plantIndex: open
+          ? cube.destIndex
+          : cube.startIndex,
         invertFold: false,
         insideOutFlow: false
       };
@@ -4750,8 +6151,10 @@ function getInsideOutDrawState(
 
     return {
       foldProgress: progress,
-      plantIndex: cube.destIndex,
-      invertFold: true,
+      plantIndex: open
+        ? cube.startIndex
+        : cube.destIndex,
+      invertFold: !open,
       insideOutFlow: false
     };
   }
@@ -4972,11 +6375,28 @@ function ensureWanderAgents(settings) {
   wanderAgents = buildWanderAgents(settings);
 }
 
-function scheduleWanderWait(agent, settings) {
-  const maxInterval = max(
-    0.05,
-    Number(settings.wanderActionInterval) || 2
+function isWanderMode(mode) {
+  return mode === "wander" || mode === "wander-roll";
+}
+
+function wanderFrequencyValue(settings) {
+  return constrain(
+    Number(settings.wanderFrequency) || 0,
+    0,
+    1
   );
+}
+
+function scheduleWanderWait(agent, settings) {
+  const freq = wanderFrequencyValue(settings);
+
+  if (freq >= 0.999) {
+    agent.waitDelay = 0;
+    agent.waitTimer = 0;
+    return;
+  }
+
+  const maxInterval = (1 - freq) * 6;
 
   agent.waitDelay =
     unitHash(
@@ -5331,13 +6751,6 @@ function collectWanderTravelUnfoldActions(
             continue;
           }
 
-          if (
-            trailing[0] !== plant[0] ||
-            trailing[1] !== plant[1]
-          ) {
-            continue;
-          }
-
           const ox = plant[0] - trailing[0];
           const oy = plant[1] - trailing[1];
           const cells = local.map((cell) => [
@@ -5441,24 +6854,62 @@ function collectWanderActions(agent, settings) {
 }
 
 function tryBeginWanderAction(agent, settings) {
-  const actions = collectWanderActions(
+  const rolls = collectWanderRollActions(
     agent,
     settings
   );
+  const unfolds =
+    settings.sketchMode === "wander-roll"
+      ? []
+      : collectWanderUnfoldActions(agent, settings);
+  const freq = wanderFrequencyValue(settings);
+  const rollChance = unitHash(
+    agent.seed * 0.67 +
+    wanderTime * 0.11 +
+    agent.waitTimer * 3.1
+  );
 
-  if (!actions.length) {
-    return false;
+  let pick = null;
+
+  if (settings.sketchMode === "wander-roll") {
+    if (!rolls.length) {
+      return false;
+    }
+
+    agent.rollDir =
+      rolls[floor(rollChance * rolls.length)].dir;
+    agent.phase = "rolling";
+    agent.animProgress = 0;
+    return true;
   }
 
-  const pick = actions[
-    floor(
-      unitHash(
-        agent.seed * 0.67 +
-        wanderTime * 0.11 +
-        agent.waitTimer * 3.1
-      ) * actions.length
-    )
-  ];
+  /*
+   * At most one roll between folding sequences:
+   * frequency is the chance a cube rolls once before
+   * it unfolds again.
+   */
+  const wantsRoll =
+    !agent.rolledSinceFold && rollChance < freq;
+
+  if (rolls.length && wantsRoll) {
+    pick = rolls[
+      floor(rollChance * rolls.length)
+    ];
+  } else if (unfolds.length) {
+    pick = unfolds[
+      floor(
+        unitHash(
+          agent.seed * 0.71 + wanderTime * 0.19
+        ) * unfolds.length
+      )
+    ];
+  } else if (rolls.length && !agent.rolledSinceFold) {
+    pick = rolls[0];
+  }
+
+  if (!pick) {
+    return false;
+  }
 
   if (pick.type === "roll") {
     agent.rollDir = pick.dir;
@@ -5471,28 +6922,24 @@ function tryBeginWanderAction(agent, settings) {
   agent.cells = pick.plan.cells;
   agent.net = prepareNet(pick.plan.cells);
   agent.travelUnfold = Boolean(pick.plan.travel);
+  agent.trailingIndex = getNetFaceIndexAt(
+    agent.net,
+    agent.i,
+    agent.j
+  );
+  agent.plantFaceIndex = agent.trailingIndex;
 
   if (agent.travelUnfold) {
-    agent.trailingIndex = getNetFaceIndexAt(
-      agent.net,
-      pick.plan.trailingCell[0],
-      pick.plan.trailingCell[1]
-    );
     agent.leadingIndex = getNetFaceIndexAt(
       agent.net,
       pick.plan.leadingCell[0],
       pick.plan.leadingCell[1]
     );
   } else {
-    agent.plantFaceIndex = getNetFaceIndexAt(
-      agent.net,
-      agent.i,
-      agent.j
-    );
-    agent.trailingIndex = agent.plantFaceIndex;
-    agent.leadingIndex = agent.plantFaceIndex;
+    agent.leadingIndex = agent.trailingIndex;
   }
 
+  agent.rolledSinceFold = false;
   agent.phase = "unravel";
   agent.animProgress = 0;
   return true;
@@ -5518,24 +6965,14 @@ function finishWanderRoll(agent) {
     agent.rollDir
   );
   agent.rollDir = null;
+  agent.rolledSinceFold = true;
 }
 
 function finishWanderRefold(agent) {
-  if (agent.travelUnfold && agent.net) {
-    const leading =
-      agent.net.faces[agent.leadingIndex];
-
-    if (leading) {
-      agent.i = leading.gridX;
-      agent.j = leading.gridY;
-    }
-  }
-
-  agent.net = null;
-  agent.cells = null;
+  agent.plantFaceIndex = getWanderPlantFaceIndex(agent);
   agent.travelUnfold = false;
-  agent.trailingIndex = 0;
-  agent.leadingIndex = 0;
+  agent.trailingIndex = agent.plantFaceIndex || 0;
+  agent.leadingIndex = agent.plantFaceIndex || 0;
 }
 
 function getWanderPlantFaceIndex(agent) {
@@ -5555,15 +6992,27 @@ function getWanderPlantFaceIndex(agent) {
   return agent.plantFaceIndex || 0;
 }
 
+function wanderFoldRate(settings) {
+  return settings.animationSpeed * 1.65 * 60;
+}
+
+function wanderRollRate(settings) {
+  const speed =
+    Number(settings.wanderSpeed) ||
+    settings.animationSpeed;
+
+  return speed * 1.65 * 60;
+}
+
 function updateWander(settings) {
   ensureWanderAgents(settings);
 
-  const speed =
-    settings.animationSpeed * 1.65;
   const dt =
     (typeof deltaTime === "number" && deltaTime > 0
       ? deltaTime
       : 1000 / 60) / 1000;
+  const foldSpeed = wanderFoldRate(settings) * dt;
+  const rollSpeed = wanderRollRate(settings) * dt;
 
   wanderTime += dt;
 
@@ -5582,52 +7031,273 @@ function updateWander(settings) {
       continue;
     }
 
-    agent.animProgress += speed;
+    agent.animProgress +=
+      agent.phase === "rolling"
+        ? rollSpeed
+        : foldSpeed;
 
-    while (agent.animProgress >= 1) {
-      agent.animProgress -= 1;
+    if (agent.animProgress < 1) {
+      continue;
+    }
 
-      if (agent.phase === "rolling") {
-        finishWanderRoll(agent);
-        agent.phase = "folded";
-        scheduleWanderWait(agent, settings);
-        break;
+    agent.animProgress = 0;
+
+    if (agent.phase === "rolling") {
+      finishWanderRoll(agent);
+      agent.phase = "folded";
+      scheduleWanderWait(agent, settings);
+      continue;
+    }
+
+    if (agent.phase === "unravel") {
+      agent.phase = "refold";
+
+      if (agent.travelUnfold && agent.net) {
+        const leading =
+          agent.net.faces[agent.leadingIndex];
+
+        if (leading) {
+          remapWanderFacePaint(
+            agent,
+            agent.trailingIndex,
+            agent.leadingIndex
+          );
+          agent.i = leading.gridX;
+          agent.j = leading.gridY;
+          agent.plantFaceIndex = agent.leadingIndex;
+        }
       }
 
-      if (agent.phase === "unravel") {
-        agent.phase = "refold";
-        break;
-      }
+      continue;
+    }
 
-      if (agent.phase === "refold") {
-        finishWanderRefold(agent);
-        agent.phase = "folded";
-        scheduleWanderWait(agent, settings);
-        break;
-      }
-
-      break;
+    if (agent.phase === "refold") {
+      finishWanderRefold(agent);
+      agent.phase = "folded";
+      scheduleWanderWait(agent, settings);
     }
   }
 }
 
-function getWanderDrawPlantIndex(
-  agent,
-  unraveling,
-  foldProgress
-) {
-  if (!agent.travelUnfold) {
-    return getWanderPlantFaceIndex(agent);
-  }
-
-  if (
-    unraveling ||
-    foldProgress <= 0
-  ) {
+function getWanderDrawPlantIndex(agent, unraveling) {
+  if (!agent.travelUnfold || unraveling) {
     return agent.trailingIndex;
   }
 
   return agent.leadingIndex;
+}
+
+/*
+ * Wander cube face slots (matching tipRollGridFacePaint):
+ * 0 ground, 1 top, 2 +X, 3 −X, 4 +Z, 5 −Z.
+ * Folded cubes sit on the camera side (−Y) of the grid.
+ */
+function wanderSlotForOutward(outward) {
+  const ax = abs(outward[0]);
+  const ay = abs(outward[1]);
+  const az = abs(outward[2]);
+
+  if (ay >= ax && ay >= az) {
+    return outward[1] > 0 ? 0 : 1;
+  }
+
+  if (ax >= az) {
+    return outward[0] > 0 ? 2 : 3;
+  }
+
+  return outward[2] > 0 ? 4 : 5;
+}
+
+/*
+ * Which cube slot each net face lands on once the net
+ * is folded around `plantIndex`. Net normals point into
+ * the folded cube.
+ */
+function getWanderNetSlots(agent, plantIndex) {
+  const cache = agent.netSlotCache;
+
+  if (
+    cache &&
+    cache.net === agent.net &&
+    cache.plantIndex === plantIndex
+  ) {
+    return cache.slots;
+  }
+
+  const rooted = rerootNet(agent.net, plantIndex);
+  const transforms = buildConnectedFaceTransforms(
+    rooted,
+    0,
+    0,
+    1,
+    HALF_PI
+  );
+  const slots = transforms.map((transform) =>
+    wanderSlotForOutward(
+      scaleVector(transform.normal, -1)
+    )
+  );
+
+  agent.netSlotCache = {
+    net: agent.net,
+    plantIndex,
+    slots
+  };
+
+  return slots;
+}
+
+/*
+ * Keep every face's paint when a travel unfold swaps
+ * its plant from the trailing to the leading face.
+ */
+function remapWanderFacePaint(agent, fromPlant, toPlant) {
+  const from = getWanderNetSlots(agent, fromPlant);
+  const to = getWanderNetSlots(agent, toPlant);
+  const paint = agent.facePaint || [0, 1, 2, 3, 4, 5];
+  const next = paint.slice();
+
+  for (let face = 0; face < from.length; face++) {
+    next[to[face]] = paint[from[face]];
+  }
+
+  agent.facePaint = next;
+}
+
+/*
+ * One side rule for nets and solid cubes: the cube's
+ * outside shows the outer color, its inside the inner
+ * color (two-tone only). `inward` points into the cube.
+ */
+function getWanderFaceColor(
+  inward,
+  center,
+  outerColor,
+  settings,
+  innerHex = settings.innerColor
+) {
+  const toCamera = subtractVectors(
+    getIsometricEyePosition(),
+    center
+  );
+  const insideVisible =
+    dotVectors(inward, toCamera) > 0;
+
+  if (
+    insideVisible &&
+    isTwoToneColorMode(settings.colorMode)
+  ) {
+    return innerHex;
+  }
+
+  return outerColor;
+}
+
+function drawWanderCube(
+  agent,
+  dir,
+  tipProgress,
+  netColor,
+  settings
+) {
+  const faceSize = settings.faceSize;
+  const ex = agent.ex || 1;
+  const ey = agent.ey || 1;
+  const ez = agent.ez || 1;
+  const hx = ex * faceSize * 0.5;
+  const hz = ez * faceSize * 0.5;
+  const hy = ey * faceSize;
+  const h2 = hy * 0.5;
+  const origin = rollGridBottomCenter(
+    agent.i,
+    agent.j,
+    ex,
+    ez,
+    faceSize
+  );
+  const paint =
+    agent.facePaint || [0, 1, 2, 3, 4, 5];
+  const innerHex =
+    getInnerColorFor(agent, true, settings);
+
+  const local = [
+    { c: [0, 0, 0], u: [hx, 0, 0], v: [0, 0, hz], n: [0, 1, 0] },
+    { c: [0, -hy, 0], u: [hx, 0, 0], v: [0, 0, -hz], n: [0, -1, 0] },
+    { c: [hx, -h2, 0], u: [0, 0, hz], v: [0, h2, 0], n: [1, 0, 0] },
+    { c: [-hx, -h2, 0], u: [0, 0, -hz], v: [0, h2, 0], n: [-1, 0, 0] },
+    { c: [0, -h2, hz], u: [-hx, 0, 0], v: [0, h2, 0], n: [0, 0, 1] },
+    { c: [0, -h2, -hz], u: [hx, 0, 0], v: [0, h2, 0], n: [0, 0, -1] }
+  ];
+
+  const angle =
+    dir && tipProgress > 0
+      ? applyMotionCurve(
+          constrain(tipProgress, 0, 1),
+          settings.cascadeMotionCurve || "ease"
+        ) * HALF_PI
+      : 0;
+  const pivot = dir
+    ? [dir.di * hx, 0, dir.dj * hz]
+    : [0, 0, 0];
+  const axis =
+    dir && dir.di !== 0 ? [0, 0, 1] : [1, 0, 0];
+  const theta = !dir
+    ? 0
+    : dir.di !== 0
+      ? dir.di * angle
+      : -dir.dj * angle;
+  const spin = (vector) =>
+    theta === 0
+      ? vector
+      : rotateVectorAroundAxis(vector, axis, theta);
+
+  const faces = local.map((face, slot) => {
+    const rel = spin(subtractVectors(face.c, pivot));
+    const outward = spin(face.n);
+    const center = [
+      origin.x + pivot[0] + rel[0],
+      pivot[1] + rel[1],
+      origin.z + pivot[2] + rel[2]
+    ];
+    const inward = scaleVector(outward, -1);
+
+    return {
+      transform: {
+        center,
+        u: spin(face.u),
+        v: spin(face.v),
+        normal: inward
+      },
+      color: getWanderFaceColor(
+        inward,
+        center,
+        getFaceOuterColor(
+          paint[slot],
+          netColor,
+          settings,
+          agent.seed
+        ),
+        settings,
+        innerHex
+      ),
+      dist: getFaceViewerDistance(center)
+    };
+  });
+
+  faces.sort((a, b) => b.dist - a.dist);
+
+  for (let order = 0; order < faces.length; order++) {
+    drawConnectedFace(
+      faces[order].transform,
+      color(faces[order].color),
+      1,
+      settings,
+      null,
+      2,
+      false,
+      order
+    );
+  }
 }
 
 function drawWanderAgents(settings) {
@@ -5650,18 +7320,12 @@ function drawWanderAgents(settings) {
         1
       );
 
-      drawRollingCube(
-        agent.i,
-        agent.j,
-        agent.ex || 1,
-        agent.ey || 1,
-        agent.ez || 1,
+      drawWanderCube(
+        agent,
         agent.rollDir,
         tipProgress,
         netColor,
-        settings,
-        agent.seed,
-        agent.facePaint
+        settings
       );
       continue;
     }
@@ -5683,17 +7347,26 @@ function drawWanderAgents(settings) {
       const plantIndex =
         getWanderDrawPlantIndex(
           agent,
-          unraveling,
-          foldProgress
+          unraveling
         );
-      const plantFace =
-        agent.net.faces[plantIndex] ||
-        agent.net.faces[0];
       const origin = worldOriginForFace(
-        plantFace.gridX,
-        plantFace.gridY,
+        agent.i,
+        agent.j,
         1,
         size
+      );
+      const motionCurve =
+        settings.cascadeMotionCurve || "ease";
+      const slots = getWanderNetSlots(
+        agent,
+        plantIndex
+      );
+      const paint =
+        agent.facePaint || [0, 1, 2, 3, 4, 5];
+      const innerHex = getInnerColorFor(
+        agent,
+        foldProgress >= 0.999,
+        settings
       );
 
       drawNet(
@@ -5712,25 +7385,33 @@ function drawWanderAgents(settings) {
           useOriginAsPlant: true,
           drapeAmount: 0,
           cubeScale: 1,
-          motionCurve:
-            settings.cascadeMotionCurve || "ease"
+          colorKey: agent,
+          motionCurve,
+          singleSided: true,
+          faceColorFor: (faceIndex, transform) =>
+            getWanderFaceColor(
+              transform.normal,
+              transform.center,
+              getFaceOuterColor(
+                paint[slots[faceIndex]],
+                netColor,
+                settings,
+                agent.seed
+              ),
+              settings,
+              innerHex
+            )
         }
       );
       continue;
     }
 
-    drawRollingCube(
-      agent.i,
-      agent.j,
-      agent.ex || 1,
-      agent.ey || 1,
-      agent.ez || 1,
-      ROLL_GRID_DIRS[0],
+    drawWanderCube(
+      agent,
+      null,
       0,
       netColor,
-      settings,
-      agent.seed,
-      agent.facePaint
+      settings
     );
   }
 }
@@ -6729,7 +8410,31 @@ function updateCascade(settings) {
         traveler.waitTimer >=
         (traveler.waitDelay || 0)
       ) {
-        tryBeginCascadeUnfold(traveler, settings);
+        const started =
+          tryBeginCascadeUnfold(traveler, settings);
+
+        /*
+         * If a cube sits idle too long, reseat it on
+         * the source lip so the stream doesn't thin
+         * after the first pass leaves the frame.
+         */
+        if (
+          !started &&
+          traveler.waitTimer >= 0.85 &&
+          !cascadeTravelerVisible(
+            traveler,
+            settings
+          )
+        ) {
+          resetCascadeTravelerToStart(
+            traveler,
+            settings
+          );
+          tryBeginCascadeUnfold(
+            traveler,
+            settings
+          );
+        }
       }
 
       continue;
@@ -6768,6 +8473,9 @@ function updateCascade(settings) {
       traveler.animProgress -= 1;
 
       if (traveler.phase === "unravel") {
+        /* frames can skip exact flat, so mark it here */
+        getInnerColorFor(traveler, true, settings);
+
         if (pauseSec > 0) {
           traveler.phase = "pause-open";
           traveler.pauseTimer = 0;
@@ -6953,11 +8661,29 @@ function findCascadeUnfoldPlan(traveler, settings) {
             scale
           );
 
+        const plantScore =
+          preferScore(
+            plant[0],
+            plant[1],
+            prefer
+          );
+
+        const leadingScore =
+          preferScore(
+            leadingPlant[0],
+            leadingPlant[1],
+            prefer
+          );
+
+        if (leadingScore <= plantScore) {
+          continue;
+        }
+
         const score =
           span * 10 -
           abs(span - 3) * 1.5 +
-          (entersView ? 12 : 0) +
-          (plantOffBoard && entersView ? 10 : 0) +
+          (entersView ? 18 : 0) +
+          (plantOffBoard && entersView ? 16 : 0) +
           unitHash(
             traveler.seed * 0.31 +
             typeIndex * 17.9 +
@@ -7220,12 +8946,7 @@ function getCascadeStreamLayout(
   const factor = max(1, scaleFactor);
   const total = max(1, count);
 
-  const corners = [
-    [board.minI, board.minJ],
-    [board.minI, board.maxJ],
-    [board.maxI, board.minJ],
-    [board.maxI, board.maxJ]
-  ];
+  const corners = getBoardTravelCorners(board);
 
   let travelMin = Infinity;
   let travelMax = -Infinity;
@@ -7421,6 +9142,58 @@ function cascadePlantOnBoard(plant, board, scale) {
  * True when every base cell of the plant footprint sits
  * strictly outside the visible board on the source axes.
  */
+function getBoardTravelRange(board, prefer) {
+  const corners = getBoardTravelCorners(board);
+
+  const perpI = -prefer.dj;
+  const perpJ = prefer.di;
+  let travelMin = Infinity;
+  let travelMax = -Infinity;
+  let perpMin = Infinity;
+  let perpMax = -Infinity;
+
+  for (const corner of corners) {
+    const travel =
+      preferScore(
+        corner[0],
+        corner[1],
+        prefer
+      );
+
+    const perp =
+      corner[0] * perpI +
+      corner[1] * perpJ;
+
+    travelMin = min(travelMin, travel);
+    travelMax = max(travelMax, travel);
+    perpMin = min(perpMin, perp);
+    perpMax = max(perpMax, perp);
+  }
+
+  return {
+    travelMin,
+    travelMax,
+    perpMin,
+    perpMax,
+    perpI,
+    perpJ
+  };
+}
+
+function latticeFromTravelPerp(travel, perp, prefer) {
+  const di = prefer.di;
+  const dj = prefer.dj;
+
+  return [
+    round((di * travel - dj * perp) * 0.5),
+    round((dj * travel + di * perp) * 0.5)
+  ];
+}
+
+/*
+ * True when the plant sits on the incoming side of
+ * travel — behind the visible board, not past it.
+ */
 function cascadePlantOffSourceBoard(
   plant,
   board,
@@ -7428,27 +9201,15 @@ function cascadePlantOffSourceBoard(
   scale
 ) {
   const edge = max(1, scale);
-  const footprint = expandCellsToFootprint([plant], edge);
+  const range = getBoardTravelRange(board, prefer);
+  const plantScore =
+    preferScore(
+      plant[0] * edge,
+      plant[1] * edge,
+      prefer
+    );
 
-  for (const cell of footprint) {
-    if (prefer.di < 0 && cell[0] <= board.maxI) {
-      return false;
-    }
-
-    if (prefer.di > 0 && cell[0] >= board.minI) {
-      return false;
-    }
-
-    if (prefer.dj < 0 && cell[1] <= board.maxJ) {
-      return false;
-    }
-
-    if (prefer.dj > 0 && cell[1] >= board.minJ) {
-      return false;
-    }
-  }
-
-  return true;
+  return plantScore < range.travelMin;
 }
 
 function findFreeCascadePlant(
@@ -7597,75 +9358,59 @@ function findResetCascadePlant(
   laneIndex,
   depthIndex
 ) {
-  const laneCount = layout ? layout.lanes : 1;
-  const depthSpread =
+  const range =
     layout
-      ? max(4, layout.depth + 4)
-      : 8;
+      ? {
+          travelMin: layout.travelMin,
+          travelMax: layout.travelMax,
+          perpMin: layout.perpMin,
+          perpMax: layout.perpMax
+        }
+      : getBoardTravelRange(board, prefer);
 
-  for (
-    let depthTry = depthIndex;
-    depthTry <= depthIndex + depthSpread;
-    depthTry++
-  ) {
-    const plant = findResetCascadePlantAtDepth(
-      board,
-      prefer,
-      edge,
-      occupied,
-      seed,
-      index,
-      layout,
-      laneIndex,
-      depthTry,
-      laneCount
-    );
+  const laneCount =
+    layout ? max(1, layout.lanes) : 1;
 
-    if (plant) {
-      return plant;
-    }
-  }
+  const laneT =
+    laneCount <= 1
+      ? 0.5
+      : constrain(
+          laneIndex / (laneCount - 1),
+          0,
+          1
+        );
 
-  return null;
-}
+  const targetPerp =
+    range.perpMin +
+    laneT * (range.perpMax - range.perpMin);
 
-function findResetCascadePlantAtDepth(
-  board,
-  prefer,
-  edge,
-  occupied,
-  seed,
-  index,
-  layout,
-  laneIndex,
-  depthIndex,
-  laneCount
-) {
-  const slot = getCascadeStartCell(
-    board,
-    prefer,
-    laneIndex,
-    laneCount,
-    seed,
-    depthIndex,
-    layout,
-    edge,
-    "reset"
-  );
-
-  const anchorI = round(slot.i / edge);
-  const anchorJ = round(slot.j / edge);
-  const searchRadius = max(
-    3,
-    layout ? ceil(layout.lanes * 0.75) + 2 : 4
-  );
+  const behindMax =
+    cascadeSourceMargin(edge) + 3;
 
   const candidates = [];
 
-  for (let dj = -searchRadius; dj <= searchRadius; dj++) {
-    for (let di = -searchRadius; di <= searchRadius; di++) {
-      const logicalI = anchorI + di;
-      const logicalJ = anchorJ + dj;
+  for (
+    let behind = 1;
+    behind <= behindMax;
+    behind++
+  ) {
+    const travel =
+      range.travelMin - behind * edge;
+
+    for (
+      let perp = floor(range.perpMin) - 4;
+      perp <= ceil(range.perpMax) + 4;
+      perp++
+    ) {
+      const cell =
+        latticeFromTravelPerp(
+          travel,
+          perp,
+          prefer
+        );
+
+      const logicalI = round(cell[0] / edge);
+      const logicalJ = round(cell[1] / edge);
       const plant = [logicalI, logicalJ];
 
       if (
@@ -7682,10 +9427,16 @@ function findResetCascadePlantAtDepth(
       candidates.push({
         i: logicalI,
         j: logicalJ,
-        dist: abs(di) + abs(dj),
+        dist:
+          behind * 8 +
+          abs(perp - targetPerp) +
+          abs(behind - 1) * 0.25,
         order: cellHash(
           coordinateKey(logicalI, logicalJ),
-          index + placementSeed + edge * 17 + depthIndex * 5.3
+          index +
+            placementSeed +
+            edge * 17 +
+            depthIndex * 5.3
         )
       });
     }
@@ -7954,91 +9705,78 @@ function getCascadeStartCell(
   scale = 1,
   spawnMode = "reset"
 ) {
-  const midI = (board.minI + board.maxI) * 0.5;
-  const midJ = (board.minJ + board.maxJ) * 0.5;
   const margin = cascadeSourceMargin(scale);
   const inset = max(1, max(1, round(scale) || 1));
   const onBoard = spawnMode === "initial";
-
-  let startI;
-  let startJ;
-
-  if (prefer.di < 0) {
-    startI = onBoard
-      ? board.maxI - inset
-      : board.maxI + margin;
-  } else if (prefer.di > 0) {
-    startI = onBoard
-      ? board.minI + inset
-      : board.minI - margin;
-  } else {
-    startI = round(midI);
-  }
-
-  if (prefer.dj < 0) {
-    startJ = onBoard
-      ? board.maxJ - inset
-      : board.maxJ + margin;
-  } else if (prefer.dj > 0) {
-    startJ = onBoard
-      ? board.minJ + inset
-      : board.minJ - margin;
-  } else {
-    startJ = round(midJ);
-  }
-
-  const perpI =
-    layout ? layout.perpI : -prefer.dj;
-
-  const perpJ =
-    layout ? layout.perpJ : prefer.di;
-
   const lanes = max(1, laneCount);
+
+  if (!onBoard) {
+    const range =
+      layout
+        ? {
+            travelMin: layout.travelMin,
+            travelMax: layout.travelMax,
+            perpMin: layout.perpMin,
+            perpMax: layout.perpMax
+          }
+        : getBoardTravelRange(board, prefer);
+
+    const laneT =
+      lanes <= 1
+        ? 0.5
+        : constrain(
+            laneIndex / (lanes - 1),
+            0,
+            1
+          );
+
+    const perp =
+      range.perpMin +
+      laneT * (range.perpMax - range.perpMin);
+
+    /*
+     * Keep recycled cubes on the source lip so the
+     * next hop can enter the frame. Deep stacking
+     * behind the board starved the stream.
+     */
+    const travel =
+      range.travelMin - margin;
+
+    const cell =
+      latticeFromTravelPerp(
+        travel,
+        perp,
+        prefer
+      );
+
+    return { i: cell[0], j: cell[1] };
+  }
+
+  /* spacing is in travel / perp score units */
+  const range = getBoardTravelRange(board, prefer);
   const lane = laneIndex - (lanes - 1) * 0.5;
 
   const laneSpacing =
     layout
       ? layout.laneSpacing
-      : max(
-          1,
-          ((board.maxI - board.minI) +
-            (board.maxJ - board.minJ)) *
-            0.08
-        );
+      : (range.perpMax - range.perpMin) * 0.16;
 
   const stepSpacing =
     layout
       ? max(1, layout.stepSpacing)
-      : 5.4;
+      : 10.8;
 
-  /*
-   * Prefer at least one base cell between lanes when
-   * possible so resets don't snap on top of each other.
-   */
-  const laneStep = max(laneSpacing, lanes > 12 ? 0.65 : 1);
-
-  startI = round(startI + perpI * lane * laneStep);
-  startJ = round(startJ + perpJ * lane * laneStep);
-
+  const laneStep = max(laneSpacing, lanes > 12 ? 1.3 : 2);
   const depth = max(0, depthIndex);
 
-  if (onBoard) {
-    /*
-     * Initial stream: stack from the source edge into
-     * the frame so cubes are visible right away.
-     */
-    startI = round(startI + prefer.di * depth * stepSpacing);
-    startJ = round(startJ + prefer.dj * depth * stepSpacing);
-  } else {
-    /*
-     * Resets: stack further off-board along the source
-     * side so re-entries don't pop in mid-frame.
-     */
-    startI = round(startI - prefer.di * depth * stepSpacing);
-    startJ = round(startJ - prefer.dj * depth * stepSpacing);
-  }
+  const cell = latticeFromTravelPerp(
+    range.travelMin + inset + depth * stepSpacing,
+    (range.perpMin + range.perpMax) * 0.5 +
+      lane * laneStep,
+    prefer
+  );
 
-  return { i: startI, j: startJ };
+  return { i: cell[0], j: cell[1] };
 }
 
 function getCascadeTravelExtremes(net, prefer) {
@@ -8105,62 +9843,34 @@ function advanceCascadeTraveler(traveler, settings) {
 function cascadeTravelerOffBoard(traveler, settings) {
   const board = getVisibleFaceBoard(settings);
   const scale = max(1, traveler.scale || 1);
-  const margin = 3 * scale;
-  const footprint = expandCellsToFootprint(
-    traveler.cells,
-    scale
-  );
+  const prefer = traveler.prefer;
+  const range = getBoardTravelRange(board, prefer);
+  const trailing =
+    traveler.net &&
+    traveler.net.faces[traveler.trailingIndex];
 
-  let anyOn = false;
-
-  for (const cell of footprint) {
-    if (
-      cell[0] >= board.minI - margin &&
-      cell[0] <= board.maxI + margin &&
-      cell[1] >= board.minJ - margin &&
-      cell[1] <= board.maxJ + margin
-    ) {
-      anyOn = true;
-      break;
-    }
-  }
-
-  if (!anyOn) {
-    return true;
+  if (!trailing) {
+    return false;
   }
 
   /*
-   * Past the exit side far enough that the trailing
-   * face has cleared the frame.
+   * Recycle only after the cube has passed the EXIT
+   * of the frame. Source-side hops must keep moving
+   * in — treating "anywhere off-board" as done was
+   * resetting cubes before they could re-enter.
    */
-  const trailing =
-    traveler.net.faces[traveler.trailingIndex];
-
-  const trailingBaseI = trailing.gridX * scale;
-  const trailingBaseJ = trailing.gridY * scale;
-
   const score =
     preferScore(
-      trailingBaseI,
-      trailingBaseJ,
-      traveler.prefer
+      trailing.gridX * scale,
+      trailing.gridY * scale,
+      prefer
     );
 
-  const exitScore = preferScore(
-    traveler.prefer.di > 0
-      ? board.maxI + margin
-      : traveler.prefer.di < 0
-        ? board.minI - margin
-        : (board.minI + board.maxI) * 0.5,
-    traveler.prefer.dj > 0
-      ? board.maxJ + margin
-      : traveler.prefer.dj < 0
-        ? board.minJ - margin
-        : (board.minJ + board.maxJ) * 0.5,
-    traveler.prefer
+  return (
+    score >
+    range.travelMax +
+      cascadeSourceMargin(scale)
   );
-
-  return score > exitScore;
 }
 
 function resetCascadeTravelerToStart(traveler, settings) {
@@ -8259,6 +9969,8 @@ function resetCascadeTravelerToStart(traveler, settings) {
   traveler.pauseTimer = 0;
   traveler.waitTimer = 0;
   traveler.waitDelay = 0;
+
+  tryBeginCascadeUnfold(traveler, settings);
 }
 
 function cascadeCellsOverlap(
@@ -8363,6 +10075,7 @@ function drawCascadeNets(settings) {
         useOriginAsPlant: true,
         drapeAmount: 0,
         cubeScale: scale,
+        colorKey: traveler,
         motionCurve: settings.cascadeMotionCurve
       }
     );
@@ -9753,13 +11466,42 @@ function getVisibleFaceBoard(settings) {
     }
   }
 
+  /*
+   * The i/j box overshoots the screen a lot along the
+   * isometric diagonals; travel ranges use the real
+   * screen corners in lattice units instead.
+   */
+  const screenCorners = [
+    [-width * 0.5, -height * 0.5],
+    [width * 0.5, -height * 0.5],
+    [-width * 0.5, height * 0.5],
+    [width * 0.5, height * 0.5]
+  ].map(([sx, sy]) => {
+    const world =
+      screenToUnfoldedRootOrigin(sx, sy, settings);
+
+    return [world.x / size, world.z / size];
+  });
+
   return {
     minI,
     maxI,
     minJ,
     maxJ,
-    cells
+    cells,
+    screenCorners
   };
+}
+
+function getBoardTravelCorners(board) {
+  return (
+    board.screenCorners || [
+      [board.minI, board.minJ],
+      [board.minI, board.maxJ],
+      [board.maxI, board.minJ],
+      [board.maxI, board.maxJ]
+    ]
+  );
 }
 
 function parseCoordinateKey(key) {
@@ -9905,7 +11647,8 @@ function drawNet(
       staggeredProgress,
       foldMode,
       creaseSeed,
-      motionCurve
+      motionCurve,
+      options.oneSideNearestFirst
     );
 
   const creaseDepth =
@@ -9978,9 +11721,26 @@ function drawNet(
   const baseColor =
     color(netColor);
 
+  /* sealed with the inside facing in (not inverted) */
+  const insideHidden = options.insideOutFlow
+    ? staggeredProgress <= 0.001
+    : !options.invertFold && staggeredProgress >= 0.999;
+
+  const shuffleMoment =
+    SHUFFLE_SWAP_WHEN_FLAT.has(settings.sketchMode)
+      ? staggeredProgress <= 0.001
+      : insideHidden;
+
   const innerBaseColor =
+    !options.singleSided &&
     isTwoToneColorMode(settings.colorMode)
-      ? color(settings.innerColor)
+      ? color(
+          getInnerColorFor(
+            options.colorKey ?? creaseSeed,
+            shuffleMoment,
+            settings
+          )
+        )
       : null;
 
   const multiOuter =
@@ -9989,11 +11749,26 @@ function drawNet(
   const rootNormal =
     transforms[activeNet.rootIndex].normal;
 
+  const drawOrder = [];
+
   for (
     let faceIndex = 0;
     faceIndex < activeNet.faces.length;
     faceIndex++
   ) {
+    drawOrder.push({
+      faceIndex,
+      dist: getFaceViewerDistance(
+        transforms[faceIndex].center
+      )
+    });
+  }
+
+  drawOrder.sort((a, b) => b.dist - a.dist);
+
+  for (let order = 0; order < drawOrder.length; order++) {
+    const faceIndex = drawOrder[order].faceIndex;
+
     /*
      * Faces still coplanar with the plant share the
      * net's overall fold progress for shading. That
@@ -10044,7 +11819,16 @@ function drawNet(
       shadeProgress,
       settings,
       innerBaseColor,
-      edgeSize
+      edgeSize,
+      false,
+      order,
+      getSharedEdgeOverlap(
+        activeNet,
+        faceIndex,
+        edgeSize,
+        creaseProgress[faceIndex],
+        settings
+      )
     );
   }
 }
@@ -10206,7 +11990,8 @@ function getFaceFoldProgress(
   globalProgress,
   foldMode,
   foldSeed = 0,
-  motionCurve = "ease"
+  motionCurve = "ease",
+  nearestFirst = false
 ) {
   const count = net.faces.length;
   const progress =
@@ -10231,7 +12016,8 @@ function getFaceFoldProgress(
     return getOneSideFoldProgress(
       net,
       globalProgress,
-      motionCurve
+      motionCurve,
+      nearestFirst
     );
   }
 
@@ -10312,7 +12098,8 @@ function getFaceFoldProgress(
 function getOneSideFoldProgress(
   net,
   globalProgress,
-  motionCurve = "ease"
+  motionCurve = "ease",
+  nearestFirst = false
 ) {
   const count = net.faces.length;
   const progress =
@@ -10344,7 +12131,14 @@ function getOneSideFoldProgress(
 
   folding.sort((a, b) => {
     if (a.depth !== b.depth) {
-      return b.depth - a.depth;
+      /*
+       * Nearest-first: sides fold up from the planted
+       * bottom, lid last. Unfolding then opens the
+       * top first instead of tipping the whole cube.
+       */
+      return nearestFirst
+        ? a.depth - b.depth
+        : b.depth - a.depth;
     }
 
     return a.index - b.index;
@@ -10727,6 +12521,72 @@ function createChildTransform(
   };
 }
 
+function getSharedEdgeOverlap(
+  net,
+  faceIndex,
+  faceSize,
+  progress,
+  settings = null
+) {
+  const extras = {
+    px: 0,
+    nx: 0,
+    py: 0,
+    ny: 0
+  };
+
+  /*
+   * Only enough overlap to hide antialiasing seams.
+   * Anything past ~half a screen pixel shows as faces
+   * poking out past their hinges.
+   */
+  const worldPerPixel =
+    settings && settings.verticalView && height > 0
+      ? (settings.verticalView * 2) / height
+      : 1;
+
+  const amount =
+    min(faceSize * 0.03, worldPerPixel * 0.5) *
+    Math.sin(
+      constrain(progress, 0, 1) * PI
+    );
+
+  if (amount <= 1e-6 || !net || !net.faces) {
+    return extras;
+  }
+
+  const face = net.faces[faceIndex];
+
+  if (!face) {
+    return extras;
+  }
+
+  for (const other of net.faces) {
+    if (other.index === face.index) {
+      continue;
+    }
+
+    const dx = other.gridX - face.gridX;
+    const dy = other.gridY - face.gridY;
+
+    if (abs(dx) + abs(dy) !== 1) {
+      continue;
+    }
+
+    if (dx === 1) {
+      extras.px = amount;
+    } else if (dx === -1) {
+      extras.nx = amount;
+    } else if (dy === 1) {
+      extras.py = amount;
+    } else if (dy === -1) {
+      extras.ny = amount;
+    }
+  }
+
+  return extras;
+}
+
 function drawConnectedFace(
   transform,
   baseColor,
@@ -10734,105 +12594,162 @@ function drawConnectedFace(
   settings,
   innerBaseColor = null,
   faceSize = null,
-  exactColor = false
+  exactColor = false,
+  depthRank = 0,
+  edgeOverlap = null,
+  edgeMask = null
 ) {
-  const half =
-    (faceSize == null
+  const resolvedFaceSize =
+    faceSize == null
       ? settings.faceSize
-      : faceSize) * 0.5;
+      : faceSize;
 
-  const u =
+  const extras = edgeOverlap || {
+    px: 0,
+    nx: 0,
+    py: 0,
+    ny: 0
+  };
+
+  const uPos =
     scaleVector(
       transform.u,
-      half
+      resolvedFaceSize * 0.5 + extras.px
     );
 
-  const v =
+  const uNeg =
+    scaleVector(
+      transform.u,
+      resolvedFaceSize * 0.5 + extras.nx
+    );
+
+  const vPos =
     scaleVector(
       transform.v,
-      half
+      resolvedFaceSize * 0.5 + extras.py
+    );
+
+  const vNeg =
+    scaleVector(
+      transform.v,
+      resolvedFaceSize * 0.5 + extras.ny
     );
 
   const corners = [
     addVectors(
       addVectors(
         transform.center,
-        scaleVector(u, -1)
+        scaleVector(uNeg, -1)
       ),
-      scaleVector(v, -1)
+      scaleVector(vNeg, -1)
     ),
 
     addVectors(
       addVectors(
         transform.center,
-        u
+        uPos
       ),
-      scaleVector(v, -1)
+      scaleVector(vNeg, -1)
     ),
 
     addVectors(
       addVectors(
         transform.center,
-        u
+        uPos
       ),
-      v
+      vPos
     ),
 
     addVectors(
       addVectors(
         transform.center,
-        scaleVector(u, -1)
+        scaleVector(uNeg, -1)
       ),
-      v
+      vPos
     )
   ];
 
   const normal =
     normalizeVector(transform.normal);
 
-  const separation = 0.12;
   const needsInner = Boolean(innerBaseColor);
 
-  const outerCorners =
-    offsetCorners(
-      corners,
-      normal,
-      needsInner ? separation : 0
+  const toCamera =
+    subtractVectors(
+      getIsometricEyePosition(),
+      transform.center
     );
 
-  drawFaceSide(
-    outerCorners,
-    baseColor,
-    normal,
-    progress,
-    settings,
-    true,
-    exactColor
-  );
+  const outwardFacing =
+    dotVectors(normal, toCamera) > 0;
+
+  const outerCorners = corners;
+  const inward = scaleVector(normal, -1);
+  const innerCorners =
+    needsInner
+      ? corners.slice().reverse()
+      : null;
+
+  const viewerBias =
+    constrain(
+      map(
+        getFaceViewerDistance(transform.center),
+        1600,
+        3200,
+        -36,
+        0
+      ),
+      -48,
+      0
+    ) -
+    depthRank * 3;
+
+  const closerBias =
+    viewerBias - 6;
 
   if (!needsInner) {
+    drawFaceSide(
+      outerCorners,
+      baseColor,
+      normal,
+      progress,
+      settings,
+      true,
+      exactColor,
+      closerBias,
+      edgeMask
+    );
     return;
   }
 
-  const inward =
-    scaleVector(normal, -1);
-
-  const innerCorners =
-    offsetCorners(
-      corners.slice().reverse(),
-      inward,
-      separation
+  /*
+   * Keep inner/outer on the same plane so creases
+   * stay sealed. Draw only the shell facing the
+   * camera so they never z-fight.
+   */
+  if (outwardFacing) {
+    drawFaceSide(
+      outerCorners,
+      baseColor,
+      normal,
+      progress,
+      settings,
+      true,
+      exactColor,
+      closerBias
     );
-
-  drawFaceSide(
-    innerCorners,
-    innerBaseColor,
-    inward,
-    progress,
-    settings,
-    false,
-    exactColor
-  );
+  } else {
+    drawFaceSide(
+      innerCorners,
+      innerBaseColor,
+      inward,
+      progress,
+      settings,
+      false,
+      exactColor,
+      closerBias
+    );
+  }
 }
 
 function offsetCorners(corners, direction, amount) {
@@ -10858,7 +12775,9 @@ function drawFaceSide(
   progress,
   settings,
   drawStroke,
-  exactColor = false
+  exactColor = false,
+  depthBias = 0,
+  edgeMask = null
 ) {
   const faceColor =
     exactColor || !settings.showFaceShading
@@ -10871,16 +12790,19 @@ function drawFaceSide(
         );
 
   fill(faceColor);
+  beginCloserFaceDepthBias(depthBias);
 
   if (!drawStroke) {
     noStroke();
     drawFaceQuad(corners);
+    endCloserFaceDepthBias();
     return;
   }
 
   if (!settings.showDivisions) {
     noStroke();
     drawFaceQuad(corners);
+    endCloserFaceDepthBias();
     return;
   }
 
@@ -10904,7 +12826,11 @@ function drawFaceSide(
     const a = corners[i];
     const b = corners[(i + 1) % corners.length];
 
-    if (
+    if (edgeMask) {
+      if (!edgeMask[i]) {
+        continue;
+      }
+    } else if (
       filter !== "all" &&
       !edgeMatchesDivisionFilter(
         edgeScreenFamily(a, b),
@@ -10923,6 +12849,8 @@ function drawFaceSide(
       b[2]
     );
   }
+
+  endCloserFaceDepthBias();
 }
 
 function drawFaceQuad(corners) {
