@@ -20,10 +20,43 @@ const PALETTE = [
 
 const OUTER_COLOR = "#032932";
 
+const PAGE_BACKGROUND_LIGHT =
+  "#FEF9F3";
+
+// Non-logo exterior shell when colorful insides are on (matches face PNG bg).
+const SHELL_EXTERIOR_COLOR =
+  PAGE_BACKGROUND_LIGHT;
+
+const DARK_MODE_SHELL_COLOR =
+  "#012131";
+const DARK_MODE_PAGE_BACKGROUND =
+  PAGE_BACKGROUND_LIGHT;
+const PAGE_BACKGROUND_DARK =
+  "#08303A";
+
+/*
+ * Slightly lower isometric tilt + vertical stretch so square
+ * face art reads taller on screen (less “squashed” at this angle).
+ */
+const ISO_ELEVATION_DENOM = 1.72;
+const ISO_VERTICAL_STRETCH = 1.05;
+
+const PANEL_FACE_SEPARATION = 0.28;
+
+// Tiny in-plane grow for folded cream shell panels (not logo PNGs).
+const FOLDED_SOLID_PLANE_EXPAND = 1.004;
+
 // Inner random picks exclude the exterior teal so faces read clearly.
 const INNER_PALETTE = PALETTE.filter(
   hex => hex !== OUTER_COLOR
 );
+
+const INNER_PALETTE_EXCLUDED_DARKS = [
+  "#032932",
+  "#03323C",
+  "#0A4552",
+  "#235C58"
+];
 
 // 11 cube nets
 const CUBE_NETS = [
@@ -54,6 +87,12 @@ const CUBE_NETS = [
     top: "a.png",
     left: "g.png",
     right: "m.png"
+  };
+
+  const DARK_FACE_IMAGES = {
+    top: "A-darkbg.png",
+    left: "G-darkbg.png",
+    right: "M-darkbg.png"
   };
   
   // ============================================================
@@ -120,6 +159,27 @@ const CUBE_NETS = [
   
   let animationState = "foldedHold";
   let stateStartTime = 0;
+  let unfoldStateElapsed = 0;
+
+  let logoExporting = false;
+  const LOGO_EXPORT_FPS = 30;
+
+  const LOGO_EXPORT_AVC_LEVELS = [
+    {
+      codec: "avc1.42001f",
+      maxCodedArea: 921600
+    },
+    {
+      codec: "avc1.420028",
+      maxCodedArea: 2097152
+    },
+    {
+      codec: "avc1.420033",
+      maxCodedArea: 8912896
+    }
+  ];
+
+  let logoExportCaptureCanvas = null;
   
   let controls = {};
 
@@ -131,6 +191,11 @@ let panelInnerColors = [];
   
   function setup() {
     const container = document.getElementById("canvas-container");
+
+    setAttributes(
+      "preserveDrawingBuffer",
+      true
+    );
   
     const canvas = createCanvas(
       container.clientWidth,
@@ -145,6 +210,7 @@ let panelInnerColors = [];
   
     getControls();
     connectControls();
+    applyPageBackgroundTheme();
     updateModePanels();
   
     currentNet = prepareNet(CUBE_NETS[currentNetIndex]);
@@ -164,30 +230,53 @@ let panelInnerColors = [];
   // ============================================================
   
   function draw() {
-    background("#FEF9F3");
+    if (logoExporting) {
+      return;
+    }
+
+    renderLogoScene();
+  }
+
+  function renderLogoScene() {
+    background(
+      getPageBackgroundColor()
+    );
   
     const size = Number(controls.cubeSize.value);
   
     setIsometricCamera();
 
+    push();
+    applyIsometricVerticalStretch();
+
     if (isTripleMode()) {
-      TripleCubeMode.update();
+      if (!logoExporting) {
+        TripleCubeMode.update();
+      }
 
       if (controls.showGridTriple.checked) {
         drawGrid(size);
       }
 
       TripleCubeMode.draw(size);
+      pop();
       return;
     }
 
-    updateAnimation();
+    if (!logoExporting) {
+      updateAnimation();
+    }
   
     if (controls.showGrid.checked) {
       drawGrid(size);
     }
   
     drawCubeNet(currentNet, size, progress);
+    pop();
+  }
+
+  function applyIsometricVerticalStretch() {
+    scale(1, ISO_VERTICAL_STRETCH, 1);
   }
 
   function isTripleMode() {
@@ -212,9 +301,7 @@ let panelInnerColors = [];
       progress = 1;
   
       if (elapsed >= foldedPause) {
-        if (controls.randomInnerColors.checked) {
-          assignRandomInnerColors(currentNet.faces.length);
-        }
+        maybeRandomizeInnerColorsOnUnfold();
 
         animationState = "unfolding";
         stateStartTime = now;
@@ -226,7 +313,7 @@ let panelInnerColors = [];
     if (animationState === "unfolding") {
       const t = constrain(elapsed / moveDuration, 0, 1);
   
-      progress = 1 - smootherstep(t);
+      progress = 1 - applyMotionCurve(t);
   
       if (t >= 1) {
         progress = 0;
@@ -252,7 +339,7 @@ let panelInnerColors = [];
     if (animationState === "folding") {
       const t = constrain(elapsed / moveDuration, 0, 1);
   
-      progress = smootherstep(t);
+      progress = applyMotionCurve(t);
   
       if (t >= 1) {
         progress = 1;
@@ -264,6 +351,199 @@ let panelInnerColors = [];
         stateStartTime = now;
       }
     }
+  }
+
+  function resetUnfoldStateElapsed() {
+    unfoldStateElapsed = 0;
+  }
+
+  function advanceUnfoldAnimation(deltaSec) {
+    let remaining = deltaSec;
+
+    while (remaining > 1e-9) {
+      remaining -=
+        stepUnfoldAnimationOnce(
+          remaining
+        );
+    }
+  }
+
+  function stepUnfoldAnimationOnce(dt) {
+    const speed =
+      Number(
+        controls.animationSpeed.value
+      );
+    const moveDuration =
+      1 / speed;
+    const foldedPause =
+      Number(
+        controls.foldedPause.value
+      );
+    const unfoldedPause =
+      Number(
+        controls.unfoldedPause.value
+      );
+
+    if (
+      animationState ===
+      "foldedHold"
+    ) {
+      progress = 1;
+
+      const need =
+        foldedPause -
+        unfoldStateElapsed;
+
+      if (dt < need) {
+        unfoldStateElapsed += dt;
+        return dt;
+      }
+
+      const used = need;
+
+      unfoldStateElapsed = 0;
+
+      maybeRandomizeInnerColorsOnUnfold();
+
+      animationState =
+        "unfolding";
+
+      if (dt - used <= 1e-9) {
+        return used;
+      }
+
+      return (
+        used +
+        stepUnfoldAnimationOnce(
+          dt - used
+        )
+      );
+    }
+
+    if (
+      animationState ===
+      "unfolding"
+    ) {
+      const after =
+        unfoldStateElapsed + dt;
+
+      if (
+        after <
+        moveDuration
+      ) {
+        unfoldStateElapsed =
+          after;
+
+        progress =
+          1 -
+          applyMotionCurve(
+            unfoldStateElapsed /
+              moveDuration
+          );
+
+        return dt;
+      }
+
+      const used =
+        moveDuration -
+        unfoldStateElapsed;
+
+      unfoldStateElapsed = 0;
+      progress = 0;
+      animationState =
+        "unfoldedHold";
+
+      if (dt - used <= 1e-9) {
+        return dt;
+      }
+
+      return (
+        used +
+        stepUnfoldAnimationOnce(
+          dt - used
+        )
+      );
+    }
+
+    if (
+      animationState ===
+      "unfoldedHold"
+    ) {
+      progress = 0;
+
+      const need =
+        unfoldedPause -
+        unfoldStateElapsed;
+
+      if (dt < need) {
+        unfoldStateElapsed += dt;
+        return dt;
+      }
+
+      const used = need;
+
+      unfoldStateElapsed = 0;
+      animationState =
+        "folding";
+
+      if (dt - used <= 1e-9) {
+        return used;
+      }
+
+      return (
+        used +
+        stepUnfoldAnimationOnce(
+          dt - used
+        )
+      );
+    }
+
+    if (
+      animationState ===
+      "folding"
+    ) {
+      const after =
+        unfoldStateElapsed + dt;
+
+      if (
+        after <
+        moveDuration
+      ) {
+        unfoldStateElapsed =
+          after;
+
+        progress =
+          applyMotionCurve(
+            unfoldStateElapsed /
+              moveDuration
+          );
+
+        return dt;
+      }
+
+      const used =
+        moveDuration -
+        unfoldStateElapsed;
+
+      unfoldStateElapsed = 0;
+      progress = 1;
+      chooseNewNet();
+      animationState =
+        "foldedHold";
+
+      if (dt - used <= 1e-9) {
+        return dt;
+      }
+
+      return (
+        used +
+        stepUnfoldAnimationOnce(
+          dt - used
+        )
+      );
+    }
+
+    return dt;
   }
   
   // ============================================================
@@ -542,9 +822,6 @@ let panelInnerColors = [];
         foldedTransform.normal
       );
   
-    const separation =
-      0.3;
-  
     const useRandomInner =
       controls.randomInnerColors.checked;
 
@@ -553,9 +830,28 @@ let panelInnerColors = [];
 
     const exteriorColor =
       useRandomInner
-        ? OUTER_COLOR
+        ? getShellExteriorColor()
         : insideColor;
-  
+
+    const outwardDirection =
+      normalizeVector(
+        foldedTransform.center
+      );
+
+    const positiveSideIsExterior =
+      dotVectors(
+        foldedNormal,
+        outwardDirection
+      ) >= 0;
+
+    const image =
+      role
+        ? faceImages[role]
+        : null;
+
+    const separation =
+      PANEL_FACE_SEPARATION;
+
     // Material side along +normal.
     const positiveSide =
       offsetCorners(
@@ -575,25 +871,26 @@ let panelInnerColors = [];
         separation
       );
   
-    const image =
-      role
-        ? faceImages[role]
-        : null;
-  
-    // Non-logo panels: exterior teal, interior colored.
+    const foldedSeamFix =
+      shouldUseFoldedSeamFix(
+        useRandomInner
+      );
+
+    // Non-logo panels: exterior shell + interior color.
     if (!image) {
-      const outwardDirection =
-        normalizeVector(
-          foldedTransform.center
+      if (foldedSeamFix) {
+        const exteriorCorners =
+          positiveSideIsExterior
+            ? positiveSide
+            : negativeSide;
+
+        drawFoldedExteriorSolid(
+          exteriorCorners,
+          exteriorColor
         );
+      }
 
-      const positiveSideIsExterior =
-        dotVectors(
-          foldedNormal,
-          outwardDirection
-        ) >= 0;
-
-      if (positiveSideIsExterior) {
+      else if (positiveSideIsExterior) {
         drawSolidFace(
           positiveSide,
           exteriorColor
@@ -628,17 +925,22 @@ let panelInnerColors = [];
     //
     // It does NOT change during animation.
     //
-    const outwardDirection =
-      normalizeVector(
-        foldedTransform.center
+    if (foldedSeamFix) {
+      const exteriorCorners =
+        positiveSideIsExterior
+          ? positiveSide
+          : negativeSide;
+
+      drawTexturedFace(
+        exteriorCorners,
+        image,
+        role,
+        foldedTransform
       );
-  
-    const positiveSideIsExterior =
-      dotVectors(
-        foldedNormal,
-        outwardDirection
-      ) >= 0;
-  
+
+      return;
+    }
+
     if (positiveSideIsExterior) {
       // OUTSIDE = PNG
       drawTexturedFace(
@@ -671,17 +973,152 @@ let panelInnerColors = [];
       );
     }
   }
-  
+
+  function shouldUseFoldedSeamFix(
+    useRandomInner
+  ) {
+    if (!useRandomInner) {
+      return false;
+    }
+
+    if (progress < 0.998) {
+      return false;
+    }
+
+    return (
+      animationState ===
+        "foldedHold" ||
+      animationState ===
+        "folding" ||
+      animationState ===
+        "unfolding"
+    );
+  }
+
+  function drawFoldedExteriorSolid(
+    exteriorCorners,
+    exteriorColor
+  ) {
+    drawSolidFace(
+      expandCornersInPlane(
+        exteriorCorners,
+        FOLDED_SOLID_PLANE_EXPAND
+      ),
+      exteriorColor
+    );
+  }
+
   // ============================================================
   // INNER COLORS
   // ============================================================
+
+  function maybeRandomizeInnerColorsOnUnfold() {
+    if (
+      !controls.randomInnerColors.checked
+    ) {
+      return;
+    }
+
+    assignRandomInnerColors(
+      currentNet.faces.length
+    );
+  }
+
+  function shuffleArray(items) {
+    const array =
+      items.slice();
+
+    for (
+      let i =
+        array.length - 1;
+      i > 0;
+      i--
+    ) {
+      const j =
+        floor(
+          random(
+            i + 1
+          )
+        );
+      const swap =
+        array[i];
+
+      array[i] =
+        array[j];
+      array[j] =
+        swap;
+    }
+
+    return array;
+  }
+
+  function createVariationSeed(
+    index
+  ) {
+    return (
+      (Date.now() ^
+        Math.imul(
+          index + 1,
+          2654435761
+        )) >>>
+      0
+    );
+  }
+
+  function randomizeInnerLayout() {
+    controls.randomInnerColors.checked =
+      true;
+    updateInsideColorControl();
+
+    assignRandomInnerColors(
+      currentNet.faces.length
+    );
+
+    if (!logoExporting) {
+      restartAnimation();
+    }
+  }
+
+  function getActiveInnerPalette() {
+    let pool =
+      INNER_PALETTE.slice();
+
+    if (
+      controls
+        .excludeDarkTealsFromInner
+        .checked
+    ) {
+      const excluded =
+        new Set(
+          INNER_PALETTE_EXCLUDED_DARKS.map(
+            hex =>
+              hex.toUpperCase()
+          )
+        );
+
+      pool =
+        pool.filter(
+          hex =>
+            !excluded.has(
+              hex.toUpperCase()
+            )
+        );
+    }
+
+    if (!pool.length) {
+      pool =
+        INNER_PALETTE.slice();
+    }
+
+    return pool;
+  }
 
   function assignRandomInnerColors(
     panelCount
   ) {
     const shuffled =
-      shuffle(
-        INNER_PALETTE.slice()
+      shuffleArray(
+        getActiveInnerPalette()
       );
 
     panelInnerColors =
@@ -1222,7 +1659,7 @@ let panelInnerColors = [];
       result[
         sequence[slot].index
       ] =
-        smootherstep(
+        applyMotionCurve(
           constrain(
             local,
             0,
@@ -1735,7 +2172,7 @@ let panelInnerColors = [];
     const elevation =
       atan(
         1 /
-        sqrt(2)
+        ISO_ELEVATION_DENOM
       );
   
     const azimuth =
@@ -1916,6 +2353,40 @@ let panelInnerColors = [];
       img;
   }
   
+  function isDarkFaceMode() {
+    return Boolean(
+      controls.darkFaceMode
+        ?.checked
+    );
+  }
+
+  function getDefaultFaceImagePaths() {
+    return isDarkFaceMode()
+      ? DARK_FACE_IMAGES
+      : DEFAULT_FACE_IMAGES;
+  }
+
+  function getShellExteriorColor() {
+    return isDarkFaceMode()
+      ? DARK_MODE_SHELL_COLOR
+      : SHELL_EXTERIOR_COLOR;
+  }
+
+  function applyDarkFaceMode() {
+    if (
+      typeof TripleCubeMode
+        .setDarkFaceArt ===
+      "function"
+    ) {
+      TripleCubeMode.setDarkFaceArt(
+        isDarkFaceMode()
+      );
+    }
+
+    loadDefaultFaceAssets();
+    applyPageBackgroundTheme();
+  }
+
   function loadDefaultFaceAssets() {
     for (
       const [
@@ -1926,7 +2397,7 @@ let panelInnerColors = [];
       of
   
       Object.entries(
-        DEFAULT_FACE_IMAGES
+        getDefaultFaceImagePaths()
       )
     ) {
       loadImage(
@@ -1990,8 +2461,71 @@ let panelInnerColors = [];
   // CONTROLS
   // ============================================================
   
+  function normalizePageBackgroundHex(
+    value
+  ) {
+    const raw = String(
+      value || PAGE_BACKGROUND_DARK
+    ).trim();
+
+    if (raw.startsWith("#")) {
+      return raw.toUpperCase();
+    }
+
+    return `#${raw.toUpperCase()}`;
+  }
+
+  function getPageBackgroundColor() {
+    if (isDarkFaceMode()) {
+      return DARK_MODE_PAGE_BACKGROUND;
+    }
+
+    const value =
+      controls.pageBackground
+        ? controls.pageBackground.value
+        : PAGE_BACKGROUND_DARK.replace(
+            "#",
+            ""
+          );
+
+    return normalizePageBackgroundHex(
+      value
+    );
+  }
+
+  function applyPageBackgroundTheme() {
+    const color =
+      getPageBackgroundColor();
+    const isDark =
+      color ===
+      PAGE_BACKGROUND_DARK;
+
+    document.body.classList.toggle(
+      "theme-dark",
+      isDark
+    );
+    document.body.classList.toggle(
+      "theme-light",
+      !isDark
+    );
+    document.body.style.background =
+      color;
+
+    const container =
+      document.getElementById(
+        "canvas-container"
+      );
+
+    if (container) {
+      container.style.background =
+        color;
+    }
+  }
+
   function getControls() {
     const ids = [
+      "pageBackground",
+      "darkFaceMode",
       "animationMode",
       "unfoldControls",
       "tripleControls",
@@ -2005,10 +2539,12 @@ let panelInnerColors = [];
   
       "insideColor",
       "randomInnerColors",
+      "excludeDarkTealsFromInner",
 
       "cubeSize",
       "cubeSizeValue",
   
+      "motionCurve",
       "animationSpeed",
       "animationSpeedValue",
   
@@ -2023,6 +2559,13 @@ let panelInnerColors = [];
   
       "showGrid",
       "showGridTriple",
+      "randomizeInnerLayoutButton",
+      "exportLoops",
+      "exportEstimate",
+      "exportVariations",
+      "exportVariationsButton",
+      "exportVideoButton",
+      "exportNote",
       "restartButton"
     ];
   
@@ -2038,6 +2581,20 @@ let panelInnerColors = [];
   }
   
   function connectControls() {
+    controls
+      .pageBackground
+      .addEventListener(
+        "change",
+        applyPageBackgroundTheme
+      );
+
+    controls
+      .darkFaceMode
+      .addEventListener(
+        "change",
+        applyDarkFaceMode
+      );
+
     controls
       .animationMode
       .addEventListener(
@@ -2104,6 +2661,21 @@ let panelInnerColors = [];
         }
       );
 
+    controls
+      .excludeDarkTealsFromInner
+      .addEventListener(
+        "change",
+        () => {
+          if (
+            controls.randomInnerColors.checked
+          ) {
+            assignRandomInnerColors(
+              currentNet.faces.length
+            );
+          }
+        }
+      );
+
     updateInsideColorControl();
 
     controls
@@ -2140,12 +2712,71 @@ let panelInnerColors = [];
         "input",
         updateLabels
       );
+
+    controls
+      .exportLoops
+      .addEventListener(
+        "input",
+        updateExportEstimate
+      );
+
+    controls
+      .motionCurve
+      .addEventListener(
+        "change",
+        updateExportEstimate
+      );
+
+    controls
+      .randomizeInnerLayoutButton
+      .addEventListener(
+        "click",
+        randomizeInnerLayout
+      );
+
+    controls
+      .exportVariationsButton
+      .addEventListener(
+        "click",
+        () => {
+          exportInnerColorVariations().catch(
+            error => {
+              console.error(error);
+              setExportNote(
+                `Export failed: ${error.message || error}`
+              );
+              logoExporting = false;
+              syncExportBusyUI();
+              loop();
+            }
+          );
+        }
+      );
   
     controls
       .restartButton
       .addEventListener(
         "click",
         restartAnimation
+      );
+
+    controls
+      .exportVideoButton
+      .addEventListener(
+        "click",
+        () => {
+          exportLogoVideo({}).catch(
+            error => {
+              console.error(error);
+              setExportNote(
+                `Export failed: ${error.message || error}`
+              );
+              logoExporting = false;
+              syncExportBusyUI();
+              loop();
+            }
+          );
+        }
       );
   }
   
@@ -2177,6 +2808,80 @@ let panelInnerColors = [];
       triple
         ? "Separated pause"
         : "Unfolded pause";
+
+    updateExportEstimate();
+  }
+
+  function getUnfoldCycleDuration() {
+    const moveDuration =
+      1 /
+      Number(
+        controls.animationSpeed.value
+      );
+
+    return (
+      Number(
+        controls.foldedPause.value
+      ) +
+      Number(
+        controls.unfoldedPause.value
+      ) +
+      2 *
+        moveDuration
+    );
+  }
+
+  function getAnimationCycleDuration() {
+    if (isTripleMode()) {
+      return TripleCubeMode.getCycleDuration();
+    }
+
+    return getUnfoldCycleDuration();
+  }
+
+  function formatExportDuration(
+    seconds
+  ) {
+    if (seconds < 60) {
+      return `${seconds.toFixed(1)} s`;
+    }
+
+    const minutes =
+      Math.floor(
+        seconds / 60
+      );
+    const remainder =
+      seconds -
+      minutes * 60;
+
+    return `${minutes}m ${remainder.toFixed(0)}s`;
+  }
+
+  function updateExportEstimate() {
+    if (
+      !controls.exportLoops ||
+      !controls.exportEstimate
+    ) {
+      return;
+    }
+
+    const loops =
+      Math.max(
+        1,
+        Math.round(
+          Number(
+            controls.exportLoops.value
+          ) || 1
+        )
+      );
+
+    const cycle =
+      getAnimationCycleDuration();
+    const total =
+      loops * cycle;
+
+    controls.exportEstimate.textContent =
+      `${loops} loop${loops === 1 ? "" : "s"} · ${formatExportDuration(cycle)} per loop · ≈ ${formatExportDuration(total)} total`;
   }
 
   function updateLabels() {
@@ -2222,6 +2927,8 @@ let panelInnerColors = [];
             .revealedPause
             .value
         ).toFixed(1)}s`;
+
+    updateExportEstimate();
   }
   
   function restartAnimation() {
@@ -2240,7 +2947,9 @@ let panelInnerColors = [];
         ]
       );
 
-    if (controls.randomInnerColors.checked) {
+    if (
+      controls.randomInnerColors.checked
+    ) {
       assignRandomInnerColors(
         currentNet.faces.length
       );
@@ -2254,6 +2963,602 @@ let panelInnerColors = [];
   
     stateStartTime =
       millis();
+
+    resetUnfoldStateElapsed();
+  }
+
+  function setExportNote(text) {
+    controls.exportNote.textContent =
+      text || "";
+  }
+
+  function syncExportBusyUI() {
+    const busy = logoExporting;
+
+    controls.exportVideoButton.disabled =
+      busy;
+    controls.exportVariationsButton.disabled =
+      busy;
+    controls.randomizeInnerLayoutButton.disabled =
+      busy;
+    controls.restartButton.disabled =
+      busy;
+    controls.animationMode.disabled =
+      busy;
+  }
+
+  function getAvcCodedArea(
+    width,
+    height
+  ) {
+    const codedWidth =
+      (width + 15) & ~15;
+    const codedHeight =
+      (height + 15) & ~15;
+
+    return {
+      codedWidth,
+      codedHeight,
+      codedArea:
+        codedWidth *
+        codedHeight
+    };
+  }
+
+  function pickAvcCodecForSize(
+    width,
+    height
+  ) {
+    const codedArea =
+      getAvcCodedArea(
+        width,
+        height
+      ).codedArea;
+
+    for (
+      const level of
+        LOGO_EXPORT_AVC_LEVELS
+    ) {
+      if (
+        codedArea <=
+        level.maxCodedArea
+      ) {
+        return level.codec;
+      }
+    }
+
+    return LOGO_EXPORT_AVC_LEVELS[
+      LOGO_EXPORT_AVC_LEVELS.length -
+        1
+    ].codec;
+  }
+
+  function fitLogoExportDimensions(
+    width,
+    height
+  ) {
+    const maxCodedArea =
+      LOGO_EXPORT_AVC_LEVELS[
+        LOGO_EXPORT_AVC_LEVELS.length -
+          1
+      ].maxCodedArea;
+
+    let encodeWidth =
+      Math.max(
+        2,
+        width & ~1
+      );
+    let encodeHeight =
+      Math.max(
+        2,
+        height & ~1
+      );
+
+    while (
+      getAvcCodedArea(
+        encodeWidth,
+        encodeHeight
+      ).codedArea >
+      maxCodedArea
+    ) {
+      encodeWidth =
+        Math.max(
+          2,
+          Math.floor(
+            encodeWidth * 0.95
+          ) & ~1
+        );
+      encodeHeight =
+        Math.max(
+          2,
+          Math.floor(
+            encodeHeight * 0.95
+          ) & ~1
+        );
+    }
+
+    return {
+      encodeWidth,
+      encodeHeight
+    };
+  }
+
+  async function configureLogoVideoEncoder(
+    encoder,
+    encodeWidth,
+    encodeHeight,
+    fps
+  ) {
+    const codec =
+      pickAvcCodecForSize(
+        encodeWidth,
+        encodeHeight
+      );
+    const config = {
+      codec,
+      width: encodeWidth,
+      height: encodeHeight,
+      bitrate: 8_000_000,
+      framerate: fps
+    };
+
+    if (
+      typeof VideoEncoder
+        .isConfigSupported ===
+      "function"
+    ) {
+      const codecsToTry = [
+        codec,
+        ...LOGO_EXPORT_AVC_LEVELS
+          .map(
+            level => level.codec
+          )
+          .filter(
+            candidate =>
+              candidate !== codec
+          )
+      ];
+
+      for (
+        const candidate of
+          codecsToTry
+      ) {
+        const candidateConfig =
+          {
+            ...config,
+            codec: candidate
+          };
+        const support =
+          await VideoEncoder.isConfigSupported(
+            candidateConfig
+          );
+
+        if (support.supported) {
+          encoder.configure(
+            support.config ||
+              candidateConfig
+          );
+          return;
+        }
+      }
+    }
+
+    encoder.configure(config);
+  }
+
+  function getLogoExportCaptureCanvas(
+    width,
+    height
+  ) {
+    if (
+      !logoExportCaptureCanvas
+    ) {
+      logoExportCaptureCanvas =
+        document.createElement(
+          "canvas"
+        );
+    }
+
+    if (
+      logoExportCaptureCanvas.width !==
+        width ||
+      logoExportCaptureCanvas.height !==
+        height
+    ) {
+      logoExportCaptureCanvas.width =
+        width;
+      logoExportCaptureCanvas.height =
+        height;
+    }
+
+    return logoExportCaptureCanvas;
+  }
+
+  function getWebGLCanvasElement() {
+    const fromContext =
+      drawingContext &&
+      drawingContext.canvas;
+
+    if (
+      fromContext &&
+      typeof fromContext.getContext ===
+        "function"
+    ) {
+      return fromContext;
+    }
+
+    const fromDom =
+      document.querySelector(
+        "#canvas-container canvas"
+      );
+
+    return fromDom || fromContext;
+  }
+
+  function copyWebGLFrameToCapture(
+    sourceCanvas,
+    width,
+    height
+  ) {
+    const capture =
+      getLogoExportCaptureCanvas(
+        width,
+        height
+      );
+
+    if (drawingContext?.finish) {
+      drawingContext.finish();
+    }
+
+    const ctx =
+      capture.getContext("2d");
+
+    ctx.fillStyle =
+      getPageBackgroundColor();
+    ctx.fillRect(
+      0,
+      0,
+      width,
+      height
+    );
+    ctx.drawImage(
+      sourceCanvas,
+      0,
+      0,
+      width,
+      height
+    );
+
+    return capture;
+  }
+
+  async function encodeLogoVideoFrame(
+    encoder,
+    sourceCanvas,
+    frameIndex,
+    fps,
+    encodeWidth,
+    encodeHeight
+  ) {
+    const capture =
+      copyWebGLFrameToCapture(
+        sourceCanvas,
+        encodeWidth,
+        encodeHeight
+      );
+    const frameDuration =
+      Math.round(
+        1_000_000 / fps
+      );
+    const timestamp =
+      frameIndex *
+      frameDuration;
+    const videoFrame =
+      new VideoFrame(
+        capture,
+        {
+          timestamp,
+          duration: frameDuration
+        }
+      );
+
+    while (
+      encoder.encodeQueueSize > 24
+    ) {
+      await new Promise(resolve => {
+        setTimeout(resolve, 0);
+      });
+    }
+
+    encoder.encode(videoFrame, {
+      keyFrame:
+        frameIndex % fps === 0
+    });
+    videoFrame.close();
+  }
+
+  async function exportLogoVideo(
+    options = {}
+  ) {
+    if (logoExporting) {
+      return;
+    }
+
+    if (
+      typeof VideoEncoder ===
+        "undefined" ||
+      typeof Mp4Muxer ===
+        "undefined"
+    ) {
+      setExportNote(
+        "Video export needs a browser with WebCodecs (Chrome or Edge)."
+      );
+      return;
+    }
+
+    const loops =
+      Math.max(
+        1,
+        Math.round(
+          Number(
+            controls.exportLoops.value
+          ) || 1
+        )
+      );
+
+    const cycleDuration =
+      getAnimationCycleDuration();
+    const duration =
+      loops * cycleDuration;
+
+    const fps = LOGO_EXPORT_FPS;
+    const totalFrames =
+      Math.max(
+        1,
+        Math.ceil(
+          duration * fps
+        )
+      );
+    const dt = 1 / fps;
+
+    const downloadName =
+      options.downloadName ||
+      `logo-animation-${loops}loops.mp4`;
+
+    logoExporting = true;
+    syncExportBusyUI();
+    noLoop();
+
+    restartAnimation();
+
+    const sourceCanvas =
+      getWebGLCanvasElement();
+
+    if (
+      !sourceCanvas ||
+      typeof sourceCanvas.getContext !==
+        "function"
+    ) {
+      throw new Error(
+        "Could not read WebGL canvas for export."
+      );
+    }
+    const fitted =
+      fitLogoExportDimensions(
+        sourceCanvas.width,
+        sourceCanvas.height
+      );
+    const encodeWidth =
+      fitted.encodeWidth;
+    const encodeHeight =
+      fitted.encodeHeight;
+
+    const muxer =
+      new Mp4Muxer.Muxer({
+        target:
+          new Mp4Muxer.ArrayBufferTarget(),
+        video: {
+          codec: "avc",
+          width: encodeWidth,
+          height: encodeHeight
+        },
+        fastStart: "in-memory"
+      });
+
+    let encoderError = null;
+
+    const encoder =
+      new VideoEncoder({
+        output: (
+          chunk,
+          meta
+        ) => {
+          muxer.addVideoChunk(
+            chunk,
+            meta
+          );
+        },
+
+        error: error => {
+          encoderError = error;
+        }
+      });
+
+    await configureLogoVideoEncoder(
+      encoder,
+      encodeWidth,
+      encodeHeight,
+      fps
+    );
+
+    try {
+      for (
+        let frame = 0;
+        frame < totalFrames;
+        frame++
+      ) {
+        if (encoderError) {
+          throw encoderError;
+        }
+
+        if (
+          encoder.state ===
+          "closed"
+        ) {
+          throw new Error(
+            "Video encoder closed unexpectedly."
+          );
+        }
+
+        renderLogoScene();
+
+        await encodeLogoVideoFrame(
+          encoder,
+          sourceCanvas,
+          frame,
+          fps,
+          encodeWidth,
+          encodeHeight
+        );
+
+        if (frame < totalFrames - 1) {
+          if (isTripleMode()) {
+            TripleCubeMode.advance(dt);
+          } else {
+            advanceUnfoldAnimation(dt);
+          }
+        }
+
+        if (
+          frame === 0 ||
+          frame ===
+            totalFrames - 1 ||
+          frame %
+            fps ===
+            0
+        ) {
+          setExportNote(
+            `Encoding ${frame + 1} / ${totalFrames} frames…`
+          );
+        }
+
+        if (
+          frame %
+            15 ===
+          14
+        ) {
+          await new Promise(
+            resolve => {
+              setTimeout(
+                resolve,
+                0
+              );
+            }
+          );
+        }
+      }
+
+      if (encoderError) {
+        throw encoderError;
+      }
+
+      await encoder.flush();
+      muxer.finalize();
+
+      const blob =
+        new Blob(
+          [
+            muxer.target.buffer
+          ],
+          {
+            type: "video/mp4"
+          }
+        );
+
+      const url =
+        URL.createObjectURL(
+          blob
+        );
+      const link =
+        document.createElement(
+          "a"
+        );
+
+      link.href = url;
+      link.download = downloadName;
+      link.click();
+      URL.revokeObjectURL(url);
+
+      if (!options.silentNote) {
+        setExportNote(
+          `Saved ${loops} loop${loops === 1 ? "" : "s"} · ${formatExportDuration(duration)} · ${encodeWidth}×${encodeHeight} · ${fps} fps.`
+        );
+      }
+
+      return {
+        loops,
+        duration,
+        encodeWidth,
+        encodeHeight,
+        fps
+      };
+    } finally {
+      if (encoder.state !== "closed") {
+        encoder.close();
+      }
+
+      logoExporting = false;
+      syncExportBusyUI();
+      loop();
+    }
+  }
+
+  async function exportInnerColorVariations() {
+    if (isTripleMode()) {
+      setExportNote(
+        "Color variation export is for cube unfold mode."
+      );
+      return;
+    }
+
+    const count =
+      Math.max(
+        1,
+        Math.round(
+          Number(
+            controls.exportVariations.value
+          ) || 4
+        )
+      );
+
+    for (
+      let index = 0;
+      index < count;
+      index++
+    ) {
+      setExportNote(
+        `Exporting color variation ${index + 1} / ${count}…`
+      );
+
+      randomSeed(
+        createVariationSeed(
+          index
+        )
+      );
+
+      await exportLogoVideo({
+        downloadName: `logo-animation-colors-${index + 1}.mp4`,
+        silentNote: true
+      });
+    }
+
+    randomSeed(
+      Date.now()
+    );
+
+    setExportNote(
+      `Saved ${count} color variation${count === 1 ? "" : "s"} · ${count}× ${controls.exportLoops.value} loop(s) each.`
+    );
   }
   
   // ============================================================
@@ -2488,6 +3793,44 @@ let panelInnerColors = [];
     );
   }
   
+  function expandCornersInPlane(
+    corners,
+    scale
+  ) {
+    const center = [
+      0,
+      0,
+      0
+    ];
+
+    for (
+      const point
+      of corners
+    ) {
+      center[0] += point[0];
+      center[1] += point[1];
+      center[2] += point[2];
+    }
+
+    center[0] /= 4;
+    center[1] /= 4;
+    center[2] /= 4;
+
+    return corners.map(
+      point =>
+        addVectors(
+          center,
+          scaleVector(
+            subtractVectors(
+              point,
+              center
+            ),
+            scale
+          )
+        )
+    );
+  }
+
   function offsetCorners(
     corners,
     direction,
@@ -2511,6 +3854,35 @@ let panelInnerColors = [];
     );
   }
   
+  function applyMotionCurve(
+    value
+  ) {
+    const t =
+      constrain(
+        value,
+        0,
+        1
+      );
+    const mode =
+      controls.motionCurve
+        ? controls.motionCurve.value
+        : "ease";
+
+    if (mode === "linear") {
+      return t;
+    }
+
+    if (mode === "ease-in-out") {
+      return (
+        t *
+        t *
+        (3 - 2 * t)
+      );
+    }
+
+    return smootherstep(t);
+  }
+
   function smootherstep(
     value
   ) {

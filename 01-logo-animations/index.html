@@ -23,8 +23,8 @@
       width: 100%;
       height: 100%;
       overflow: hidden;
-      background: #fef9f3;
-      color: #111;
+      background: #08303a;
+      color: #e8f0f2;
       font-family:
         "SFMono-Regular",
         "SF Mono",
@@ -125,11 +125,39 @@
       color: #fff;
     }
 
+    body.theme-dark select,
+    body.theme-dark button,
+    body.theme-dark input[type="color"] {
+      border-color: #5a8a96;
+      color: #e8f0f2;
+    }
+
+    body.theme-dark button:hover {
+      background: #e8f0f2;
+      color: #08303a;
+    }
+
+    body.theme-light {
+      color: #111;
+    }
+
+    body.theme-light select,
+    body.theme-light button,
+    body.theme-light input[type="color"] {
+      border-color: #111;
+      color: #111;
+    }
+
+    body.theme-light button:hover {
+      background: #111;
+      color: #fff;
+    }
+
     #canvas-container {
       flex: 1;
       min-width: 0;
       height: 100%;
-      background: #fef9f3;
+      background: #08303a;
       overflow: hidden;
     }
 
@@ -139,8 +167,27 @@
   </style>
 </head>
 
-<body>
+<body class="theme-dark">
   <aside id="controls">
+
+    <div class="group">
+      <label for="pageBackground">Canvas background</label>
+
+      <select id="pageBackground">
+        <option value="08303A" selected>Dark teal (#08303A)</option>
+        <option value="FEF9F3">Cream (#FEF9F3)</option>
+      </select>
+    </div>
+
+    <label class="checkbox">
+      <input id="darkFaceMode" type="checkbox" />
+      Dark mode (letter art on dark faces)
+    </label>
+
+    <p style="margin: 0; font-size: 11px; line-height: 1.5; opacity: 0.7;">
+      Uses A/G/M dark-bg PNGs, cream canvas (#FEF9F3),
+      and #012131 outer shell faces.
+    </p>
 
     <div class="group">
       <label for="animationMode">Animation mode</label>
@@ -177,12 +224,21 @@
     </div>
 
     <label class="checkbox">
-      <input id="randomInnerColors" type="checkbox" />
+      <input id="randomInnerColors" type="checkbox" checked />
       Random inner colors (palette)
     </label>
 
     <label class="checkbox">
-      <input id="showGrid" type="checkbox" checked />
+      <input id="excludeDarkTealsFromInner" type="checkbox" checked />
+      Exclude dark teals from inner palette
+    </label>
+
+    <button id="randomizeInnerLayoutButton" type="button">
+      Randomize inner layout
+    </button>
+
+    <label class="checkbox">
+      <input id="showGrid" type="checkbox" />
       Show isometric grid
     </label>
 
@@ -195,7 +251,7 @@
       </p>
 
       <label class="checkbox">
-        <input id="showGridTriple" type="checkbox" checked />
+        <input id="showGridTriple" type="checkbox" />
         Show isometric grid
       </label>
 
@@ -218,6 +274,16 @@
     </div>
 
     <div class="group">
+      <label for="motionCurve">Fold / unfold curve</label>
+
+      <select id="motionCurve">
+        <option value="ease" selected>Ease</option>
+        <option value="ease-in-out">Ease in-out</option>
+        <option value="linear">Linear</option>
+      </select>
+    </div>
+
+    <div class="group">
       <div class="row">
         <label for="animationSpeed">Animation speed</label>
         <span id="animationSpeedValue" class="value"></span>
@@ -229,7 +295,7 @@
         min="0.15"
         max="2"
         step="0.05"
-        value="0.7"
+        value="0.5"
       />
     </div>
 
@@ -243,9 +309,9 @@
         id="foldedPause"
         type="range"
         min="0"
-        max="3"
+        max="60"
         step="0.1"
-        value="1"
+        value="30"
       />
     </div>
 
@@ -261,7 +327,7 @@
         min="0"
         max="3"
         step="0.1"
-        value="0.8"
+        value="1"
       />
     </div>
 
@@ -281,6 +347,59 @@
       />
     </div>
 
+    <div class="group">
+      <label for="exportLoops">Export loops</label>
+
+      <input
+        id="exportLoops"
+        type="number"
+        min="1"
+        max="999"
+        step="1"
+        value="5"
+      />
+
+      <p
+        id="exportEstimate"
+        style="margin: 0; font-size: 11px; line-height: 1.5; opacity: 0.7;"
+      ></p>
+
+      <p style="margin: 0; font-size: 11px; line-height: 1.5; opacity: 0.7;">
+        One loop uses your current speed and pause settings
+        (folded, unfolded, and revealed where applicable).
+        Renders at 30 fps and downloads an MP4.
+      </p>
+
+      <label for="exportVariations" style="margin-top: 8px;">
+        Color variation exports
+      </label>
+
+      <input
+        id="exportVariations"
+        type="number"
+        min="1"
+        max="20"
+        step="1"
+        value="10"
+      />
+
+      <button id="exportVariationsButton" type="button">
+        Export color variations
+      </button>
+
+      <p style="margin: 0; font-size: 11px; line-height: 1.5; opacity: 0.7;">
+        Runs the same export as Export video multiple times.
+        Each file uses a new random seed (colors shuffle on
+        unfold like the live preview).
+      </p>
+
+      <button id="exportVideoButton" type="button">
+        Export video
+      </button>
+
+      <p id="exportNote" style="margin: 0; font-size: 11px; opacity: 0.65;"></p>
+    </div>
+
     <button id="restartButton">
       Restart animation
     </button>
@@ -289,6 +408,7 @@
 
   <main id="canvas-container"></main>
 
+  <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.js"></script>
   <script src="triple-cube-mode.js"></script>
   <script src="sketch.js"></script>
 </body>

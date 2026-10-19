@@ -8,6 +8,8 @@
 
 const TripleCubeMode = (() => {
   const OUTER_COLOR = "#032932";
+  const DARK_MODE_SHELL_COLOR =
+    "#012131";
 
   function smootherstep(value) {
     const t = Math.max(
@@ -27,6 +29,17 @@ const TripleCubeMode = (() => {
         10
       )
     );
+  }
+
+  function motionEase() {
+    if (
+      typeof applyMotionCurve ===
+      "function"
+    ) {
+      return applyMotionCurve;
+    }
+
+    return smootherstep;
   }
 
   function getControls() {
@@ -94,8 +107,17 @@ const TripleCubeMode = (() => {
 
   let images = {};
 
+  let useDarkFaceArt = false;
+
+  const DARK_FACE_IMAGE_MAP = {
+    "A.png": "A-darkbg.png",
+    "M.png": "M-darkbg.png",
+    "G.png": "G-darkbg.png"
+  };
+
   let animationState = "stackedHold";
   let stateStartTime = 0;
+  let stateElapsed = 0;
   let verticalSep = 0;
   let horizontalSep = 0;
   let reveal = 0;
@@ -104,6 +126,7 @@ const TripleCubeMode = (() => {
   function init() {
     animationState = "stackedHold";
     stateStartTime = millis();
+    stateElapsed = 0;
     verticalSep = 0;
     horizontalSep = 0;
     reveal = 0;
@@ -113,10 +136,43 @@ const TripleCubeMode = (() => {
     loadImages();
   }
 
+  function getOuterColor() {
+    return useDarkFaceArt
+      ? DARK_MODE_SHELL_COLOR
+      : OUTER_COLOR;
+  }
+
+  function getCubeImagePath(
+    cube
+  ) {
+    if (!useDarkFaceArt) {
+      return cube.image;
+    }
+
+    return (
+      DARK_FACE_IMAGE_MAP[
+        cube.image
+      ] || cube.image
+    );
+  }
+
+  function setDarkFaceArt(
+    enabled
+  ) {
+    useDarkFaceArt =
+      Boolean(enabled);
+    loadImages();
+  }
+
   function loadImages() {
     for (const cube of CUBES) {
+      const path =
+        getCubeImagePath(
+          cube
+        );
+
       loadImage(
-        cube.image,
+        path,
 
         img => {
           images[cube.id] = img;
@@ -124,7 +180,7 @@ const TripleCubeMode = (() => {
 
         () => {
           console.warn(
-            `Could not load triple-cube image: ${cube.image}`
+            `Could not load triple-cube image: ${path}`
           );
         }
       );
@@ -165,9 +221,15 @@ const TripleCubeMode = (() => {
     );
   }
 
+  function getStateElapsed() {
+    return (
+      (millis() - stateStartTime) /
+      1000
+    );
+  }
+
   function update() {
-    const now = millis();
-    const elapsed = (now - stateStartTime) / 1000;
+    const elapsed = getStateElapsed();
     const moveDuration = getMoveDuration();
 
     if (animationState === "stackedHold") {
@@ -190,7 +252,7 @@ const TripleCubeMode = (() => {
         1
       );
 
-      verticalSep = smootherstep(t);
+      verticalSep = motionEase()(t);
       horizontalSep = 0;
       reveal = 0;
 
@@ -211,7 +273,7 @@ const TripleCubeMode = (() => {
       );
 
       verticalSep = 1;
-      horizontalSep = smootherstep(t);
+      horizontalSep = motionEase()(t);
       reveal = 0;
 
       if (t >= 1) {
@@ -245,7 +307,7 @@ const TripleCubeMode = (() => {
 
       verticalSep = 1;
       horizontalSep = 1;
-      reveal = smootherstep(t);
+      reveal = motionEase()(t);
 
       if (t >= 1) {
         reveal = 1;
@@ -278,7 +340,7 @@ const TripleCubeMode = (() => {
 
       verticalSep = 1;
       horizontalSep = 1;
-      reveal = 1 - smootherstep(t);
+      reveal = 1 - motionEase()(t);
 
       if (t >= 1) {
         reveal = 0;
@@ -297,7 +359,7 @@ const TripleCubeMode = (() => {
       );
 
       verticalSep = 1;
-      horizontalSep = 1 - smootherstep(t);
+      horizontalSep = 1 - motionEase()(t);
       reveal = 0;
 
       if (t >= 1) {
@@ -316,7 +378,7 @@ const TripleCubeMode = (() => {
         1
       );
 
-      verticalSep = 1 - smootherstep(t);
+      verticalSep = 1 - motionEase()(t);
       horizontalSep = 0;
       reveal = 0;
 
@@ -326,6 +388,304 @@ const TripleCubeMode = (() => {
         stateStartTime = now;
       }
     }
+  }
+
+  function advance(deltaSec) {
+    let remaining = deltaSec;
+
+    while (remaining > 1e-9) {
+      remaining -=
+        stepTripleOnce(remaining);
+    }
+  }
+
+  function stepTripleOnce(dt) {
+    const ease = motionEase();
+    const moveDuration = getMoveDuration();
+
+    if (animationState === "stackedHold") {
+      verticalSep = 0;
+      horizontalSep = 0;
+      reveal = 0;
+
+      const need =
+        getStackedPause() -
+        stateElapsed;
+
+      if (dt < need) {
+        stateElapsed += dt;
+        return dt;
+      }
+
+      const used = need;
+
+      stateElapsed = 0;
+      animationState = "separatingVertical";
+
+      if (dt - used <= 1e-9) {
+        return used;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    if (animationState === "separatingVertical") {
+      const after =
+        stateElapsed + dt;
+
+      if (after < moveDuration) {
+        stateElapsed = after;
+        verticalSep = ease(
+          stateElapsed / moveDuration
+        );
+        horizontalSep = 0;
+        reveal = 0;
+        return dt;
+      }
+
+      const used =
+        moveDuration - stateElapsed;
+
+      stateElapsed = 0;
+      verticalSep = 1;
+      animationState =
+        "separatingHorizontal";
+
+      if (dt - used <= 1e-9) {
+        return dt;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    if (animationState === "separatingHorizontal") {
+      const after =
+        stateElapsed + dt;
+
+      if (after < moveDuration) {
+        stateElapsed = after;
+        verticalSep = 1;
+        horizontalSep = ease(
+          stateElapsed / moveDuration
+        );
+        reveal = 0;
+        return dt;
+      }
+
+      const used =
+        moveDuration - stateElapsed;
+
+      stateElapsed = 0;
+      horizontalSep = 1;
+      animationState = "separatedHold";
+
+      if (dt - used <= 1e-9) {
+        return dt;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    if (animationState === "separatedHold") {
+      verticalSep = 1;
+      horizontalSep = 1;
+      reveal = 0;
+
+      const need =
+        getSeparatedPause() -
+        stateElapsed;
+
+      if (dt < need) {
+        stateElapsed += dt;
+        return dt;
+      }
+
+      const used = need;
+
+      stateElapsed = 0;
+      animationState = "rotating";
+
+      if (dt - used <= 1e-9) {
+        return used;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    if (animationState === "rotating") {
+      const after =
+        stateElapsed + dt;
+
+      if (after < moveDuration) {
+        stateElapsed = after;
+        verticalSep = 1;
+        horizontalSep = 1;
+        reveal = ease(
+          stateElapsed / moveDuration
+        );
+        return dt;
+      }
+
+      const used =
+        moveDuration - stateElapsed;
+
+      stateElapsed = 0;
+      reveal = 1;
+      animationState = "revealedHold";
+
+      if (dt - used <= 1e-9) {
+        return dt;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    if (animationState === "revealedHold") {
+      verticalSep = 1;
+      horizontalSep = 1;
+      reveal = 1;
+
+      const need =
+        getRevealedPause() -
+        stateElapsed;
+
+      if (dt < need) {
+        stateElapsed += dt;
+        return dt;
+      }
+
+      const used = need;
+
+      stateElapsed = 0;
+      animationState = "unrotating";
+
+      if (dt - used <= 1e-9) {
+        return used;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    if (animationState === "unrotating") {
+      const after =
+        stateElapsed + dt;
+
+      if (after < moveDuration) {
+        stateElapsed = after;
+        verticalSep = 1;
+        horizontalSep = 1;
+        reveal =
+          1 -
+          ease(
+            stateElapsed / moveDuration
+          );
+        return dt;
+      }
+
+      const used =
+        moveDuration - stateElapsed;
+
+      stateElapsed = 0;
+      reveal = 0;
+      animationState =
+        "collapsingHorizontal";
+
+      if (dt - used <= 1e-9) {
+        return dt;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    if (animationState === "collapsingHorizontal") {
+      const after =
+        stateElapsed + dt;
+
+      if (after < moveDuration) {
+        stateElapsed = after;
+        verticalSep = 1;
+        horizontalSep =
+          1 -
+          ease(
+            stateElapsed / moveDuration
+          );
+        reveal = 0;
+        return dt;
+      }
+
+      const used =
+        moveDuration - stateElapsed;
+
+      stateElapsed = 0;
+      horizontalSep = 0;
+      animationState =
+        "collapsingVertical";
+
+      if (dt - used <= 1e-9) {
+        return dt;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    if (animationState === "collapsingVertical") {
+      const after =
+        stateElapsed + dt;
+
+      if (after < moveDuration) {
+        stateElapsed = after;
+        verticalSep =
+          1 -
+          ease(
+            stateElapsed / moveDuration
+          );
+        horizontalSep = 0;
+        reveal = 0;
+        return dt;
+      }
+
+      const used =
+        moveDuration - stateElapsed;
+
+      stateElapsed = 0;
+      verticalSep = 0;
+      animationState = "stackedHold";
+
+      if (dt - used <= 1e-9) {
+        return dt;
+      }
+
+      return (
+        used +
+        stepTripleOnce(dt - used)
+      );
+    }
+
+    return dt;
   }
 
   function getCubePosition(
@@ -1017,7 +1377,7 @@ const TripleCubeMode = (() => {
       else {
         drawSolidQuad(
           face.corners,
-          OUTER_COLOR
+          getOuterColor()
         );
       }
     }
@@ -1080,11 +1440,26 @@ const TripleCubeMode = (() => {
     pop();
   }
 
+  function getCycleDuration() {
+    const moveDuration = getMoveDuration();
+
+    return (
+      getStackedPause() +
+      getSeparatedPause() +
+      getRevealedPause() +
+      6 *
+        moveDuration
+    );
+  }
+
   return {
     init,
     update,
+    advance,
     draw,
     restart,
-    loadImages
+    loadImages,
+    setDarkFaceArt,
+    getCycleDuration
   };
 })();
