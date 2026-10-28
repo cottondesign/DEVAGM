@@ -2034,8 +2034,35 @@ function exitReelPreview() {
 async function exportReel() {
   const clips = reel.clips.slice();
 
-  if (!clips.length) {
+  if (!clips.length || reel.job) {
     return;
+  }
+
+  let fileHandle = null;
+
+  if (
+    typeof window.showSaveFilePicker === "function" &&
+    typeof VideoEncoder !== "undefined" &&
+    typeof Mp4Muxer !== "undefined"
+  ) {
+    try {
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: `${getReelFileStem()}.mp4`,
+        types: [
+          {
+            description: "MP4 video",
+            accept: { "video/mp4": [".mp4"] }
+          }
+        ]
+      });
+    } catch (error) {
+      if (error && error.name === "AbortError") {
+        setReelNote("Export cancelled.");
+        return;
+      }
+
+      fileHandle = null;
+    }
   }
 
   const fps = reel.fps === 60 ? 60 : 30;
@@ -2058,6 +2085,7 @@ async function exportReel() {
   );
 
   let blob = null;
+  let savedToFile = false;
   let extension = "mp4";
 
   const { ok, job: finishedJob } = await runReelJob("export", async (job) => {
@@ -2080,7 +2108,8 @@ async function exportReel() {
       (await createWebCodecsReelEncoder(
         size.width,
         size.height,
-        fps
+        fps,
+        fileHandle
       )) ||
       createMediaRecorderReelEncoder(out, fps);
 
@@ -2147,6 +2176,16 @@ async function exportReel() {
 
       setReelProgress("Finalizing video…", 1);
       blob = await encoder.finish();
+
+      /* MediaRecorder fallback still returns a blob. */
+      if (blob && fileHandle && extension === "mp4") {
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        blob = null;
+      }
+
+      savedToFile = Boolean(fileHandle && !blob);
     } catch (error) {
       encoder.abort();
       throw error;
@@ -2155,26 +2194,34 @@ async function exportReel() {
     return true;
   });
 
-  if (ok && blob) {
+  const summary =
+    `${totalFrames} frames · ${size.width}×${size.height} · ${fps} fps · ${extension.toUpperCase()}`;
+
+  if (ok && savedToFile) {
+    setReelNote(`Saved ${fileHandle.name} · ${summary}.`);
+  } else if (ok && blob) {
     downloadReelBlob(blob, extension);
-    setReelNote(
-      `Exported ${totalFrames} frames · ${size.width}×${size.height} · ${fps} fps · ${extension.toUpperCase()}.`
-    );
+    setReelNote(`Exported ${summary}.`);
   } else if (finishedJob && finishedJob.cancelled) {
     setReelNote("Export cancelled.");
   }
 }
 
-function downloadReelBlob(blob, extension) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
+function getReelFileStem() {
   const stamp = new Date()
     .toISOString()
     .replace(/[:.]/g, "-")
     .slice(0, 19);
 
+  return `cube-reel-${stamp}`;
+}
+
+function downloadReelBlob(blob, extension) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
   link.href = url;
-  link.download = `cube-reel-${stamp}.${extension}`;
+  link.download = `${getReelFileStem()}.${extension}`;
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -2182,7 +2229,7 @@ function downloadReelBlob(blob, extension) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-async function createWebCodecsReelEncoder(width, height, fps) {
+async function createWebCodecsReelEncoder(width, height, fps, fileHandle) {
   if (
     typeof VideoEncoder === "undefined" ||
     typeof VideoFrame === "undefined" ||
@@ -2232,7 +2279,31 @@ async function createWebCodecsReelEncoder(width, height, fps) {
     return null;
   }
 
-  const target = new Mp4Muxer.ArrayBufferTarget();
+  /*
+   * Never collect the movie in one ArrayBuffer: browsers
+   * cap those near 2 GB, which long reels exceed. Stream
+   * to the chosen file, or else keep 16 MB parts.
+   */
+  let writable = null;
+  let parts = null;
+  let target;
+
+  if (fileHandle) {
+    writable = await fileHandle.createWritable();
+    target = new Mp4Muxer.FileSystemWritableFileStreamTarget(
+      writable,
+      { chunkSize: 16 * 1024 * 1024 }
+    );
+  } else {
+    parts = [];
+    target = new Mp4Muxer.StreamTarget({
+      chunked: true,
+      chunkSize: 16 * 1024 * 1024,
+      onData: (data, position) =>
+        writeReelVideoPart(parts, data, position)
+    });
+  }
+
   const muxer = new Mp4Muxer.Muxer({
     target,
     video: {
@@ -2241,7 +2312,7 @@ async function createWebCodecsReelEncoder(width, height, fps) {
       height,
       frameRate: fps
     },
-    fastStart: "in-memory",
+    fastStart: false,
     firstTimestampBehavior: "offset"
   });
 
@@ -2293,9 +2364,16 @@ async function createWebCodecsReelEncoder(width, height, fps) {
       muxer.finalize();
       encoder.close();
 
-      return new Blob([target.buffer], {
-        type: "video/mp4"
-      });
+      if (writable) {
+        await writable.close();
+        writable = null;
+        return null;
+      }
+
+      return new Blob(
+        parts.map((part) => part.data),
+        { type: "video/mp4" }
+      );
     },
 
     abort() {
@@ -2306,8 +2384,50 @@ async function createWebCodecsReelEncoder(width, height, fps) {
       } catch (error) {
         /* Already closed. */
       }
+
+      if (writable) {
+        writable.abort().catch(() => {});
+        writable = null;
+      }
     }
   };
+}
+
+/*
+ * Muxer output arrives mostly in order; the few writes
+ * that land earlier (header sizes at the end) patch
+ * bytes already stored.
+ */
+function writeReelVideoPart(parts, data, position) {
+  const last = parts[parts.length - 1];
+  const end = last ? last.start + last.data.byteLength : 0;
+
+  if (position >= end) {
+    parts.push({ start: position, data: data.slice() });
+    return;
+  }
+
+  for (const part of parts) {
+    const from = Math.max(position, part.start);
+    const to = Math.min(
+      position + data.byteLength,
+      part.start + part.data.byteLength
+    );
+
+    if (from < to) {
+      part.data.set(
+        data.subarray(from - position, to - position),
+        from - part.start
+      );
+    }
+  }
+
+  if (position + data.byteLength > end) {
+    parts.push({
+      start: end,
+      data: data.slice(end - position)
+    });
+  }
 }
 
 /*
