@@ -22,18 +22,25 @@ const REEL_SIM_FPS = 60;
 const REEL_MAX_TRIM_SECONDS = 30;
 const REEL_MAX_CLIP_SECONDS = 1200;
 const REEL_THUMB_WIDTH = 320;
+const REEL_COLLAPSED_PREVIEW_COUNT = 3;
+/* clips with no repeating fold count one cycle as this */
+const REEL_STATIC_CYCLE_SECONDS = 2;
 
 const reel = {
   clips: [],
   aspectRatio: "16:9",
-  defaultDuration: 4,
+  defaultCycles: 2,
+  contentScaleMode: "area",
+  splitMode: "alternate",
   fps: 30,
   resolutionScale: 1,
   cameraZoomScale: 1,
   expanded: false,
   job: null,
   preview: null,
-  dragId: null
+  dragId: null,
+  loadedClip: null,
+  loadedClipDirty: false
 };
 
 const reelEls = {};
@@ -77,7 +84,19 @@ function initReel() {
     "reelPresetControls",
     "reelPresetSelect",
     "reelLoadPresetButton",
-    "reelDeletePresetButton"
+    "reelDeletePresetButton",
+    "reelApplyUpdatesButton",
+    "reelRandomMinutes",
+    "reelRandomClipsButton",
+    "reelPresetName",
+    "reelPresetSaveNote",
+    "reelExportJsonButton",
+    "reelImportJsonButton",
+    "reelImportJsonInput",
+    "reelShortenClipsButton",
+    "reelContentScaleMode",
+    "reelSplitMode",
+    "reelSplitModeGroup"
   ];
 
   for (const id of ids) {
@@ -100,15 +119,19 @@ function initReel() {
   connectReelControls();
   refreshReelPresetSelect();
   renderReel();
+  setInterval(checkLoadedReelClipDirty, 400);
+  setTimeout(refreshVisibleMissingThumbnails, 500);
 }
 
 function syncReelSettingInputs() {
   reelEls.reelAspectRatio.value = reel.aspectRatio;
+  reelEls.reelContentScaleMode.value = reel.contentScaleMode;
+  reelEls.reelSplitMode.value = reel.splitMode;
   reelEls.reelCameraZoomScale.value = String(
     reel.cameraZoomScale || 1
   );
   reelEls.reelDefaultDuration.value =
-    String(reel.defaultDuration);
+    String(reel.defaultCycles);
   reelEls.reelFps.value = String(reel.fps);
   reelEls.reelResolution.value =
     String(reel.resolutionScale);
@@ -123,6 +146,38 @@ function connectReelControls() {
   reelEls.reelArrangeButton.addEventListener(
     "click",
     () => setReelExpanded(true)
+  );
+
+  reelEls.reelApplyUpdatesButton.addEventListener(
+    "click",
+    applyUpdatesToLoadedClip
+  );
+
+  reelEls.reelRandomClipsButton.addEventListener(
+    "click",
+    addRandomClipsForMinutes
+  );
+
+  reelEls.reelExportJsonButton.addEventListener(
+    "click",
+    exportSequenceJson
+  );
+
+  reelEls.reelImportJsonButton.addEventListener(
+    "click",
+    () => reelEls.reelImportJsonInput.click()
+  );
+
+  reelEls.reelImportJsonInput.addEventListener(
+    "change",
+    () => {
+      const file = reelEls.reelImportJsonInput.files[0];
+      reelEls.reelImportJsonInput.value = "";
+
+      if (file) {
+        importSequenceJson(file);
+      }
+    }
   );
 
   reelEls.reelClearSequenceButton.addEventListener(
@@ -145,13 +200,38 @@ function connectReelControls() {
     alternateArrangeClips
   );
 
+  reelEls.reelShortenClipsButton.addEventListener(
+    "click",
+    shortenLongClips
+  );
+
+  reelEls.reelContentScaleMode.addEventListener(
+    "change",
+    () => {
+      reel.contentScaleMode = reelEls.reelContentScaleMode.value;
+      persistReelState();
+      renderReel();
+      refreshVisibleReelThumbnails();
+    }
+  );
+
+  reelEls.reelSplitMode.addEventListener(
+    "change",
+    () => {
+      reel.splitMode = reelEls.reelSplitMode.value;
+      persistReelState();
+      renderReel();
+      refreshVisibleReelThumbnails();
+    }
+  );
+
   reelEls.reelAspectRatio.addEventListener(
     "change",
     () => {
       reel.aspectRatio = reelEls.reelAspectRatio.value;
       persistReelState();
       renderReel();
-      refreshReelThumbnails(reel.clips.slice());
+      refreshVisibleReelThumbnails();
     }
   );
 
@@ -180,7 +260,7 @@ function connectReelControls() {
   reelEls.reelDefaultDuration.addEventListener(
     "input",
     () => {
-      reel.defaultDuration = Number(
+      reel.defaultCycles = roundToHalfCycle(
         reelEls.reelDefaultDuration.value
       );
       persistReelState();
@@ -367,6 +447,139 @@ function uniqueReelClipName(base) {
   return `${base} (${n})`;
 }
 
+function getLiveReelClipImage(snapshot) {
+  return snapshot.fields.sketchMode === "image" &&
+    sourceImageData
+    ? {
+        data: sourceImageData,
+        key: sourceImageKey,
+        name: sourceImageName
+      }
+    : null;
+}
+
+function createReelClip(snapshot, cycleSeconds) {
+  return {
+    id: createReelClipId(),
+    name: uniqueReelClipName(
+      buildReelClipName(snapshot)
+    ),
+    snapshot,
+    thumbnail: "",
+    duration: null,
+    cycles: null,
+    cycleSeconds,
+    trimStart: 0,
+    image: getLiveReelClipImage(snapshot),
+    imageMissing: false
+  };
+}
+
+/*
+ * Odds for generated clips: these read as off-theme
+ * when they come up as often as the folding modes.
+ */
+const REEL_RANDOM_MODE_WEIGHTS = {
+  "roll-grid": 0.2,
+  "wander-roll": 0.2
+};
+const REEL_RANDOM_BOX_EXTENT_CHANCE = 0.1;
+const REEL_RANDOM_MAX_CLIPS = 300;
+
+function buildRandomReelSnapshot() {
+  const snapshot = buildRandomizedSnapshot(
+    REEL_RANDOM_MODE_WEIGHTS
+  );
+
+  snapshot.fields.aspectRatio = reel.aspectRatio;
+  snapshot.fields.animateFolding = true;
+  snapshot.fields.allowBoxExtents =
+    Math.random() < REEL_RANDOM_BOX_EXTENT_CHANCE;
+
+  return snapshot;
+}
+
+/*
+ * Generates random clips until they add up to the
+ * requested minutes, then re-arranges the whole
+ * sequence with the Auto Arrange ordering.
+ */
+async function addRandomClipsForMinutes() {
+  if (reel.job) {
+    return;
+  }
+
+  const minutes = Number(reelEls.reelRandomMinutes.value);
+
+  if (!(minutes > 0)) {
+    reelEls.reelRandomMinutes.focus();
+    return;
+  }
+
+  const targetSeconds = minutes * 60;
+  const added = [];
+
+  const { ok } = await runReelJob("generate", async (job) => {
+    let total = 0;
+
+    while (
+      total < targetSeconds &&
+      added.length < REEL_RANDOM_MAX_CLIPS
+    ) {
+      setReelProgress(
+        `Generating clip ${added.length + 1} · ${formatReelSeconds(total)} / ${formatReelSeconds(targetSeconds)}`,
+        total / targetSeconds
+      );
+
+      const clip = createReelClip(
+        buildRandomReelSnapshot(),
+        null
+      );
+
+      applyReelClip(clip);
+      reelStepFrame();
+
+      clip.cycleSeconds =
+        getLiveFoldCycleSeconds() ||
+        REEL_STATIC_CYCLE_SECONDS;
+      clip.thumbnail = captureReelThumbnail();
+
+      reel.clips.push(clip);
+      added.push(clip);
+      total += getReelClipDuration(clip);
+      renderReelClips();
+
+      await reelYield();
+
+      if (job.cancelled) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+
+  if (added.length && reel.clips.length >= 3) {
+    applyReelContrastOrder(
+      computeReelContrastOrder(reel.clips, 0)
+    );
+  }
+
+  persistReelState();
+  renderReel();
+
+  if (ok && added.length) {
+    setReelNote(
+      `Added ${added.length} random clip${added.length === 1 ? "" : "s"} (${formatReelSeconds(
+        added.reduce(
+          (sum, clip) => sum + getReelClipDuration(clip),
+          0
+        )
+      )}) and re-arranged the sequence.`
+    );
+  }
+}
+
 function addClipToSequence() {
   if (reel.job) {
     return;
@@ -381,29 +594,13 @@ function addClipToSequence() {
     reelEls.reelAspectRatio.value = reel.aspectRatio;
   }
 
-  const clip = {
-    id: createReelClipId(),
-    name: uniqueReelClipName(
-      buildReelClipName(snapshot)
-    ),
+  const clip = createReelClip(
     snapshot,
-    thumbnail: "",
-    duration: null,
-    trimStart: 0,
-    image:
-      snapshot.fields.sketchMode === "image" &&
-      sourceImageData
-        ? {
-            data: sourceImageData,
-            key: sourceImageKey,
-            name: sourceImageName
-          }
-        : null,
-    imageMissing: false
-  };
+    getLiveFoldCycleSeconds()
+  );
 
   const sameAspect =
-    snapshot.fields.aspectRatio === reel.aspectRatio;
+    snapshot.fields.aspectRatio === getReelRenderAspect();
 
   if (sameAspect) {
     clip.thumbnail = captureReelThumbnail();
@@ -461,17 +658,77 @@ function moveReelClip(id, delta) {
   renderReel();
 }
 
-function getReelClipDuration(clip) {
-  const value =
-    clip.duration === null || clip.duration === undefined
-      ? reel.defaultDuration
-      : clip.duration;
+function roundToHalfCycle(value) {
+  return Math.max(0.5, Math.round((Number(value) || 0) * 2) / 2);
+}
 
-  return constrain(
-    Number(value) || reel.defaultDuration,
-    0.1,
-    REEL_MAX_CLIP_SECONDS
+function formatReelCycles(cycles) {
+  return `${cycles} cycle${cycles === 1 ? "" : "s"}`;
+}
+
+function getLiveFoldCycleSeconds() {
+  const settings = getSettings();
+
+  return getFoldCycleSeconds(
+    settings,
+    getMaxFoldStaggerDelay(settings)
   );
+}
+
+/*
+ * Clips saved before cycle lengths were stored derive
+ * it from their snapshot (without stagger carry-over).
+ */
+function getReelClipCycleSeconds(clip) {
+  if (Number(clip.cycleSeconds) > 0) {
+    return Number(clip.cycleSeconds);
+  }
+
+  if (!(Number(clip.cycleSecondsEstimate) > 0)) {
+    const fields = clip.snapshot.fields || {};
+    const settings = { ...fields };
+
+    for (const key of Object.keys(settings)) {
+      if (
+        typeof settings[key] === "string" &&
+        settings[key] !== "" &&
+        !isNaN(Number(settings[key]))
+      ) {
+        settings[key] = Number(settings[key]);
+      }
+    }
+
+    clip.cycleSecondsEstimate =
+      getFoldCycleSeconds(settings) ||
+      REEL_STATIC_CYCLE_SECONDS;
+  }
+
+  return Number(clip.cycleSecondsEstimate);
+}
+
+function getReelClipCycles(clip) {
+  return clip.cycles === null || clip.cycles === undefined
+    ? reel.defaultCycles
+    : roundToHalfCycle(clip.cycles);
+}
+
+/*
+ * Length in seconds: fold cycles × that clip's cycle
+ * time. A legacy per-clip seconds override still wins
+ * until the clip is given a cycle count.
+ */
+function getReelClipDuration(clip) {
+  const hasLegacySeconds =
+    (clip.cycles === null || clip.cycles === undefined) &&
+    clip.duration !== null &&
+    clip.duration !== undefined &&
+    Number(clip.duration) > 0;
+
+  const seconds = hasLegacySeconds
+    ? Number(clip.duration)
+    : getReelClipCycles(clip) * getReelClipCycleSeconds(clip);
+
+  return constrain(seconds, 0.1, REEL_MAX_CLIP_SECONDS);
 }
 
 function getReelClipTrim(clip) {
@@ -494,12 +751,26 @@ function getReelTotalSeconds() {
  * aspect ratio replaces the clip's own so the frame
  * is re-laid-out (not cropped) at the reel size.
  */
+/*
+ * Alternating split lobby renders each side as its own
+ * 720×768 frame; everything else renders the full frame.
+ */
+function isReelSplitAlternate() {
+  const preset = ASPECT_PRESETS[reel.aspectRatio];
+  return Boolean(preset && preset.split && reel.splitMode === "alternate");
+}
+
+function getReelRenderAspect() {
+  return isReelSplitAlternate() ? "720:768" : reel.aspectRatio;
+}
+
 function applyReelClip(clip) {
   const snapshot = JSON.parse(
     JSON.stringify(clip.snapshot)
   );
+  const authoredAspect = snapshot.fields.aspectRatio;
 
-  snapshot.fields.aspectRatio = reel.aspectRatio;
+  snapshot.fields.aspectRatio = getReelRenderAspect();
 
   if (clip.image) {
     sourceImageData = clip.image.data;
@@ -508,6 +779,9 @@ function applyReelClip(clip) {
   }
 
   applyPresetSnapshot(snapshot);
+  contentReferenceAspect = authoredAspect;
+  contentScaleMode = reel.contentScaleMode;
+  splitViewMode = reel.splitMode === "crop" ? "crop" : "none";
 
   const zoomScale = reel.cameraZoomScale || 1;
 
@@ -516,7 +790,7 @@ function applyReelClip(clip) {
       Number(controls.cameraZoom.value) || 1;
 
     controls.cameraZoom.value = String(
-      constrain(baseZoom * zoomScale, 0.15, 4.5)
+      constrain(baseZoom * zoomScale, 0.7, 4.5)
     );
   }
 
@@ -541,6 +815,105 @@ function loadReelClipIntoSketch(id) {
   }
 
   applyReelClip(clip);
+  reel.loadedClip = {
+    id: clip.id,
+    baseline: getReelEditKey()
+  };
+  reel.loadedClipDirty = false;
+  renderReel();
+}
+
+/* Everything a clip saves except timing state. */
+function getReelEditKey() {
+  const snapshot = collectPresetSnapshot();
+
+  return JSON.stringify({
+    fields: snapshot.fields,
+    monoColor: snapshot.monoColor,
+    outerColor: snapshot.outerColor,
+    innerColor: snapshot.innerColor,
+    placementSeed: snapshot.placementSeed,
+    image: sourceImageKey
+  });
+}
+
+function getLoadedReelClip() {
+  return reel.loadedClip
+    ? reel.clips.find(
+        (clip) => clip.id === reel.loadedClip.id
+      ) || null
+    : null;
+}
+
+function checkLoadedReelClipDirty() {
+  if (!reel.loadedClip || reel.job) {
+    return;
+  }
+
+  if (!getLoadedReelClip()) {
+    reel.loadedClip = null;
+    reel.loadedClipDirty = false;
+    renderReel();
+    return;
+  }
+
+  const dirty =
+    getReelEditKey() !== reel.loadedClip.baseline;
+
+  if (dirty !== reel.loadedClipDirty) {
+    reel.loadedClipDirty = dirty;
+    renderReel();
+  }
+}
+
+/*
+ * Saves the live sketch back into the loaded clip. The
+ * sequence aspect / zoom scale applied on load are
+ * undone so the clip keeps its own values.
+ */
+function applyUpdatesToLoadedClip() {
+  const clip = getLoadedReelClip();
+
+  if (!clip || reel.job) {
+    return;
+  }
+
+  const snapshot = JSON.parse(
+    JSON.stringify(collectPresetSnapshot())
+  );
+  const zoomScale = reel.cameraZoomScale || 1;
+
+  snapshot.fields.aspectRatio =
+    clip.snapshot.fields.aspectRatio;
+  snapshot.fields.cameraZoom = constrain(
+    (Number(snapshot.fields.cameraZoom) || 1) / zoomScale,
+    0.7,
+    4.5
+  ).toFixed(2);
+
+  clip.snapshot = snapshot;
+  clip.cycleSeconds =
+    getLiveFoldCycleSeconds() || REEL_STATIC_CYCLE_SECONDS;
+  clip.cycleSecondsEstimate = null;
+  clip.image = getLiveReelClipImage(snapshot);
+  clip.imageMissing = false;
+  clip.thumbnail = captureReelThumbnail();
+
+  const others = reel.clips.filter((entry) => entry !== clip);
+  const base = buildReelClipName(snapshot);
+  let name = base;
+  let n = 2;
+
+  while (others.some((entry) => entry.name === name)) {
+    name = `${base} (${n++})`;
+  }
+
+  clip.name = name;
+
+  reel.loadedClip.baseline = getReelEditKey();
+  reel.loadedClipDirty = false;
+  persistReelState();
+  renderReel();
 }
 
 /* ------------------------------------------------------------------
@@ -595,6 +968,13 @@ async function refreshReelThumbnails(clips) {
 
       reelStepFrame();
       clip.thumbnail = captureReelThumbnail();
+
+      if (!(Number(clip.cycleSeconds) > 0)) {
+        clip.cycleSeconds =
+          getLiveFoldCycleSeconds() ||
+          REEL_STATIC_CYCLE_SECONDS;
+      }
+
       renderReelClips();
       await reelYield();
 
@@ -633,14 +1013,14 @@ const REEL_COLOR_FAMILY = {
 };
 
 const REEL_ZOOM_LOG_RANGE = [
-  Math.log(0.15),
+  Math.log(0.7),
   Math.log(4.5)
 ];
 
 function getScaledReelClipCameraZoom(fields) {
   const base = constrain(
     Number(fields.cameraZoom) || 1,
-    0.15,
+    0.7,
     4.5
   );
   const scale = constrain(
@@ -649,7 +1029,7 @@ function getScaledReelClipCameraZoom(fields) {
     4
   );
 
-  return constrain(base * scale, 0.15, 4.5);
+  return constrain(base * scale, 0.7, 4.5);
 }
 
 function getReelClipFeatures(clip) {
@@ -779,6 +1159,9 @@ function buildReelDifferenceMatrix(clips) {
  * is kept light so it never outweighs an adjacent cut.
  */
 const REEL_SECOND_NEIGHBOR_WEIGHT = 0.15;
+const REEL_ARRANGE_LARGE_COUNT = 30;
+const REEL_ARRANGE_LARGE_STARTS = 6;
+const REEL_ARRANGE_LARGE_PASSES = 2;
 
 function reelOrderScore(order, matrix) {
   const reward = (d) => 1 - Math.exp(-3.2 * d);
@@ -853,12 +1236,13 @@ function greedyReelOrder(start, matrix) {
   return order;
 }
 
-function improveReelOrder(order, matrix) {
+function improveReelOrder(order, matrix, maxPasses = Infinity) {
   let best = order.slice();
   let bestScore = reelOrderScore(best, matrix);
   let improved = true;
+  let passes = 0;
 
-  while (improved) {
+  while (improved && passes++ < maxPasses) {
     improved = false;
 
     for (let i = 0; i < best.length; i++) {
@@ -925,10 +1309,21 @@ function listReelContrastOrders(clips) {
       addOrder(order.slice());
     });
   } else {
-    for (let start = 0; start < n; start++) {
+    /*
+     * Long generated sequences: fewer starts and passes
+     * keep the search from freezing the page.
+     */
+    const large = n > REEL_ARRANGE_LARGE_COUNT;
+    const starts = large
+      ? Math.min(n, REEL_ARRANGE_LARGE_STARTS)
+      : n;
+
+    for (let s = 0; s < starts; s++) {
+      const start = Math.floor((s * n) / starts);
       const result = improveReelOrder(
         greedyReelOrder(start, matrix),
-        matrix
+        matrix,
+        large ? REEL_ARRANGE_LARGE_PASSES : Infinity
       );
 
       addOrder(result.order);
@@ -1068,6 +1463,11 @@ async function runReelJob(kind, work) {
 
   const job = { kind, cancelled: false, error: null };
   const restoreSnapshot = collectPresetSnapshot();
+  const restoreView = {
+    contentReferenceAspect,
+    contentScaleMode,
+    splitViewMode
+  };
   const restoreImage = {
     data: sourceImageData,
     key: sourceImageKey,
@@ -1096,9 +1496,13 @@ async function runReelJob(kind, work) {
     sourceImageName = restoreImage.name;
 
     applyPresetSnapshot(restoreSnapshot);
+    contentReferenceAspect = restoreView.contentReferenceAspect;
+    contentScaleMode = restoreView.contentScaleMode;
+    splitViewMode = restoreView.splitViewMode;
     resetOneAtATimeState();
     resetShuffleInnerColors();
     updateImageUploadNote();
+    hideReelCompositeView();
 
     reel.job = null;
     document.body.classList.remove("reel-busy");
@@ -1137,6 +1541,219 @@ function getReelExportSize() {
   };
 }
 
+/* ------------------------------------------------------------------
+ * Tracks — one per screen. The alternating split lobby
+ * renders its right side in a hidden second copy of
+ * the sketch, since both sides play different clips
+ * at the same moment.
+ * ---------------------------------------------------------------- */
+
+const localReelTrackApi = {
+  apply: (clip) => applyReelClip(clip),
+  preroll: (job, clip) => prerollReelClip(job, clip),
+  step: () => reelStepFrame(),
+  simulate: () => reelSimulateFrame(),
+  canvas: () => getSketchCanvasElement()
+};
+
+let reelWorkerFrame = null;
+
+async function getReelRenderWorker() {
+  if (!reelWorkerFrame) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("renderWorker", "1");
+
+    reelWorkerFrame = document.createElement("iframe");
+    reelWorkerFrame.setAttribute("aria-hidden", "true");
+    reelWorkerFrame.tabIndex = -1;
+    reelWorkerFrame.style.cssText =
+      "position:fixed;left:-20000px;top:0;width:1200px;height:900px;border:0;opacity:0;pointer-events:none;";
+    reelWorkerFrame.src = url.toString();
+    document.body.appendChild(reelWorkerFrame);
+  }
+
+  const started = performance.now();
+
+  while (performance.now() - started < 20000) {
+    try {
+      const win = reelWorkerFrame.contentWindow;
+
+      if (win && win.reelWorkerReady) {
+        return win;
+      }
+    } catch (error) {
+      throw new Error(
+        "Alternating split screens need the page served from a local web server, not opened as a file."
+      );
+    }
+
+    await reelWait(100);
+  }
+
+  throw new Error("The second split-screen renderer didn't start.");
+}
+
+function createWorkerTrackApi(win) {
+  win.reelWorkerConfigure({
+    aspectRatio: "720:768",
+    cameraZoomScale: reel.cameraZoomScale || 1,
+    contentScaleMode: reel.contentScaleMode
+  });
+
+  return {
+    apply: (clip) => win.applyReelClip(clip),
+    preroll: (job, clip) => win.prerollReelClip(job, clip),
+    step: () => win.reelStepFrame(),
+    simulate: () => win.reelSimulateFrame(),
+    canvas: () => win.getSketchCanvasElement()
+  };
+}
+
+/* Called inside the render worker by the main page. */
+function reelWorkerConfigure(config) {
+  reel.aspectRatio = config.aspectRatio;
+  reel.cameraZoomScale = config.cameraZoomScale;
+  reel.contentScaleMode = config.contentScaleMode;
+  reel.splitMode = "crop";
+  reelRendering = true;
+  fixedFrameDeltaMs = 1000 / REEL_SIM_FPS;
+  noLoop();
+}
+
+/*
+ * Right side of the alternating split: the same clips
+ * rotated so no clip is on both screens at once. Picks
+ * the rotation with the least same-clip overlap,
+ * preferring one near half the sequence.
+ */
+function computeReelAlternateOrder(clips) {
+  const n = clips.length;
+
+  if (n < 2) {
+    return clips.slice();
+  }
+
+  const spans = (order) => {
+    const map = new Map();
+    let t = 0;
+
+    for (const clip of order) {
+      const d = getReelClipDuration(clip);
+      map.set(clip, [t, t + d]);
+      t += d;
+    }
+
+    return map;
+  };
+
+  const left = spans(clips);
+  let best = null;
+
+  for (let k = 1; k < n; k++) {
+    const order = clips.slice(k).concat(clips.slice(0, k));
+    const right = spans(order);
+    let overlap = 0;
+
+    for (const clip of clips) {
+      const [a0, a1] = left.get(clip);
+      const [b0, b1] = right.get(clip);
+      overlap += Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
+    }
+
+    const score = overlap * 1000 + Math.abs(k - n / 2);
+
+    if (!best || score < best.score) {
+      best = { order, score };
+    }
+  }
+
+  return best.order;
+}
+
+function prepareReelTrack(track) {
+  track.starts = [];
+  track.total = 0;
+
+  for (const clip of track.clips) {
+    track.starts.push(track.total);
+    track.total += getReelClipDuration(clip);
+  }
+
+  track.clipIndex = -1;
+  track.stepsDone = 0;
+  return track;
+}
+
+async function buildReelTracks(clips) {
+  const size = getReelExportSize();
+
+  if (!isReelSplitAlternate()) {
+    return [
+      prepareReelTrack({
+        clips,
+        api: localReelTrackApi,
+        rect: { x: 0, y: 0, w: size.width, h: size.height }
+      })
+    ];
+  }
+
+  const win = await getReelRenderWorker();
+  const half = Math.round(size.width / 2);
+
+  return [
+    prepareReelTrack({
+      clips,
+      api: localReelTrackApi,
+      rect: { x: 0, y: 0, w: half, h: size.height }
+    }),
+    prepareReelTrack({
+      clips: computeReelAlternateOrder(clips),
+      api: createWorkerTrackApi(win),
+      rect: { x: half, y: 0, w: size.width - half, h: size.height }
+    })
+  ];
+}
+
+function drawReelTracks(ctx, tracks) {
+  for (const track of tracks) {
+    ctx.drawImage(
+      track.api.canvas(),
+      track.rect.x,
+      track.rect.y,
+      track.rect.w,
+      track.rect.h
+    );
+  }
+}
+
+let reelCompositeCanvas = null;
+
+/* Preview of both split sides, shown in place of the sketch canvas. */
+function showReelCompositeView(size) {
+  if (!reelCompositeCanvas) {
+    reelCompositeCanvas = document.createElement("canvas");
+    reelCompositeCanvas.id = "reelCompositeView";
+    document
+      .getElementById("canvas-stage")
+      .appendChild(reelCompositeCanvas);
+  }
+
+  reelCompositeCanvas.width = size.width;
+  reelCompositeCanvas.height = size.height;
+  reelCompositeCanvas.style.display = "block";
+  getSketchCanvasElement().style.display = "none";
+
+  return reelCompositeCanvas.getContext("2d", { alpha: false });
+}
+
+function hideReelCompositeView() {
+  if (reelCompositeCanvas) {
+    reelCompositeCanvas.style.display = "none";
+  }
+
+  getSketchCanvasElement().style.display = "";
+}
+
 /*
  * Preview stays open until exited. Seeking re-applies
  * the target clip and steps from its start (or keeps
@@ -1168,13 +1785,21 @@ async function previewReel() {
     playing: true,
     scrubbing: false,
     resumeAfterScrub: false,
-    clipIndex: -1,
-    stepsDone: 0
+    tracks: [],
+    composite: null
   };
 
   reel.preview = preview;
 
   await runReelJob("preview", async (job) => {
+    preview.tracks = await buildReelTracks(clips);
+
+    if (preview.tracks.length > 1) {
+      preview.composite = showReelCompositeView(
+        getReelExportSize()
+      );
+    }
+
     syncReelPreviewUI();
 
     let last = performance.now();
@@ -1255,38 +1880,53 @@ function getReelPreviewLocation(preview, seconds) {
 }
 
 async function seekReelPreview(job, preview, seconds) {
+  for (const track of preview.tracks) {
+    if (!(await seekReelTrack(job, track, seconds))) {
+      return false;
+    }
+  }
+
+  if (preview.composite) {
+    drawReelTracks(preview.composite, preview.tracks);
+  }
+
+  preview.time = constrain(seconds, 0, preview.total);
+  return true;
+}
+
+async function seekReelTrack(job, track, seconds) {
   const { index, step } = getReelPreviewLocation(
-    preview,
+    track,
     seconds
   );
 
   if (
-    index !== preview.clipIndex ||
-    step < preview.stepsDone
+    index !== track.clipIndex ||
+    step < track.stepsDone
   ) {
-    const clip = preview.clips[index];
+    const clip = track.clips[index];
 
-    preview.clipIndex = -1;
-    applyReelClip(clip);
+    track.clipIndex = -1;
+    track.api.apply(clip);
 
-    if (!(await prerollReelClip(job, clip))) {
+    if (!(await track.api.preroll(job, clip))) {
       return false;
     }
 
-    preview.clipIndex = index;
-    preview.stepsDone = 0;
+    track.clipIndex = index;
+    track.stepsDone = 0;
   }
 
   let sliceStart = performance.now();
 
-  while (preview.stepsDone < step) {
-    if (preview.stepsDone === step - 1) {
-      reelStepFrame();
+  while (track.stepsDone < step) {
+    if (track.stepsDone === step - 1) {
+      track.api.step();
     } else {
-      reelSimulateFrame();
+      track.api.simulate();
     }
 
-    preview.stepsDone++;
+    track.stepsDone++;
 
     if (performance.now() - sliceStart > 30) {
       await reelYield();
@@ -1298,7 +1938,6 @@ async function seekReelPreview(job, preview, seconds) {
     }
   }
 
-  preview.time = constrain(seconds, 0, preview.total);
   return true;
 }
 
@@ -1320,8 +1959,15 @@ function syncReelPreviewUI() {
     reelEls.reelScrubber.value = String(preview.time);
   }
 
-  reelEls.reelPreviewClip.textContent =
-    `${index + 1} / ${preview.clips.length} · ${preview.clips[index].name}`;
+  const right = preview.tracks[1];
+
+  const rightClip = right
+    ? right.clips[getReelPreviewLocation(right, shown).index]
+    : null;
+
+  reelEls.reelPreviewClip.textContent = rightClip
+    ? `Left: clip ${index + 1} · Right: clip ${preview.clips.indexOf(rightClip) + 1} (of ${preview.clips.length})`
+    : `${index + 1} / ${preview.clips.length} · ${preview.clips[index].name}`;
   reelEls.reelPreviewTime.textContent =
     `${formatReelSeconds(Math.floor(shown * 10) / 10)} / ${formatReelSeconds(preview.total)}`;
   reelEls.reelPlayButton.textContent =
@@ -1402,10 +2048,11 @@ async function exportReel() {
 
   const outCtx = out.getContext("2d", { alpha: false });
 
-  const frameCounts = clips.map((clip) =>
-    Math.max(1, Math.round(getReelClipDuration(clip) * fps))
-  );
-  const totalFrames = frameCounts.reduce(
+  const countFrames = (list) =>
+    list.map((clip) =>
+      Math.max(1, Math.round(getReelClipDuration(clip) * fps))
+    );
+  let totalFrames = countFrames(clips).reduce(
     (sum, count) => sum + count,
     0
   );
@@ -1415,6 +2062,19 @@ async function exportReel() {
 
   const { ok, job: finishedJob } = await runReelJob("export", async (job) => {
     setReelProgress("Preparing encoder…", 0);
+
+    const tracks = (await buildReelTracks(clips)).map((track) => {
+      track.frameCounts = countFrames(track.clips);
+      track.c = -1;
+      track.framesLeft = 0;
+      return track;
+    });
+
+    totalFrames = Math.max(
+      ...tracks.map((track) =>
+        track.frameCounts.reduce((sum, count) => sum + count, 0)
+      )
+    );
 
     const encoder =
       (await createWebCodecsReelEncoder(
@@ -1432,52 +2092,56 @@ async function exportReel() {
 
     extension = encoder.extension;
 
-    let frameIndex = 0;
+    const progressLabel = () => {
+      const c = Math.max(0, tracks[0].c);
+      return `Clip ${c + 1} / ${clips.length} · ${clips[c].name}`;
+    };
 
     try {
-      for (let c = 0; c < clips.length; c++) {
-        const clip = clips[c];
+      for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+        for (const track of tracks) {
+          /* A track that finishes early holds its last frame. */
+          if (
+            track.framesLeft === 0 &&
+            track.c < track.clips.length - 1
+          ) {
+            track.c++;
+            const clip = track.clips[track.c];
 
-        setReelProgress(
-          `Clip ${c + 1} / ${clips.length} · ${clip.name}`,
-          frameIndex / totalFrames
-        );
+            if (track === tracks[0]) {
+              setReelProgress(progressLabel(), frameIndex / totalFrames);
+            }
 
-        applyReelClip(clip);
+            track.api.apply(clip);
 
-        if (!(await prerollReelClip(job, clip))) {
-          encoder.abort();
-          return false;
+            if (!(await track.api.preroll(job, clip))) {
+              encoder.abort();
+              return false;
+            }
+
+            track.framesLeft = track.frameCounts[track.c];
+          }
+
+          if (track.framesLeft > 0) {
+            for (let s = 0; s < stepsPerFrame; s++) {
+              track.api.step();
+            }
+
+            track.framesLeft--;
+          }
         }
 
-        for (let f = 0; f < frameCounts[c]; f++) {
-          for (let s = 0; s < stepsPerFrame; s++) {
-            reelStepFrame();
-          }
+        drawReelTracks(outCtx, tracks);
+        await encoder.addFrame(out, frameIndex);
 
-          outCtx.drawImage(
-            getSketchCanvasElement(),
-            0,
-            0,
-            size.width,
-            size.height
-          );
+        if ((frameIndex + 1) % 4 === 0) {
+          setReelProgress(progressLabel(), (frameIndex + 1) / totalFrames);
+          await reelYield();
+        }
 
-          await encoder.addFrame(out, frameIndex);
-          frameIndex++;
-
-          if (frameIndex % 4 === 0) {
-            setReelProgress(
-              `Clip ${c + 1} / ${clips.length} · ${clip.name}`,
-              frameIndex / totalFrames
-            );
-            await reelYield();
-          }
-
-          if (job.cancelled) {
-            encoder.abort();
-            return false;
-          }
+        if (job.cancelled) {
+          encoder.abort();
+          return false;
         }
       }
 
@@ -1779,6 +2443,8 @@ function serializeReelClip(clip) {
     snapshot: clip.snapshot,
     thumbnail: clip.thumbnail,
     duration: clip.duration,
+    cycles: clip.cycles,
+    cycleSeconds: clip.cycleSeconds,
     trimStart: clip.trimStart,
     usesImage:
       clip.snapshot.fields.sketchMode === "image"
@@ -1791,12 +2457,17 @@ function deserializeReelClips(clips) {
     .map((clip) => ({
       id: clip.id || createReelClipId(),
       name: clip.name || buildReelClipName(clip.snapshot),
-      snapshot: clip.snapshot,
+      snapshot: migratePresetSnapshot(clip.snapshot),
       thumbnail: clip.thumbnail || "",
-      duration:
-        clip.duration === null || clip.duration === undefined
+      duration: null,
+      cycles:
+        clip.cycles === null || clip.cycles === undefined
           ? null
-          : Number(clip.duration),
+          : roundToHalfCycle(clip.cycles),
+      cycleSeconds:
+        Number(clip.cycleSeconds) > 0
+          ? Number(clip.cycleSeconds)
+          : null,
       trimStart: Number(clip.trimStart) || 0,
       image: null,
       imageMissing: Boolean(clip.usesImage)
@@ -1807,7 +2478,9 @@ function serializeReelState() {
   return {
     version: 1,
     aspectRatio: reel.aspectRatio,
-    defaultDuration: reel.defaultDuration,
+    defaultCycles: reel.defaultCycles,
+    contentScaleMode: reel.contentScaleMode,
+    splitMode: reel.splitMode,
     fps: reel.fps,
     resolutionScale: reel.resolutionScale,
     cameraZoomScale: reel.cameraZoomScale || 1,
@@ -1816,12 +2489,22 @@ function serializeReelState() {
 }
 
 function applyReelStateSettings(state) {
-  if (ASPECT_PRESETS[state.aspectRatio]) {
-    reel.aspectRatio = state.aspectRatio;
+  const aspect = migrateAspectKey(state.aspectRatio);
+
+  if (ASPECT_PRESETS[aspect]) {
+    reel.aspectRatio = aspect;
   }
 
-  if (Number(state.defaultDuration) > 0) {
-    reel.defaultDuration = Number(state.defaultDuration);
+  if (["area", "fit", "pixels"].includes(state.contentScaleMode)) {
+    reel.contentScaleMode = state.contentScaleMode;
+  }
+
+  if (["alternate", "crop"].includes(state.splitMode)) {
+    reel.splitMode = state.splitMode;
+  }
+
+  if (Number(state.defaultCycles) > 0) {
+    reel.defaultCycles = roundToHalfCycle(state.defaultCycles);
   }
 
   if ([30, 60].includes(Number(state.fps))) {
@@ -1844,6 +2527,10 @@ function applyReelStateSettings(state) {
 }
 
 function writeReelState() {
+  if (RENDER_WORKER) {
+    return;
+  }
+
   const state = serializeReelState();
 
   try {
@@ -1853,24 +2540,119 @@ function writeReelState() {
     );
   } catch (error) {
     /*
-     * Quota exceeded: keep the sequence without
-     * thumbnails rather than losing it.
+     * Quota exceeded: drop thumbnails from the end
+     * first so the collapsed preview keeps its images;
+     * missing ones re-render when they're shown.
      */
-    try {
-      state.clips.forEach((clip) => {
-        clip.thumbnail = "";
+    let keep = state.clips.length;
+
+    while (keep > 0) {
+      keep = Math.floor(keep / 2);
+      state.clips.forEach((clip, index) => {
+        if (index >= keep) {
+          clip.thumbnail = "";
+        }
       });
-      localStorage.setItem(
-        REEL_STORAGE_KEY,
-        JSON.stringify(state)
-      );
-    } catch (innerError) {
-      /* Storage unavailable. */
+
+      try {
+        localStorage.setItem(
+          REEL_STORAGE_KEY,
+          JSON.stringify(state)
+        );
+        return;
+      } catch (innerError) {
+        /* Still too large; keep trimming. */
+      }
     }
   }
 }
 
+/*
+ * After a framing change: re-render thumbnails on
+ * screen now, and drop the rest so they re-render when
+ * they're shown.
+ */
+function refreshVisibleReelThumbnails() {
+  if (reel.job) {
+    return;
+  }
+
+  const visible = reel.expanded
+    ? reel.clips
+    : reel.clips.slice(0, REEL_COLLAPSED_PREVIEW_COUNT);
+
+  for (const clip of reel.clips) {
+    if (!visible.includes(clip)) {
+      clip.thumbnail = "";
+    }
+  }
+
+  refreshReelThumbnails(visible.slice());
+}
+
+const REEL_SHORTEN_MAX_SECONDS = 15;
+
+/* Caps long clips at 15s by lowering their fold cycles in halves. */
+function shortenLongClips() {
+  if (reel.job) {
+    return;
+  }
+
+  let shortened = 0;
+  let stillLong = 0;
+
+  for (const clip of reel.clips) {
+    if (getReelClipDuration(clip) <= REEL_SHORTEN_MAX_SECONDS + 1e-6) {
+      continue;
+    }
+
+    const cycleSeconds = getReelClipCycleSeconds(clip);
+
+    clip.cycles = Math.max(
+      0.5,
+      Math.floor((REEL_SHORTEN_MAX_SECONDS / cycleSeconds) * 2) / 2
+    );
+    clip.duration = null;
+    shortened++;
+
+    if (getReelClipDuration(clip) > REEL_SHORTEN_MAX_SECONDS + 1e-6) {
+      stillLong++;
+    }
+  }
+
+  persistReelState();
+  renderReel();
+  setReelNote(
+    shortened
+      ? `Shortened ${shortened} clip${shortened === 1 ? "" : "s"} to ${REEL_SHORTEN_MAX_SECONDS}s or less.` +
+          (stillLong
+            ? ` ${stillLong} still run longer because half a fold cycle is already over ${REEL_SHORTEN_MAX_SECONDS}s.`
+            : "")
+      : `Every clip is already ${REEL_SHORTEN_MAX_SECONDS}s or shorter.`
+  );
+}
+
+/* Re-renders missing thumbnails for clips on screen. */
+function refreshVisibleMissingThumbnails() {
+  if (reel.job) {
+    return;
+  }
+
+  const visible = reel.expanded
+    ? reel.clips
+    : reel.clips.slice(0, REEL_COLLAPSED_PREVIEW_COUNT);
+  const missing = visible.filter((clip) => !clip.thumbnail);
+
+  if (missing.length) {
+    refreshReelThumbnails(missing);
+  }
+}
+
 function restoreReelState() {
+  if (RENDER_WORKER) {
+    return;
+  }
+
   let state = null;
 
   try {
@@ -1898,9 +2680,63 @@ function readReelPresetStore() {
       localStorage.getItem(REEL_PRESET_STORAGE_KEY) || "null"
     );
 
-    return parsed && typeof parsed === "object"
-      ? parsed
-      : {};
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+
+    let migrated = false;
+
+    for (const name of Object.keys(parsed)) {
+      const preset = parsed[name];
+
+      if (
+        !preset ||
+        !Array.isArray(preset.clips)
+      ) {
+        continue;
+      }
+
+      let presetChanged = false;
+      const clips = preset.clips.map((clip) => {
+        if (!clip || !clip.snapshot) {
+          return clip;
+        }
+
+        const nextSnapshot = migratePresetSnapshot(
+          clip.snapshot
+        );
+        const hasLegacySeconds =
+          clip.duration !== null &&
+          clip.duration !== undefined;
+
+        if (
+          nextSnapshot === clip.snapshot &&
+          !hasLegacySeconds &&
+          !clip.thumbnail
+        ) {
+          return clip;
+        }
+
+        presetChanged = true;
+        return {
+          ...clip,
+          snapshot: nextSnapshot,
+          duration: null,
+          thumbnail: ""
+        };
+      });
+
+      if (presetChanged) {
+        parsed[name] = { ...preset, clips };
+        migrated = true;
+      }
+    }
+
+    if (migrated) {
+      writeReelPresetStore(parsed);
+    }
+
+    return parsed;
   } catch (error) {
     return {};
   }
@@ -1911,6 +2747,10 @@ function readReelPresetStore() {
  * thumbnails; they re-render when it's loaded.
  */
 function writeReelPresetStore(store, name) {
+  if (RENDER_WORKER) {
+    return false;
+  }
+
   try {
     localStorage.setItem(
       REEL_PRESET_STORAGE_KEY,
@@ -1980,52 +2820,181 @@ function saveSequenceAsPreset() {
     return;
   }
 
+  /*
+   * Named inline rather than with window.prompt, which
+   * embedded browsers can silently block. Taken names
+   * get a numeric suffix instead of a replace dialog.
+   */
   const store = readReelPresetStore();
-  const input = window.prompt(
-    "Name this sequence preset",
-    `Sequence ${Object.keys(store).length + 1}`
+  const base =
+    reelEls.reelPresetName.value.trim().slice(0, 40) ||
+    `Sequence ${Object.keys(store).length + 1}`;
+  let name = base;
+  let n = 2;
+
+  while (store[name]) {
+    name = `${base} (${n++})`;
+  }
+
+  const state = JSON.parse(
+    JSON.stringify(serializeReelState())
   );
 
-  if (input === null) {
+  /* Thumbnails re-render on load; storing them fills the quota. */
+  state.clips.forEach((clip) => {
+    clip.thumbnail = "";
+  });
+
+  store[name] = { ...state, savedAt: Date.now() };
+
+  let saved = writeReelPresetStore(store, name);
+
+  if (!saved) {
+    try {
+      const current = serializeReelState();
+      current.clips.forEach((clip) => {
+        clip.thumbnail = "";
+      });
+      localStorage.setItem(
+        REEL_STORAGE_KEY,
+        JSON.stringify(current)
+      );
+    } catch (error) {
+      /* Fall through to the failure note. */
+    }
+
+    saved = writeReelPresetStore(store, name);
+  }
+
+  if (!saved) {
+    const message =
+      "Couldn't save the sequence preset: browser storage is full.";
+    setReelNote(message);
+    reelEls.reelPresetSaveNote.textContent = message;
     return;
   }
 
-  const name = input.trim().slice(0, 40);
-
-  if (!name) {
-    return;
-  }
-
-  if (
-    store[name] &&
-    !window.confirm(`Replace the sequence preset “${name}”?`)
-  ) {
-    return;
-  }
-
-  store[name] = JSON.parse(
-    JSON.stringify({
-      ...serializeReelState(),
-      savedAt: Date.now()
-    })
-  );
-
-  if (!writeReelPresetStore(store, name)) {
-    setReelNote(
-      "Couldn't save the sequence preset — browser storage is full."
-    );
-    return;
-  }
-
+  reelEls.reelPresetName.value = "";
+  reelEls.reelPresetSaveNote.textContent =
+    `Saved “${name}” · ${reel.clips.length} clip${reel.clips.length === 1 ? "" : "s"}. Find it under Load a preset → Sequences.`;
   refreshReelPresetSelect(name);
+  refreshPresetSelect();
   setReelNote(
     `Saved sequence preset “${name}” · ${reel.clips.length} clip${reel.clips.length === 1 ? "" : "s"}.`
   );
 }
 
-function loadSelectedSequencePreset() {
-  const name = reelEls.reelPresetSelect.value;
+const REEL_JSON_FORMAT = "devagm-cube-sequence";
 
+function exportSequenceJson() {
+  if (!reel.clips.length) {
+    reelEls.reelPresetSaveNote.textContent =
+      "Add clips before exporting a sequence.";
+    return;
+  }
+
+  const data = {
+    format: REEL_JSON_FORMAT,
+    exportedAt: new Date().toISOString(),
+    name: reelEls.reelPresetName.value.trim() || "",
+    ...serializeReelState()
+  };
+
+  downloadReelBlob(
+    new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/json"
+    }),
+    "json"
+  );
+
+  reelEls.reelPresetSaveNote.textContent =
+    `Exported ${reel.clips.length} clip${reel.clips.length === 1 ? "" : "s"} as JSON.` +
+    (reel.clips.some((clip) => clip.snapshot.fields.sketchMode === "image")
+      ? " Image clips don't include the uploaded image."
+      : "");
+}
+
+/*
+ * Imports never replace the current sequence: the file
+ * becomes a sequence preset, and is only loaded straight
+ * away when the reel is empty.
+ */
+async function importSequenceJson(file) {
+  if (reel.job) {
+    return;
+  }
+
+  const note = reelEls.reelPresetSaveNote;
+  let data = null;
+
+  try {
+    data = JSON.parse(await file.text());
+  } catch (error) {
+    note.textContent = `Couldn't read “${file.name}”: not valid JSON.`;
+    return;
+  }
+
+  const clips =
+    data && Array.isArray(data.clips)
+      ? data.clips.filter(
+          (clip) => clip && clip.snapshot && clip.snapshot.fields
+        )
+      : [];
+
+  if (!clips.length) {
+    note.textContent = `“${file.name}” doesn't contain any sequence clips.`;
+    return;
+  }
+
+  const state = { ...data, clips };
+  const store = readReelPresetStore();
+  const base =
+    String(data.name || "").trim().slice(0, 40) ||
+    file.name.replace(/\.json$/i, "").slice(0, 40) ||
+    "Imported sequence";
+  let name = base;
+  let n = 2;
+
+  while (store[name]) {
+    name = `${base} (${n++})`;
+  }
+
+  const presetState = JSON.parse(JSON.stringify(state));
+  delete presetState.format;
+  delete presetState.exportedAt;
+  delete presetState.name;
+  presetState.clips.forEach((clip) => {
+    clip.thumbnail = "";
+  });
+
+  store[name] = { ...presetState, savedAt: Date.now() };
+  const saved = writeReelPresetStore(store, name);
+
+  refreshReelPresetSelect(saved ? name : "");
+  refreshPresetSelect();
+
+  if (!reel.clips.length) {
+    applyReelStateSettings(state);
+    syncReelSettingInputs();
+    persistReelState();
+    renderReel();
+    refreshVisibleMissingThumbnails();
+    note.textContent =
+      `Imported “${name}” · ${clips.length} clip${clips.length === 1 ? "" : "s"} into the sequence` +
+      (saved ? " and saved it as a preset." : ". Browser storage is full, so it wasn't saved as a preset.");
+    return;
+  }
+
+  note.textContent = saved
+    ? `Imported “${name}” · ${clips.length} clip${clips.length === 1 ? "" : "s"} as a preset. Your current sequence is unchanged. Load it from Load a preset → Sequences.`
+    : `Couldn't import “${name}”: browser storage is full. Clear the current sequence and import again to load it directly.`;
+}
+
+function loadSelectedSequencePreset() {
+  loadSequencePresetByName(reelEls.reelPresetSelect.value);
+}
+
+function loadSequencePresetByName(name) {
   if (!name || reel.job) {
     return;
   }
@@ -2049,14 +3018,25 @@ function loadSelectedSequencePreset() {
   syncReelSettingInputs();
   persistReelState();
   renderReel();
+
+  const visible = reel.expanded
+    ? reel.clips
+    : reel.clips.slice(0, REEL_COLLAPSED_PREVIEW_COUNT);
+
   refreshReelThumbnails(
-    reel.clips.filter((clip) => !clip.thumbnail)
+    reel.clips.filter(
+      (clip) =>
+        (!clip.thumbnail && visible.includes(clip)) ||
+        !(Number(clip.cycleSeconds) > 0)
+    )
   );
 }
 
 function deleteSelectedSequencePreset() {
-  const name = reelEls.reelPresetSelect.value;
+  deleteSequencePresetByName(reelEls.reelPresetSelect.value);
+}
 
+function deleteSequencePresetByName(name) {
   if (!name || reel.job) {
     return;
   }
@@ -2071,6 +3051,7 @@ function deleteSelectedSequencePreset() {
   delete store[name];
   writeReelPresetStore(store);
   refreshReelPresetSelect("");
+  refreshPresetSelect("");
 }
 
 /* ------------------------------------------------------------------
@@ -2084,6 +3065,7 @@ function setReelExpanded(expanded) {
     expanded
   );
   renderReel();
+  refreshVisibleMissingThumbnails();
 }
 
 function formatReelSeconds(seconds) {
@@ -2123,6 +3105,8 @@ function syncReelBusyUI() {
   );
   document.body.classList.toggle("reel-previewing", previewing);
   reelEls.reelSavePresetButton.disabled = busy || !count;
+  reelEls.reelExportJsonButton.disabled = busy || !count;
+  reelEls.reelImportJsonButton.disabled = busy;
   reelEls.reelPresetSelect.disabled = busy;
   reelEls.reelLoadPresetButton.disabled = busy;
   reelEls.reelDeletePresetButton.disabled = busy;
@@ -2132,6 +3116,12 @@ function syncReelBusyUI() {
   }
 
   reelEls.reelAddClipButton.disabled = busy;
+  reelEls.reelRandomClipsButton.disabled = busy;
+  reelEls.reelRandomMinutes.disabled = busy;
+  reelEls.reelApplyUpdatesButton.disabled = busy;
+  reelEls.reelShortenClipsButton.disabled = busy || !count;
+  reelEls.reelContentScaleMode.disabled = busy;
+  reelEls.reelSplitMode.disabled = busy;
   reelEls.reelAutoArrangeButton.disabled =
     busy || count < 3;
   reelEls.reelAlternateArrangeButton.disabled =
@@ -2160,13 +3150,21 @@ function renderReel() {
     ASPECT_PRESETS["16:9"];
   const size = getReelExportSize();
 
+  const renderPreset =
+    ASPECT_PRESETS[getReelRenderAspect()] || preset;
+
   document.body.style.setProperty(
     "--reel-aspect",
-    `${preset.width} / ${preset.height}`
+    `${renderPreset.width} / ${renderPreset.height}`
+  );
+
+  reelEls.reelSplitModeGroup.classList.toggle(
+    "hidden",
+    !preset.split
   );
 
   reelEls.reelDefaultDurationValue.textContent =
-    formatReelSeconds(reel.defaultDuration);
+    formatReelCycles(reel.defaultCycles);
 
   reelEls.reelCameraZoomScaleValue.textContent =
     `${Number(reel.cameraZoomScale || 1).toFixed(2)}×`;
@@ -2174,6 +3172,19 @@ function renderReel() {
   reelEls.reelSummary.textContent = count
     ? `${count} clip${count === 1 ? "" : "s"} · ${formatReelSeconds(getReelTotalSeconds())}`
     : "No clips";
+
+  const loadedClip = getLoadedReelClip();
+  const showApply = Boolean(loadedClip && reel.loadedClipDirty);
+
+  reelEls.reelApplyUpdatesButton.classList.toggle(
+    "hidden",
+    !showApply
+  );
+
+  if (showApply) {
+    reelEls.reelApplyUpdatesButton.textContent =
+      `Apply Updates to Clip ${String(reel.clips.indexOf(loadedClip) + 1).padStart(2, "0")}`;
+  }
 
   reelEls.reelEmptyNote.classList.toggle(
     "hidden",
@@ -2221,8 +3232,23 @@ function renderReelClips() {
   list.innerHTML = "";
 
   reel.clips.forEach((clip, index) => {
+    if (
+      !reel.expanded &&
+      index >= REEL_COLLAPSED_PREVIEW_COUNT
+    ) {
+      contrastSum += reelClipDifference(
+        features[index - 1],
+        features[index]
+      );
+      return;
+    }
+
     const card = document.createElement("div");
     card.className = "reel-clip";
+    card.classList.toggle(
+      "loaded",
+      Boolean(reel.loadedClip && reel.loadedClip.id === clip.id)
+    );
     card.draggable = true;
     card.dataset.id = clip.id;
 
@@ -2267,9 +3293,14 @@ function renderReelClips() {
     meta.className = "reel-clip-meta";
 
     const duration = document.createElement("span");
-    duration.textContent =
-      formatReelSeconds(getReelClipDuration(clip)) +
-      (clip.duration !== null ? " · trimmed" : "");
+    const usesLegacySeconds =
+      (clip.cycles === null || clip.cycles === undefined) &&
+      clip.duration !== null &&
+      clip.duration !== undefined;
+
+    duration.textContent = usesLegacySeconds
+      ? `${formatReelSeconds(getReelClipDuration(clip))} · trimmed`
+      : `${formatReelCycles(getReelClipCycles(clip))} · ${formatReelSeconds(getReelClipDuration(clip))}`;
 
     const contrast = document.createElement("span");
 
@@ -2307,6 +3338,19 @@ function renderReelClips() {
     list.appendChild(card);
   });
 
+  const hiddenCount =
+    reel.clips.length - REEL_COLLAPSED_PREVIEW_COUNT;
+
+  if (!reel.expanded && hiddenCount > 0) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "reel-more-clips";
+    more.textContent = `+ ${hiddenCount} more clip${hiddenCount === 1 ? "" : "s"} · Arrange Sequence to see all`;
+    more.disabled = Boolean(reel.job);
+    more.addEventListener("click", () => setReelExpanded(true));
+    list.appendChild(more);
+  }
+
   if (reel.clips.length > 1) {
     const average = contrastSum / (reel.clips.length - 1);
     reelEls.reelContrastNote.textContent =
@@ -2323,25 +3367,27 @@ function buildReelTrimControls(clip) {
   wrap.className = "reel-clip-trim reel-editor-only";
 
   const durationLabel = document.createElement("label");
-  durationLabel.textContent = "Duration (s)";
+  durationLabel.textContent = "Fold cycles";
 
   const durationInput = document.createElement("input");
   durationInput.type = "number";
-  durationInput.min = "0.1";
-  durationInput.max = String(REEL_MAX_CLIP_SECONDS);
-  durationInput.step = "0.1";
-  durationInput.placeholder = String(reel.defaultDuration);
+  durationInput.min = "0.5";
+  durationInput.step = "0.5";
+  durationInput.placeholder = String(reel.defaultCycles);
   durationInput.value =
-    clip.duration === null ? "" : String(clip.duration);
+    clip.cycles === null || clip.cycles === undefined
+      ? ""
+      : String(clip.cycles);
   durationInput.title =
-    "Leave empty to use the sequence clip duration";
+    "Full fold + unfold cycles, in halves. Leave empty to use the sequence default.";
 
   durationInput.addEventListener("change", () => {
     const value = durationInput.value.trim();
-    clip.duration =
+    clip.cycles =
       value === "" || !(Number(value) > 0)
         ? null
-        : Math.min(Number(value), REEL_MAX_CLIP_SECONDS);
+        : roundToHalfCycle(value);
+    clip.duration = null;
     persistReelState();
     renderReel();
   });
@@ -2395,10 +3441,22 @@ function buildReelClipActions(clip, index) {
     return button;
   };
 
+  const isLoaded = Boolean(
+    reel.loadedClip && reel.loadedClip.id === clip.id
+  );
+
   wrap.appendChild(
-    make("Load", "Load this clip's settings into the sketch", () =>
-      loadReelClipIntoSketch(clip.id)
-    )
+    isLoaded && reel.loadedClipDirty
+      ? make(
+          "Apply",
+          "Save the sketch's current settings into this clip",
+          applyUpdatesToLoadedClip
+        )
+      : make(
+          isLoaded ? "Loaded" : "Load",
+          "Load this clip's settings into the sketch",
+          () => loadReelClipIntoSketch(clip.id)
+        )
   );
   wrap.appendChild(
     make("←", "Move earlier", () => moveReelClip(clip.id, -1), index === 0)

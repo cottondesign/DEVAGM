@@ -360,6 +360,22 @@
       padding: 8px;
     }
 
+    .reel-clip.loaded {
+      border-color: var(--page-fg, #f4f1ea);
+    }
+
+    .reel-more-clips {
+      padding: 6px;
+      font-size: 10px;
+      opacity: 0.7;
+    }
+
+    .reel-random-row {
+      display: grid;
+      grid-template-columns: 64px 1fr;
+      gap: 6px;
+    }
+
     .reel-clip.dragging {
       opacity: 0.35;
     }
@@ -1141,11 +1157,13 @@
         <option value="16:9" selected>16:9</option>
         <option value="1:1">1:1</option>
         <option value="4:5">4:5</option>
-        <option value="960:1536">960×1536</option>
-        <option value="1440:768">1440×768</option>
-        <option value="2496:768">2496×768</option>
+        <option value="960:1536">960×1536 (2nd floor)</option>
         <option value="2496:786">2496×786</option>
-        <option value="1824:2304">1824×2304</option>
+        <option value="1824:2304">1824×2304 (3rd floor)</option>
+        <option value="2496:768">2496×768 (lobby right)</option>
+        <option value="1440:768">1440×768 (lobby left)</option>
+        <option value="1440:768-split">1440×768 (lobby left split)</option>
+        <option value="720:768" hidden>720×768 (one split side)</option>
       </select>
     </div>
 
@@ -1891,7 +1909,7 @@
       <input
         id="cameraZoom"
         type="range"
-        min="0.15"
+        min="0.7"
         max="4.5"
         step="0.01"
         value="1"
@@ -1968,6 +1986,9 @@
             <option value="diagonal-down-vertical">
               Diagonal ↘ + vertical
             </option>
+            <option value="outline">
+              Outline only (shape silhouette)
+            </option>
           </select>
         </div>
 
@@ -2007,6 +2028,35 @@
 
           Shade cube faces
         </label>
+
+        <div class="control-group" id="lightAngleGroup">
+          <div class="control-row">
+            <label for="lightAngle">
+              Light angle
+            </label>
+          </div>
+
+          <select id="lightAngle">
+            <option value="left" selected>
+              From left (left light · top original · right dark)
+            </option>
+            <option value="right">
+              From right (right light · top original · left dark)
+            </option>
+            <option value="top-left">
+              Above left (top light · left original · right dark)
+            </option>
+            <option value="top-right">
+              Above right (top light · right original · left dark)
+            </option>
+            <option value="low-left">
+              Low left (left light · right original · top dark)
+            </option>
+            <option value="low-right">
+              Low right (right light · left original · top dark)
+            </option>
+          </select>
+        </div>
       </div>
     </details>
 
@@ -2111,6 +2161,43 @@
       Add Clip to Sequence
     </button>
 
+    <button
+      id="reelApplyUpdatesButton"
+      type="button"
+      class="hidden"
+      title="Save the sketch's current settings into the clip you loaded"
+    >
+      Apply Updates to Clip
+    </button>
+
+    <div class="control-group">
+      <div class="control-row">
+        <label for="reelRandomMinutes">
+          Add random clips (minutes)
+        </label>
+      </div>
+
+      <div class="reel-random-row">
+        <input
+          id="reelRandomMinutes"
+          type="number"
+          min="0.5"
+          step="0.5"
+          value="2"
+        />
+
+        <button id="reelRandomClipsButton" type="button">
+          Add Random Clips
+        </button>
+      </div>
+
+      <p class="note">
+        Generates random clips until they add up to
+        this many minutes, then Auto Arranges the whole
+        sequence.
+      </p>
+    </div>
+
     <div id="reelEditorHead" class="control-group hidden">
       <button id="reelBackButton" type="button">
         ← Back to Sketch Controls
@@ -2125,6 +2212,14 @@
           Alternate Arrange
         </button>
       </div>
+
+      <button
+        id="reelShortenClipsButton"
+        type="button"
+        title="Clips over 15 seconds get fewer fold cycles (in halves) so they run 15 seconds or less"
+      >
+        Shorten Clips (15s max)
+      </button>
 
       <p class="note" id="reelContrastNote">
         Drag clips to reorder. Auto Arrange picks the
@@ -2147,6 +2242,48 @@
         Every clip is re-rendered at this ratio when
         it plays or exports; other clip settings stay
         as saved.
+      </p>
+    </div>
+
+    <div class="control-group">
+      <div class="control-row">
+        <label for="reelContentScaleMode">
+          Scaling across screens
+        </label>
+      </div>
+
+      <select id="reelContentScaleMode">
+        <option value="area" selected>Even across screens (match screen area)</option>
+        <option value="fit">Fit the whole original frame</option>
+        <option value="pixels">Original pixel size (crops smaller screens)</option>
+      </select>
+
+      <p class="note">
+        Clips remember the aspect ratio they were made
+        at. On a different screen the cubes resize with
+        the canvas, so it's like the frame's edges moved
+        instead of the picture zooming. Camera zoom and
+        placement aren't changed.
+      </p>
+    </div>
+
+    <div id="reelSplitModeGroup" class="control-group hidden">
+      <div class="control-row">
+        <label for="reelSplitMode">
+          Split screen content
+        </label>
+      </div>
+
+      <select id="reelSplitMode">
+        <option value="alternate" selected>Alternate clips on each side</option>
+        <option value="crop">Same clip, two different crops</option>
+      </select>
+
+      <p class="note">
+        Alternate plays the sequence on both 720×768
+        sides with the right side reordered so the same
+        clip is never on both at once. Two crops shows
+        one clip with each side framed differently.
       </p>
     </div>
 
@@ -2180,7 +2317,7 @@
     <div class="control-group">
       <div class="control-row">
         <label for="reelDefaultDuration">
-          Clip duration
+          Clip length (fold cycles)
         </label>
 
         <span
@@ -2193,14 +2330,15 @@
         id="reelDefaultDuration"
         type="range"
         min="0.5"
-        max="1200"
+        max="20"
         step="0.5"
-        value="4"
+        value="2"
       />
 
       <p class="note">
-        Default length for every clip. Trim a clip in
-        the sequence editor to override it.
+        Default length for every clip, counted in full
+        fold + unfold cycles at that clip's speed and
+        pauses. Override a clip in the sequence editor.
       </p>
     </div>
 
@@ -2260,6 +2398,32 @@
           Add Sequence as Preset
         </button>
       </div>
+
+      <input
+        id="reelPresetName"
+        type="text"
+        placeholder="Sequence preset name (optional)"
+        style="margin-top: 8px"
+      />
+
+      <div class="button-row" style="margin-top: 8px">
+        <button id="reelExportJsonButton" type="button">
+          Export Sequence JSON
+        </button>
+
+        <button id="reelImportJsonButton" type="button">
+          Import Sequence JSON
+        </button>
+      </div>
+
+      <input
+        id="reelImportJsonInput"
+        type="file"
+        accept="application/json,.json"
+        class="hidden"
+      />
+
+      <p id="reelPresetSaveNote" class="note"></p>
 
       <div
         id="reelPreviewControls"

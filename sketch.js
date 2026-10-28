@@ -26,8 +26,73 @@ const ASPECT_PRESETS = {
     width: 1824,
     height: 2304,
     outputPixels: true
+  },
+  /* Lobby left as two separate 720×768 screens. */
+  "1440:768-split": {
+    width: 1440,
+    height: 768,
+    outputPixels: true,
+    split: true
+  },
+  /* One half of the split lobby; used for per-side renders. */
+  "720:768": {
+    width: 720,
+    height: 768,
+    outputPixels: true
   }
 };
+
+const RETIRED_ASPECT_RATIOS = {
+  "3936:768": "2496:768",
+  "3936:768-tilted": "2496:768"
+};
+
+function migrateAspectKey(key) {
+  return RETIRED_ASPECT_RATIOS[key] || key;
+}
+
+/*
+ * Run with ?renderWorker: a hidden second copy of the
+ * sketch that renders the other side of the split
+ * lobby. It never reads or writes saved state.
+ */
+const RENDER_WORKER = new URLSearchParams(
+  window.location.search
+).has("renderWorker");
+
+/*
+ * Reel clips keep the aspect they were authored at;
+ * at another canvas size the cube size scales with
+ * the canvas instead of staying a fixed pixel size,
+ * so layouts see the same frame scaled, not cropped.
+ */
+let contentReferenceAspect = null;
+let contentScaleMode = "area";
+
+/* How the split lobby draws a single clip: two crops. */
+let splitViewMode = "crop";
+const SPLIT_CROP_SHIFT = 0.25;
+
+function getContentScale() {
+  if (!contentReferenceAspect || contentScaleMode === "pixels") {
+    return 1;
+  }
+
+  const reference =
+    ASPECT_PRESETS[migrateAspectKey(contentReferenceAspect)];
+
+  if (!reference || !(width > 0) || !(height > 0)) {
+    return 1;
+  }
+
+  const ref = resolveAspectCanvasSize(reference);
+
+  if (contentScaleMode === "fit") {
+    return min(width / ref.width, height / ref.height);
+  }
+
+  return sqrt((width * height) / (ref.width * ref.height));
+}
 
 const CANVAS_WIDTH = ASPECT_PRESETS["16:9"].width;
 const CANVAS_HEIGHT = ASPECT_PRESETS["16:9"].height;
@@ -44,7 +109,6 @@ const controls = {};
 const PALETTE = [
   "#032932",
   "#0A4552",
-  "#32EEFF",
   "#DAFF47",
   "#5D005D",
   "#16C518",
@@ -56,6 +120,61 @@ const PALETTE = [
   "#FF520D",
   "#FFB616"
 ];
+
+const RETIRED_PALETTE_COLOR = "#32eeff";
+const RETIRED_PALETTE_REPLACEMENT = "#0DB6FF";
+
+function migrateRetiredPaletteColor(hex) {
+  if (
+    typeof hex === "string" &&
+    hex.toLowerCase() === RETIRED_PALETTE_COLOR
+  ) {
+    return RETIRED_PALETTE_REPLACEMENT;
+  }
+
+  return hex;
+}
+
+function migratePresetSnapshot(preset) {
+  if (!preset || typeof preset !== "object") {
+    return preset;
+  }
+
+  let changed = false;
+  const next = { ...preset };
+
+  for (const key of [
+    "monoColor",
+    "outerColor",
+    "innerColor"
+  ]) {
+    if (typeof next[key] !== "string") {
+      continue;
+    }
+
+    const migrated = migrateRetiredPaletteColor(
+      next[key]
+    );
+
+    if (migrated !== next[key]) {
+      next[key] = migrated;
+      changed = true;
+    }
+  }
+
+  if (
+    next.fields &&
+    RETIRED_ASPECT_RATIOS[next.fields.aspectRatio]
+  ) {
+    next.fields = {
+      ...next.fields,
+      aspectRatio: migrateAspectKey(next.fields.aspectRatio)
+    };
+    changed = true;
+  }
+
+  return changed ? next : preset;
+}
 
 const BACKGROUNDS = {
   light: "#FEF9F3",
@@ -308,7 +427,8 @@ const PRESET_FIELD_IDS = [
   "showGrid",
   "showCubeGrid",
   "allowBoxExtents",
-  "showFaceShading"
+  "showFaceShading",
+  "lightAngle"
 ];
 
 const REMOVED_SKETCH_MODES = new Set([
@@ -326,9 +446,9 @@ const REMOVED_SKETCH_MODES = new Set([
 let animatedProgress = 0;
 let animationDirection = 1;
 let animationPauseTimer = 0;
-let monoColor = PALETTE[2];
+let monoColor = RETIRED_PALETTE_REPLACEMENT;
 let outerColor = PALETTE[1];
-let innerColor = PALETTE[3];
+let innerColor = PALETTE[2];
 
 /*
  * Two-tone shuffle: per-cube inside color, keyed by the
@@ -345,8 +465,22 @@ const SHUFFLE_SWAP_WHEN_FLAT = new Set([
   "one-at-a-time"
 ]);
 
-let shuffleInnerColors = new WeakMap();
-let shuffleInnerColorsBySeed = new Map();
+function createShuffleChannel() {
+  return {
+    byObject: new WeakMap(),
+    bySeed: new Map(),
+    round: 0,
+    color: null
+  };
+}
+
+/*
+ * Inside-out cubes evert, so the outer shell is the
+ * sealed side while inverted; it shuffles on its own
+ * channel at that moment.
+ */
+let innerShuffle = createShuffleChannel();
+let outerShuffle = createShuffleChannel();
 let shuffleInnerVersion = 0;
 let shuffleInnerFrozen = false;
 
@@ -444,7 +578,7 @@ function setup() {
    * Restore the last session when present. Otherwise
    * start flat with the HTML defaults.
    */
-  if (!restoreSessionSettings()) {
+  if (RENDER_WORKER || !restoreSessionSettings()) {
     controls.foldProgress.value = 0;
     controls.drapeAmount.value = 1;
     controls.cubeCoverage.value = 100;
@@ -477,6 +611,11 @@ function setup() {
 
   if (typeof initReel === "function") {
     initReel();
+  }
+
+  if (RENDER_WORKER) {
+    noLoop();
+    window.reelWorkerReady = true;
   }
 }
 
@@ -513,8 +652,27 @@ function draw() {
     updateInsideOut(settings);
   } else if (settings.sketchMode === "one-at-a-time") {
     updateOneAtATime(settings);
+  }
+
+  drawScene(settings);
+  drawTiltedPanel(settings);
+  drawSplitCropPanel(settings);
+
+  if (isWanderMode(settings.sketchMode)) {
+    updateWander(settings);
+  }
+
+  updateFpsMeter(settings);
+}
+
+/*
+ * Rendering only — simulation updates stay in draw()
+ * so a second pass (tilted lobby panel) is side-effect
+ * free.
+ */
+function drawScene(settings) {
+  if (settings.sketchMode === "one-at-a-time") {
     drawOneAtATimeFrame(settings);
-    updateFpsMeter(settings);
     return;
   }
 
@@ -568,12 +726,151 @@ function draw() {
     drawInsideOut(settings);
   } else if (isWanderMode(settings.sketchMode)) {
     drawWanderAgents(settings);
-    updateWander(settings);
   } else {
     drawAllNets(settings);
   }
+}
 
-  updateFpsMeter(settings);
+/* Set while drawing the tilted lobby panel. */
+let screenTilt = null;
+
+function getActiveAspectPreset() {
+  const key =
+    controls.aspectRatio
+      ? controls.aspectRatio.value
+      : "16:9";
+
+  return ASPECT_PRESETS[key] || ASPECT_PRESETS["16:9"];
+}
+
+/*
+ * Split lobby, one clip: the right screen redraws the
+ * scene shifted so it shows a different crop rather
+ * than continuing the left screen's picture.
+ */
+function drawSplitCropPanel(settings) {
+  const preset = getActiveAspectPreset();
+
+  if (!preset.split || splitViewMode !== "crop") {
+    return;
+  }
+
+  const gl = drawingContext;
+  const bufferWidth = gl.drawingBufferWidth;
+  const bufferHeight = gl.drawingBufferHeight;
+  const scissorX = round(bufferWidth * 0.5);
+
+  gl.enable(gl.SCISSOR_TEST);
+  gl.scissor(scissorX, 0, bufferWidth - scissorX, bufferHeight);
+
+  background(getBackgroundColor(settings));
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+
+  screenTilt = {
+    radians: 0,
+    centerX: 0,
+    offsetX: width * SPLIT_CROP_SHIFT
+  };
+
+  push();
+  noLights();
+  drawScene(settings);
+  pop();
+
+  screenTilt = null;
+  gl.disable(gl.SCISSOR_TEST);
+}
+
+/*
+ * Redraws the scene into the right-hand screen only,
+ * turned clockwise about that screen's center.
+ */
+function drawTiltedPanel(settings) {
+  const preset = getActiveAspectPreset();
+
+  if (!preset.tilt) {
+    return;
+  }
+
+  const gl = drawingContext;
+  const split = preset.tilt.splitPixels / preset.width;
+  const bufferWidth = gl.drawingBufferWidth;
+  const bufferHeight = gl.drawingBufferHeight;
+  const scissorX = round(bufferWidth * split);
+
+  gl.enable(gl.SCISSOR_TEST);
+  gl.scissor(scissorX, 0, bufferWidth - scissorX, bufferHeight);
+
+  background(getBackgroundColor(settings));
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+
+  const panelCenterX =
+    width * split + (width * (1 - split)) * 0.5 - width * 0.5;
+
+  screenTilt = {
+    radians: radians(preset.tilt.degrees),
+    centerX: panelCenterX
+  };
+
+  push();
+  /* lights accumulate per frame; don't double them */
+  noLights();
+  drawScene(settings);
+  pop();
+
+  screenTilt = null;
+  gl.disable(gl.SCISSOR_TEST);
+}
+
+/*
+ * Left-multiplies the projection by a screen-space
+ * clockwise rotation about the tilted panel center.
+ * Done in pixel space so the canvas aspect doesn't
+ * shear the rotation.
+ */
+function applyScreenTilt() {
+  if (!screenTilt) {
+    return;
+  }
+
+  const renderer = p5.instance && p5.instance._renderer;
+
+  if (!renderer || !renderer.uPMatrix) {
+    return;
+  }
+
+  const a = width * 0.5;
+  const b = height * 0.5;
+  const c = cos(screenTilt.radians);
+  const s = sin(screenTilt.radians);
+  const px = screenTilt.centerX;
+  const shiftX = (screenTilt.offsetX || 0) / a;
+
+  const m = [
+    [c, (s * b) / a, 0, (px / a) * (1 - c) + shiftX],
+    [(-s * a) / b, c, 0, (s * px) / b],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]
+  ];
+
+  const p = renderer.uPMatrix.mat4;
+  const out = new Array(16);
+
+  for (let col = 0; col < 4; col++) {
+    for (let row = 0; row < 4; row++) {
+      let sum = 0;
+
+      for (let k = 0; k < 4; k++) {
+        sum += m[row][k] * p[col * 4 + k];
+      }
+
+      out[col * 4 + row] = sum;
+    }
+  }
+
+  for (let i = 0; i < 16; i++) {
+    p[i] = out[i];
+  }
 }
 
 function advanceSimulation(settings) {
@@ -782,21 +1079,16 @@ function isTwoToneColorMode(mode) {
  * round; every other cube adopts the latest round color
  * at its own swap moment.
  */
-let sharedShuffleRound = 0;
-let sharedShuffleColor = null;
-
 function resetShuffleInnerColors() {
-  shuffleInnerColors = new WeakMap();
-  shuffleInnerColorsBySeed = new Map();
-  sharedShuffleRound = 0;
-  sharedShuffleColor = null;
+  innerShuffle = createShuffleChannel();
+  outerShuffle = createShuffleChannel();
   shuffleInnerVersion++;
 }
 
-function pickShuffleInnerColor(current, settings) {
+function pickShuffleColor(current, otherSide, settings) {
   const avoid = new Set([
     String(current).toLowerCase(),
-    String(outerColor).toLowerCase(),
+    String(otherSide).toLowerCase(),
     String(getBackgroundColor(settings)).toLowerCase()
   ]);
 
@@ -809,20 +1101,32 @@ function pickShuffleInnerColor(current, settings) {
     : current;
 }
 
-function getInnerColorFor(key, closed, settings) {
-  if (!isShuffleColorMode(settings.colorMode)) {
-    return settings.innerColor;
-  }
-
+function shuffleChannelEntry(channel, key) {
   const store =
     key !== null && typeof key === "object"
-      ? shuffleInnerColors
-      : shuffleInnerColorsBySeed;
+      ? channel.byObject
+      : channel.bySeed;
 
-  let entry = store.get(key);
+  return {
+    entry: store.get(key),
+    store
+  };
+}
+
+function getShuffledColorFor(
+  channel,
+  key,
+  closed,
+  settings,
+  initialHex,
+  otherSideHex
+) {
+  const { entry: found, store } =
+    shuffleChannelEntry(channel, key);
+  let entry = found;
 
   if (!entry) {
-    entry = { hex: settings.innerColor, closed, round: 0 };
+    entry = { hex: initialHex, closed, round: 0 };
     store.set(key, entry);
     return entry.hex;
   }
@@ -833,19 +1137,21 @@ function getInnerColorFor(key, closed, settings) {
 
   if (closed && !entry.closed) {
     if (settings.colorMode === "two-tone-shuffle-sync") {
-      if (entry.round === sharedShuffleRound) {
-        sharedShuffleColor = pickShuffleInnerColor(
-          sharedShuffleColor || settings.innerColor,
+      if (entry.round === channel.round) {
+        channel.color = pickShuffleColor(
+          channel.color || initialHex,
+          otherSideHex,
           settings
         );
-        sharedShuffleRound++;
+        channel.round++;
       }
 
-      entry.round = sharedShuffleRound;
-      entry.hex = sharedShuffleColor || settings.innerColor;
+      entry.round = channel.round;
+      entry.hex = channel.color || initialHex;
     } else {
-      entry.hex = pickShuffleInnerColor(
+      entry.hex = pickShuffleColor(
         entry.hex,
+        otherSideHex,
         settings
       );
     }
@@ -856,6 +1162,55 @@ function getInnerColorFor(key, closed, settings) {
   entry.closed = closed;
 
   return entry.hex;
+}
+
+function peekShuffledColor(channel, key, fallbackHex) {
+  const { entry } = shuffleChannelEntry(channel, key);
+  return entry ? entry.hex : fallbackHex;
+}
+
+function getInnerColorFor(
+  key,
+  closed,
+  settings,
+  outerHex = outerColor
+) {
+  if (!isShuffleColorMode(settings.colorMode)) {
+    return settings.innerColor;
+  }
+
+  return getShuffledColorFor(
+    innerShuffle,
+    key,
+    closed,
+    settings,
+    settings.innerColor,
+    outerHex
+  );
+}
+
+function getOuterShuffleColorFor(
+  key,
+  closed,
+  settings,
+  fallbackHex
+) {
+  if (!isShuffleColorMode(settings.colorMode)) {
+    return fallbackHex;
+  }
+
+  return getShuffledColorFor(
+    outerShuffle,
+    key,
+    closed,
+    settings,
+    fallbackHex,
+    peekShuffledColor(
+      innerShuffle,
+      key,
+      settings.innerColor
+    )
+  );
 }
 
 function getFaceOuterColor(
@@ -1121,7 +1476,7 @@ const RANDOMIZE_EXCLUDED_MODES = new Set([
  * landing on settings that stall the frame rate.
  */
 const RANDOMIZE_RANGE_LIMITS = {
-  cameraZoom: [0.5, 2.5],
+  cameraZoom: [0.7, 2.5],
   cascadeCount: [4, 80],
   animationSpeed: [0.004, 0.03],
   wanderSpeed: [0.004, 0.03],
@@ -1153,7 +1508,18 @@ function randomRangeValue(el, id) {
 }
 
 function randomizeEverything() {
-  const snapshot = collectPresetSnapshot();
+  applyPresetSnapshot(buildRandomizedSnapshot());
+  resetShuffleInnerColors();
+}
+
+/*
+ * `modeWeights` maps sketch modes to relative odds
+ * (default 1) when picking the mode.
+ */
+function buildRandomizedSnapshot(modeWeights = null) {
+  const snapshot = JSON.parse(
+    JSON.stringify(collectPresetSnapshot())
+  );
   const fields = snapshot.fields;
 
   for (const id of PRESET_FIELD_IDS) {
@@ -1178,7 +1544,10 @@ function randomizeEverything() {
         );
 
       if (options.length) {
-        fields[id] = pickRandomFrom(options);
+        fields[id] =
+          id === "sketchMode" && modeWeights
+            ? pickWeightedFrom(options, modeWeights)
+            : pickRandomFrom(options);
       }
     }
   }
@@ -1214,8 +1583,27 @@ function randomizeEverything() {
     fields.divisionMatchBackground = true;
   }
 
-  applyPresetSnapshot(snapshot);
-  resetShuffleInnerColors();
+  return snapshot;
+}
+
+function pickWeightedFrom(list, weights) {
+  const weightOf = (value) =>
+    weights[value] === undefined ? 1 : weights[value];
+  const total = list.reduce(
+    (sum, value) => sum + weightOf(value),
+    0
+  );
+  let roll = Math.random() * total;
+
+  for (const value of list) {
+    roll -= weightOf(value);
+
+    if (roll < 0) {
+      return value;
+    }
+  }
+
+  return list[list.length - 1];
 }
 
 function readPresetStore() {
@@ -1229,15 +1617,38 @@ function readPresetStore() {
 
     const parsed = JSON.parse(raw);
 
-    return parsed && typeof parsed === "object"
-      ? parsed
-      : {};
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+
+    let migrated = false;
+
+    for (const name of Object.keys(parsed)) {
+      const updated = migratePresetSnapshot(
+        parsed[name]
+      );
+
+      if (updated !== parsed[name]) {
+        parsed[name] = updated;
+        migrated = true;
+      }
+    }
+
+    if (migrated) {
+      writePresetStore(parsed);
+    }
+
+    return parsed;
   } catch (error) {
     return {};
   }
 }
 
 function writePresetStore(store) {
+  if (RENDER_WORKER) {
+    return;
+  }
+
   localStorage.setItem(
     PRESET_STORAGE_KEY,
     JSON.stringify(store)
@@ -1245,7 +1656,7 @@ function writePresetStore(store) {
 }
 
 function scheduleSessionSave() {
-  if (sessionRestoring || reelRendering) {
+  if (sessionRestoring || reelRendering || RENDER_WORKER) {
     return;
   }
 
@@ -1261,6 +1672,7 @@ function scheduleSessionSave() {
 
 function saveSessionSettings() {
   if (
+    RENDER_WORKER ||
     sessionRestoring ||
     reelRendering ||
     !controls.foldProgress
@@ -1301,6 +1713,24 @@ function restoreSessionSettings() {
     return false;
   }
 
+  const migrated = migratePresetSnapshot(preset);
+
+  if (migrated !== preset) {
+    preset = migrated;
+
+    try {
+      localStorage.setItem(
+        SESSION_SETTINGS_KEY,
+        JSON.stringify(preset)
+      );
+    } catch (error) {
+      /*
+       * Quota / private-mode failures shouldn't block
+       * restoring the session.
+       */
+    }
+  }
+
   sessionRestoring = true;
   applyPresetSnapshot(preset);
   sessionRestoring = false;
@@ -1335,12 +1765,51 @@ function refreshPresetSelect(selectedName = "") {
     select.appendChild(option);
   }
 
+  const values = [...names];
+
+  if (typeof readReelPresetStore === "function") {
+    const sequences = readReelPresetStore();
+    const sequenceNames = Object.keys(sequences).sort(
+      (a, b) => a.localeCompare(b)
+    );
+
+    if (sequenceNames.length) {
+      const group = document.createElement("optgroup");
+      group.label = "Sequences";
+
+      for (const name of sequenceNames) {
+        const count = Array.isArray(sequences[name].clips)
+          ? sequences[name].clips.length
+          : 0;
+        const option = document.createElement("option");
+
+        option.value = SEQUENCE_PRESET_PREFIX + name;
+        option.textContent =
+          `${name} · ${count} clip${count === 1 ? "" : "s"}`;
+        group.appendChild(option);
+        values.push(option.value);
+      }
+
+      select.appendChild(group);
+    }
+  }
+
   if (
     previous &&
-    names.includes(previous)
+    values.includes(previous)
   ) {
     select.value = previous;
   }
+}
+
+const SEQUENCE_PRESET_PREFIX = "sequence:";
+
+function getSelectedSequencePresetName() {
+  const value = controls.presetSelect.value;
+
+  return value.startsWith(SEQUENCE_PRESET_PREFIX)
+    ? value.slice(SEQUENCE_PRESET_PREFIX.length)
+    : null;
 }
 
 function collectPresetSnapshot() {
@@ -1397,6 +1866,13 @@ function loadSelectedPreset() {
     return;
   }
 
+  const sequenceName = getSelectedSequencePresetName();
+
+  if (sequenceName !== null) {
+    loadSequencePresetByName(sequenceName);
+    return;
+  }
+
   const store = readPresetStore();
   const preset = store[name];
 
@@ -1411,6 +1887,13 @@ function deleteSelectedPreset() {
   const name = controls.presetSelect.value;
 
   if (!name) {
+    return;
+  }
+
+  const sequenceName = getSelectedSequencePresetName();
+
+  if (sequenceName !== null) {
+    deleteSequencePresetByName(sequenceName);
     return;
   }
 
@@ -1429,6 +1912,9 @@ function deleteSelectedPreset() {
 function applyPresetSnapshot(preset) {
   const fields = preset.fields || {};
 
+  contentReferenceAspect = null;
+  splitViewMode = "crop";
+
   for (const id of PRESET_FIELD_IDS) {
     if (!(id in fields)) {
       continue;
@@ -1442,6 +1928,8 @@ function applyPresetSnapshot(preset) {
 
     if (el.type === "checkbox") {
       el.checked = Boolean(fields[id]);
+    } else if (id === "aspectRatio") {
+      el.value = migrateAspectKey(String(fields[id]));
     } else {
       el.value = String(fields[id]);
     }
@@ -1451,15 +1939,21 @@ function applyPresetSnapshot(preset) {
   controls.showCubeGrid.checked = false;
 
   if (typeof preset.monoColor === "string") {
-    monoColor = preset.monoColor;
+    monoColor = migrateRetiredPaletteColor(
+      preset.monoColor
+    );
   }
 
   if (typeof preset.outerColor === "string") {
-    outerColor = preset.outerColor;
+    outerColor = migrateRetiredPaletteColor(
+      preset.outerColor
+    );
   }
 
   if (typeof preset.innerColor === "string") {
-    innerColor = preset.innerColor;
+    innerColor = migrateRetiredPaletteColor(
+      preset.innerColor
+    );
   }
 
   if (typeof preset.placementSeed === "number") {
@@ -1496,13 +1990,24 @@ function applyPresetSnapshot(preset) {
     controls.showDivisions.checked &&
     controls.showFaceShading.checked;
   syncingQuickToggle = false;
+  syncLightAngleUI();
 
-  if (controls.presetSelect.value) {
+  if (
+    controls.presetSelect.value &&
+    getSelectedSequencePresetName() === null
+  ) {
     controls.presetName.value =
       controls.presetSelect.value;
   }
 
   scheduleSessionSave();
+}
+
+function syncLightAngleUI() {
+  controls.lightAngleGroup.classList.toggle(
+    "hidden",
+    !controls.showFaceShading.checked
+  );
 }
 
 function syncColorModeUI() {
@@ -1762,6 +2267,8 @@ function getControls() {
     "showCubeGrid",
     "allowBoxExtents",
     "showFaceShading",
+    "lightAngle",
+    "lightAngleGroup",
     "unfoldButton",
     "foldButton",
     "randomizePlacementsButton",
@@ -2063,6 +2570,7 @@ function connectControls() {
       controls.showDivisions.checked = on;
       controls.showFaceShading.checked = on;
       syncingQuickToggle = false;
+      syncLightAngleUI();
     }
   );
 
@@ -2092,7 +2600,10 @@ function connectControls() {
 
   controls.showFaceShading.addEventListener(
     "change",
-    syncQuickFromParts
+    () => {
+      syncQuickFromParts();
+      syncLightAngleUI();
+    }
   );
 
   controls.gridPlacement.addEventListener(
@@ -2224,7 +2735,11 @@ function connectControls() {
   controls.presetSelect.addEventListener(
     "change",
     () => {
-      if (controls.presetSelect.value) {
+      /* Sequences replace the reel, so they wait for Load. */
+      if (
+        controls.presetSelect.value &&
+        getSelectedSequencePresetName() === null
+      ) {
         loadSelectedPreset();
       }
     }
@@ -2299,7 +2814,7 @@ function getSettings() {
    * being cancelled by a compensating face scale.
    */
   const referencePixelsPerWorldUnit =
-    height / (getVerticalView(1) * 2);
+    height / (getVerticalView(1) * 2 * getContentScale());
 
   const faceSize =
     gridSize /
@@ -2521,7 +3036,10 @@ function getSettings() {
       controls.allowBoxExtents.checked,
 
     showFaceShading:
-      controls.showFaceShading.checked
+      controls.showFaceShading.checked,
+
+    lightAngle:
+      controls.lightAngle.value
   };
 }
 
@@ -2728,6 +3246,73 @@ function getMaxFoldStaggerDelay(settings) {
   return maxDelay;
 }
 
+/*
+ * Seconds for one full fold cycle (fold + unfold, with
+ * pauses) at 60 simulation steps per second, or null
+ * when the mode has no repeating fold (static frame).
+ * Roll grid counts one roll as a cycle.
+ */
+function getFoldCycleSeconds(settings, staggerDelay = 0) {
+  const speed = Number(settings.animationSpeed) || 0;
+
+  if (speed <= 0) {
+    return null;
+  }
+
+  const perSec = speed * 60;
+  const mode = settings.sketchMode;
+
+  if (mode === "gridded" || mode === "image") {
+    if (!settings.animateFolding) {
+      return null;
+    }
+
+    return (
+      (2 * (1 + staggerDelay)) / perSec +
+      2 * max(0, Number(settings.cascadePause) || 0)
+    );
+  }
+
+  if (mode === "cascade") {
+    return (
+      2 / (perSec * 1.65) +
+      2 * max(0, Number(settings.cascadePause) || 0)
+    );
+  }
+
+  if (mode === "one-at-a-time") {
+    return (
+      2 / perSec +
+      max(0, Number(settings.oneAtATimeHold) || 0) +
+      max(0, Number(settings.oneAtATimeGap) || 0)
+    );
+  }
+
+  if (mode === "inside-out") {
+    return (
+      insideOutCycleLength(settings) /
+      insideOutFlipRatePerSec(settings)
+    );
+  }
+
+  if (mode === "roll-grid") {
+    return (
+      (1 + rollGridPauseUnits(settings)) /
+      rollGridTipRatePerSec(settings)
+    );
+  }
+
+  if (mode === "wander-roll") {
+    return 1 / wanderRollRate(settings);
+  }
+
+  if (isWanderMode(mode)) {
+    return 2 / wanderFoldRate(settings);
+  }
+
+  return null;
+}
+
 function staggeredNetFoldProgress(
   globalProgress,
   foldDelay,
@@ -2901,6 +3486,7 @@ function syncSketchModeUI() {
 
   syncRollGridMotionUI();
   syncColorModeUI();
+  syncLightAngleUI();
   syncFoldProgressRange();
   updateImageUploadNote();
 }
@@ -3098,6 +3684,7 @@ function setIsometricCamera(settings) {
     -10000,
     10000
   );
+  applyScreenTilt();
 
   /*
    * True isometric camera:
@@ -3163,12 +3750,19 @@ function getIsometricEyePosition() {
   ];
 }
 
+/*
+ * The camera is orthographic, so facing and depth use
+ * the fixed view direction — measuring toward the eye
+ * point misjudges faces far from the canvas center.
+ */
+function getIsometricViewDirection() {
+  return normalizeVector(getIsometricEyePosition());
+}
+
 function getFaceViewerDistance(center) {
-  return vectorLength(
-    subtractVectors(
-      getIsometricEyePosition(),
-      center
-    )
+  return (
+    vectorLength(getIsometricEyePosition()) -
+    dotVectors(center, getIsometricViewDirection())
   );
 }
 
@@ -3179,8 +3773,12 @@ function beginCloserFaceDepthBias(units) {
     return;
   }
 
+  /*
+   * Positive units push a face back (inner shells) so
+   * it never wins against an outer shell it touches.
+   */
   gl.enable(gl.POLYGON_OFFSET_FILL);
-  gl.polygonOffset(-1, units);
+  gl.polygonOffset(units > 0 ? 1 : -1, units);
 }
 
 function endCloserFaceDepthBias() {
@@ -3203,6 +3801,7 @@ function beginScreenSpaceCamera() {
     -1000,
     1000
   );
+  applyScreenTilt();
 
   camera(
     0,
@@ -5780,11 +6379,47 @@ function solidBoxSlotForDirection(dir) {
  * Edge k of a face runs corner k → k+1, bordering the
  * −v, +u, +v, −u neighbor in turn.
  */
+/*
+ * Rolling boxes are drawn inside a rotated model
+ * matrix, so facing must use the world-space normal.
+ */
+function modelToWorldDirection(dir) {
+  const renderer = p5.instance && p5.instance._renderer;
+  const model = renderer && renderer.uModelMatrix;
+
+  if (!model) {
+    return dir;
+  }
+
+  const m = model.mat4;
+
+  return [
+    m[0] * dir[0] + m[4] * dir[1] + m[8] * dir[2],
+    m[1] * dir[0] + m[5] * dir[1] + m[9] * dir[2],
+    m[2] * dir[0] + m[6] * dir[1] + m[10] * dir[2]
+  ];
+}
+
 function getSolidBoxEdgeMask(slot, face, paint, settings) {
   const filter = settings.divisionAngleFilter || "all";
 
   if (!settings.showDivisions || filter === "all") {
     return null;
+  }
+
+  if (filter === "outline") {
+    const facing = isFacingCamera(
+      modelToWorldDirection(face.normal)
+    );
+
+    return [
+      scaleVector(face.v, -1),
+      face.u,
+      face.v,
+      scaleVector(face.u, -1)
+    ].map((dir) =>
+      isFacingCamera(modelToWorldDirection(dir)) !== facing
+    );
   }
 
   const neighborDirs = [
@@ -7357,12 +7992,8 @@ function getWanderFaceColor(
   settings,
   innerHex = settings.innerColor
 ) {
-  const toCamera = subtractVectors(
-    getIsometricEyePosition(),
-    center
-  );
   const insideVisible =
-    dotVectors(inward, toCamera) > 0;
+    dotVectors(inward, getIsometricViewDirection()) > 0;
 
   if (
     insideVisible &&
@@ -11897,7 +12528,7 @@ function drawNet(
       }
     );
 
-  const baseColor =
+  let baseColor =
     color(netColor);
 
   /* sealed with the inside facing in (not inverted) */
@@ -11905,19 +12536,60 @@ function drawNet(
     ? staggeredProgress <= 0.001
     : !options.invertFold && staggeredProgress >= 0.999;
 
-  const shuffleMoment =
-    SHUFFLE_SWAP_WHEN_FLAT.has(settings.sketchMode)
+  const isInsideOut =
+    settings.sketchMode === "inside-out";
+
+  /*
+   * Inside-out cubes seal in both directions, so the
+   * side shut inside is read from the geometry at each
+   * closed moment and only that side is reshuffled.
+   */
+  const sealedSide = isInsideOut
+    ? getSealedNetSide(
+        transforms,
+        options.insideOutFlow
+          ? staggeredProgress <= 0.001 ||
+              staggeredProgress >= 0.999
+          : staggeredProgress >= 0.999
+      )
+    : null;
+
+  const shuffleMoment = isInsideOut
+    ? sealedSide === "inner"
+    : SHUFFLE_SWAP_WHEN_FLAT.has(settings.sketchMode)
       ? staggeredProgress <= 0.001
       : insideHidden;
+
+  const shuffleKey = options.colorKey ?? creaseSeed;
+
+  const outsideHidden = sealedSide === "outer";
+
+  const shuffleOuter =
+    isInsideOut &&
+    isShuffleColorMode(settings.colorMode);
+
+  const outerHex = shuffleOuter
+    ? getOuterShuffleColorFor(
+        shuffleKey,
+        outsideHidden,
+        settings,
+        netColor
+      )
+    : netColor;
+
+  if (shuffleOuter) {
+    baseColor = color(outerHex);
+  }
 
   const innerBaseColor =
     !options.singleSided &&
     isTwoToneColorMode(settings.colorMode)
       ? color(
           getInnerColorFor(
-            options.colorKey ?? creaseSeed,
+            shuffleKey,
             shuffleMoment,
-            settings
+            settings,
+            outerHex
           )
         )
       : null;
@@ -11927,6 +12599,10 @@ function drawNet(
 
   const rootNormal =
     transforms[activeNet.rootIndex].normal;
+
+  const outlineMasks = isOutlineDivisionMode(settings)
+    ? getNetOutlineEdgeMasks(transforms, edgeSize)
+    : null;
 
   const drawOrder = [];
 
@@ -12007,9 +12683,78 @@ function drawNet(
         edgeSize,
         creaseProgress[faceIndex],
         settings
-      )
+      ),
+      outlineMasks ? outlineMasks[faceIndex] : null
     );
   }
+}
+
+function isOutlineDivisionMode(settings) {
+  return (
+    settings.showDivisions &&
+    settings.divisionAngleFilter === "outline"
+  );
+}
+
+function isFacingCamera(normal) {
+  return dotVectors(normal, getIsometricViewDirection()) > 0;
+}
+
+/*
+ * Outline edges: an edge no other face shares (the
+ * open rim of a net), or one where the sheet turns
+ * from facing the camera to facing away (a fold-over
+ * silhouette, e.g. the hexagon around a sealed cube).
+ * Edge k runs corner k → k+1, matching drawConnectedFace.
+ */
+function getNetOutlineEdgeMasks(transforms, size) {
+  const half = size * 0.5;
+  const epsilon = size * 0.02;
+  const edges = [];
+
+  transforms.forEach((t, faceIndex) => {
+    const u = scaleVector(t.u, half);
+    const v = scaleVector(t.v, half);
+    const corners = [
+      subtractVectors(subtractVectors(t.center, u), v),
+      subtractVectors(addVectors(t.center, u), v),
+      addVectors(addVectors(t.center, u), v),
+      addVectors(subtractVectors(t.center, u), v)
+    ];
+
+    for (let k = 0; k < 4; k++) {
+      const a = corners[k];
+      const b = corners[(k + 1) % 4];
+
+      edges.push({
+        faceIndex,
+        k,
+        mid: scaleVector(addVectors(a, b), 0.5),
+        facing: isFacingCamera(t.normal)
+      });
+    }
+  });
+
+  const masks = transforms.map(() => [true, true, true, true]);
+
+  for (const edge of edges) {
+    for (const other of edges) {
+      if (
+        other.faceIndex === edge.faceIndex ||
+        vectorLength(
+          subtractVectors(edge.mid, other.mid)
+        ) > epsilon
+      ) {
+        continue;
+      }
+
+      if (other.facing === edge.facing) {
+        masks[edge.faceIndex][edge.k] = false;
+      }
+    }
+  }
+
+  return masks;
 }
 
 /*
@@ -12700,6 +13445,44 @@ function createChildTransform(
   };
 }
 
+/*
+ * For a sealed net, which shell ends up inside the
+ * cube: "inner" when outer normals point away from the
+ * cube's center, "outer" when they point into it.
+ */
+function getSealedNetSide(transforms, closed) {
+  if (!closed || !transforms.length) {
+    return null;
+  }
+
+  let cx = 0;
+  let cy = 0;
+  let cz = 0;
+
+  for (const t of transforms) {
+    cx += t.center[0];
+    cy += t.center[1];
+    cz += t.center[2];
+  }
+
+  const center = [
+    cx / transforms.length,
+    cy / transforms.length,
+    cz / transforms.length
+  ];
+
+  let outward = 0;
+
+  for (const t of transforms) {
+    outward += dotVectors(
+      t.normal,
+      subtractVectors(t.center, center)
+    );
+  }
+
+  return outward > 0 ? "inner" : "outer";
+}
+
 function getSharedEdgeOverlap(
   net,
   faceIndex,
@@ -12716,18 +13499,21 @@ function getSharedEdgeOverlap(
 
   /*
    * Only enough overlap to hide antialiasing seams.
-   * Anything past ~half a screen pixel shows as faces
-   * poking out past their hinges.
+   * At convex hinges the overlap pokes out past the
+   * neighbouring face as a sliver of this face's tone,
+   * so keep it to a fraction of a device pixel.
    */
   const worldPerPixel =
     settings && settings.verticalView && height > 0
-      ? (settings.verticalView * 2) / height
+      ? (settings.verticalView * 2) /
+        (height * max(1, pixelDensity()))
       : 1;
 
   const amount =
-    min(faceSize * 0.03, worldPerPixel * 0.5) *
-    Math.sin(
-      constrain(progress, 0, 1) * PI
+    min(faceSize * 0.01, worldPerPixel * 0.3) *
+    Math.pow(
+      Math.sin(constrain(progress, 0, 1) * PI),
+      2
     );
 
   if (amount <= 1e-6 || !net || !net.faces) {
@@ -12853,14 +13639,8 @@ function drawConnectedFace(
 
   const needsInner = Boolean(innerBaseColor);
 
-  const toCamera =
-    subtractVectors(
-      getIsometricEyePosition(),
-      transform.center
-    );
-
   const outwardFacing =
-    dotVectors(normal, toCamera) > 0;
+    dotVectors(normal, getIsometricViewDirection()) > 0;
 
   const outerCorners = corners;
   const inward = scaleVector(normal, -1);
@@ -12915,18 +13695,25 @@ function drawConnectedFace(
       settings,
       true,
       exactColor,
-      closerBias
+      closerBias,
+      edgeMask
     );
   } else {
+    /* reversed corners: inner edge k is outer edge 2,1,0,3 */
+    const innerMask = edgeMask
+      ? [edgeMask[2], edgeMask[1], edgeMask[0], edgeMask[3]]
+      : null;
+
     drawFaceSide(
       innerCorners,
       innerBaseColor,
       inward,
       progress,
       settings,
-      false,
+      Boolean(innerMask),
       exactColor,
-      closerBias
+      closerBias,
+      innerMask
     );
   }
 }
@@ -12965,7 +13752,8 @@ function drawFaceSide(
           baseColor,
           normal,
           progress,
-          settings.showFaceShading
+          settings.showFaceShading,
+          settings.lightAngle
         );
 
   fill(faceColor);
@@ -13144,77 +13932,74 @@ function edgeScreenFamily(a, b) {
   return "diagonal-down";
 }
 
+const FACE_SHADE_LIGHTER = 0.22;
+const FACE_SHADE_DARKER = -0.22;
+
+/*
+ * Tone per visible isometric side for each light
+ * direction: 1 = lighter, 0 = original, -1 = darker.
+ * World +x is the right side, +z the left, −y the top.
+ */
+const LIGHT_ANGLE_TONES = {
+  left: { top: 0, left: 1, right: -1 },
+  right: { top: 0, left: -1, right: 1 },
+  "top-left": { top: 1, left: 0, right: -1 },
+  "top-right": { top: 1, left: -1, right: 0 },
+  "low-left": { top: -1, left: 1, right: 0 },
+  "low-right": { top: -1, left: 0, right: 1 }
+};
+
+function toneToShadeAmount(tone) {
+  if (tone > 0) {
+    return FACE_SHADE_LIGHTER;
+  }
+
+  if (tone < 0) {
+    return FACE_SHADE_DARKER;
+  }
+
+  return 0;
+}
+
 function getFaceColor(
   baseColor,
   normal,
   progress,
-  useShading
+  useShading,
+  lightAngle = "left"
 ) {
   if (!useShading) {
     return baseColor;
   }
 
-  const lightDirection =
-    normalizeVector([
-      -0.5,
-      -1,
-      -0.45
-    ]);
+  const tones =
+    LIGHT_ANGLE_TONES[lightAngle] ||
+    LIGHT_ANGLE_TONES.left;
 
-  const brightness =
-    dotVectors(
-      normalizeVector(normal),
-      scaleVector(
-        lightDirection,
-        -1
-      )
-    );
-
+  /*
+   * Squared normal components sum to 1, so faces
+   * mid-fold blend smoothly between the side tones.
+   */
+  const n = normalizeVector(normal);
   const shade =
-    map(
-      constrain(
-        brightness,
-        -1,
-        1
-      ),
-      -1,
-      1,
-      0.58,
-      1.15
-    );
+    n[0] * n[0] * toneToShadeAmount(tones.right) +
+    n[1] * n[1] * toneToShadeAmount(tones.top) +
+    n[2] * n[2] * toneToShadeAmount(tones.left);
 
   const finalShade =
     lerp(
-      lerp(
-        1,
-        shade,
-        0.45
-      ),
+      shade * 0.45,
       shade,
       progress
     );
 
+  const target = finalShade >= 0 ? 255 : 0;
+  const amount = abs(finalShade);
+
   return color(
-    constrain(
-      red(baseColor) *
-      finalShade,
-      0,
-      255
-    ),
-
-    constrain(
-      green(baseColor) *
-      finalShade,
-      0,
-      255
-    ),
-
-    constrain(
-      blue(baseColor) *
-      finalShade,
-      0,
-      255
-    )
+    lerp(red(baseColor), target, amount),
+    lerp(green(baseColor), target, amount),
+    lerp(blue(baseColor), target, amount)
   );
 }
 
