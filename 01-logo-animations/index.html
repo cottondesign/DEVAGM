@@ -153,6 +153,61 @@
       color: #fff;
     }
 
+    input[type="number"] {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid currentColor;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-size: 11px;
+    }
+
+    .hint {
+      margin: 0;
+      font-size: 11px;
+      line-height: 1.5;
+      opacity: 0.7;
+    }
+
+    .export-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      padding: 14px;
+      border: 1px solid currentColor;
+      flex-shrink: 0;
+    }
+
+    .export-section {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .export-section + .export-section {
+      padding-top: 14px;
+      border-top: 1px dashed currentColor;
+    }
+
+    .panel-title,
+    .section-title {
+      margin: 0;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .section-title {
+      opacity: 0.7;
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
     #canvas-container {
       flex: 1;
       min-width: 0;
@@ -347,62 +402,159 @@
       />
     </div>
 
-    <div class="group">
-      <label for="exportLoops">Export loops</label>
-
-      <input
-        id="exportLoops"
-        type="number"
-        min="1"
-        max="999"
-        step="1"
-        value="5"
-      />
-
-      <p
-        id="exportEstimate"
-        style="margin: 0; font-size: 11px; line-height: 1.5; opacity: 0.7;"
-      ></p>
-
-      <p style="margin: 0; font-size: 11px; line-height: 1.5; opacity: 0.7;">
-        One loop uses your current speed and pause settings
-        (folded, unfolded, and revealed where applicable).
-        Renders at 30 fps and downloads an MP4.
-      </p>
-
-      <label for="exportVariations" style="margin-top: 8px;">
-        Color variation exports
-      </label>
-
-      <input
-        id="exportVariations"
-        type="number"
-        min="1"
-        max="20"
-        step="1"
-        value="10"
-      />
-
-      <button id="exportVariationsButton" type="button">
-        Export color variations
-      </button>
-
-      <p style="margin: 0; font-size: 11px; line-height: 1.5; opacity: 0.7;">
-        Runs the same export as Export video multiple times.
-        Each file uses a new random seed (colors shuffle on
-        unfold like the live preview).
-      </p>
-
-      <button id="exportVideoButton" type="button">
-        Export video
-      </button>
-
-      <p id="exportNote" style="margin: 0; font-size: 11px; opacity: 0.65;"></p>
-    </div>
-
     <button id="restartButton">
       Restart animation
     </button>
+
+    <section id="exportPanel" class="export-panel">
+      <h2 class="panel-title">Export</h2>
+
+      <div class="export-section">
+        <h3 class="section-title">GIF</h3>
+
+        <div class="group">
+          <label for="gifVariations">Variations</label>
+          <input
+            id="gifVariations"
+            type="number"
+            min="1"
+            max="100"
+            step="1"
+            value="10"
+          />
+          <p class="hint">
+            One GIF per variation, each with its own random
+            inner colors and unfold layouts.
+          </p>
+        </div>
+
+        <div class="group">
+          <div class="row">
+            <label for="gifFirstUnfoldDelay">Time before first unfold</label>
+            <span id="gifFirstUnfoldDelayValue" class="value"></span>
+          </div>
+          <input
+            id="gifFirstUnfoldDelay"
+            type="range"
+            min="0"
+            max="30"
+            step="0.5"
+            value="5"
+          />
+        </div>
+
+        <div class="group">
+          <div class="row">
+            <label for="gifBetweenUnfoldDelay">Time between unfolds</label>
+            <span id="gifBetweenUnfoldDelayValue" class="value"></span>
+          </div>
+          <input
+            id="gifBetweenUnfoldDelay"
+            type="range"
+            min="0"
+            max="60"
+            step="0.5"
+            value="15"
+          />
+          <p class="hint">
+            Folded time between one fold-up and the next unfold.
+            Also used as the gap when the GIF loops back to the start.
+          </p>
+        </div>
+
+        <div class="group">
+          <label for="gifUnfoldCount">Unfolds per GIF</label>
+          <input
+            id="gifUnfoldCount"
+            type="number"
+            min="1"
+            max="20"
+            step="1"
+            value="1"
+          />
+        </div>
+
+        <div class="group">
+          <label for="gifFps">Frame rate</label>
+          <select id="gifFps">
+            <option value="15">15 fps</option>
+            <option value="20">20 fps</option>
+            <option value="25" selected>25 fps</option>
+            <option value="30">30 fps</option>
+          </select>
+        </div>
+
+        <div class="group">
+          <label for="gifScale">Size</label>
+          <select id="gifScale">
+            <option value="1">Full canvas</option>
+            <option value="0.75">75%</option>
+            <option value="0.5" selected>50%</option>
+            <option value="0.33">33%</option>
+          </select>
+        </div>
+
+        <p id="gifEstimate" class="hint"></p>
+
+        <button id="exportGifButton" type="button">
+          Export GIFs
+        </button>
+      </div>
+
+      <div class="export-section">
+        <h3 class="section-title">Video (MP4)</h3>
+
+        <div class="group">
+          <label for="exportLoops">Export loops</label>
+
+          <input
+            id="exportLoops"
+            type="number"
+            min="1"
+            max="999"
+            step="1"
+            value="5"
+          />
+
+          <p id="exportEstimate" class="hint"></p>
+
+          <p class="hint">
+            One loop uses your current speed and pause settings
+            (folded, unfolded, and revealed where applicable).
+            Renders at 30 fps and downloads an MP4.
+          </p>
+        </div>
+
+        <button id="exportVideoButton" type="button">
+          Export video
+        </button>
+
+        <div class="group">
+          <label for="exportVariations">Color variation exports</label>
+
+          <input
+            id="exportVariations"
+            type="number"
+            min="1"
+            max="20"
+            step="1"
+            value="10"
+          />
+
+          <p class="hint">
+            Runs the same export as Export video multiple times.
+            Each file uses a new random seed (colors shuffle on
+            unfold like the live preview).
+          </p>
+        </div>
+
+        <button id="exportVariationsButton" type="button">
+          Export color variations
+        </button>
+      </div>
+
+      <p id="exportNote" class="hint"></p>
+    </section>
 
   </aside>
 

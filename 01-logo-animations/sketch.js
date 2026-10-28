@@ -2566,7 +2566,18 @@ let panelInnerColors = [];
       "exportVariationsButton",
       "exportVideoButton",
       "exportNote",
-      "restartButton"
+      "restartButton",
+
+      "gifVariations",
+      "gifFirstUnfoldDelay",
+      "gifFirstUnfoldDelayValue",
+      "gifBetweenUnfoldDelay",
+      "gifBetweenUnfoldDelayValue",
+      "gifUnfoldCount",
+      "gifFps",
+      "gifScale",
+      "gifEstimate",
+      "exportGifButton"
     ];
   
     for (
@@ -2778,6 +2789,41 @@ let panelInnerColors = [];
           );
         }
       );
+
+    for (
+      const id of [
+        "gifFirstUnfoldDelay",
+        "gifBetweenUnfoldDelay",
+        "gifUnfoldCount",
+        "gifVariations",
+        "gifFps",
+        "gifScale"
+      ]
+    ) {
+      controls[id].addEventListener(
+        "input",
+        updateLabels
+      );
+    }
+
+    controls
+      .exportGifButton
+      .addEventListener(
+        "click",
+        () => {
+          exportGifVariations().catch(
+            error => {
+              console.error(error);
+              setExportNote(
+                `GIF export failed: ${error.message || error}`
+              );
+              logoExporting = false;
+              syncExportBusyUI();
+              loop();
+            }
+          );
+        }
+      );
   }
   
   function updateModePanels() {
@@ -2882,6 +2928,43 @@ let panelInnerColors = [];
 
     controls.exportEstimate.textContent =
       `${loops} loop${loops === 1 ? "" : "s"} · ${formatExportDuration(cycle)} per loop · ≈ ${formatExportDuration(total)} total`;
+
+    updateGifEstimate();
+  }
+
+  function updateGifEstimate() {
+    if (!controls.gifEstimate) {
+      return;
+    }
+
+    if (isTripleMode()) {
+      controls.gifEstimate.textContent =
+        "GIF export is for cube unfold mode.";
+      return;
+    }
+
+    const settings =
+      getGifExportSettings();
+    const duration =
+      getGifTimelineDuration(
+        buildGifTimeline(settings)
+      );
+    const sourceCanvas =
+      getWebGLCanvasElement();
+    const size =
+      sourceCanvas
+        ? getGifDimensions(
+            sourceCanvas,
+            settings.scale
+          )
+        : null;
+
+    controls.gifEstimate.textContent =
+      `${settings.variations} GIF${settings.variations === 1 ? "" : "s"} · ${formatExportDuration(duration)} each` +
+      ` · ${settings.fps} fps · ${getGifTotalFrames(duration, settings.fps)} frames` +
+      (size
+        ? ` · cropped to fit (max ${size.width}×${size.height})`
+        : "");
   }
 
   function updateLabels() {
@@ -2925,6 +3008,24 @@ let panelInnerColors = [];
         `${Number(
           controls
             .revealedPause
+            .value
+        ).toFixed(1)}s`;
+
+    controls
+      .gifFirstUnfoldDelayValue
+      .textContent =
+        `${Number(
+          controls
+            .gifFirstUnfoldDelay
+            .value
+        ).toFixed(1)}s`;
+
+    controls
+      .gifBetweenUnfoldDelayValue
+      .textContent =
+        `${Number(
+          controls
+            .gifBetweenUnfoldDelay
             .value
         ).toFixed(1)}s`;
 
@@ -2984,6 +3085,8 @@ let panelInnerColors = [];
     controls.restartButton.disabled =
       busy;
     controls.animationMode.disabled =
+      busy;
+    controls.exportGifButton.disabled =
       busy;
   }
 
@@ -3560,6 +3663,859 @@ let panelInnerColors = [];
       `Saved ${count} color variation${count === 1 ? "" : "s"} · ${count}× ${controls.exportLoops.value} loop(s) each.`
     );
   }
+
+  // ============================================================
+  // GIF EXPORT
+  // ============================================================
+
+  const GIFENC_URL =
+    "https://cdn.jsdelivr.net/npm/gifenc@1.0.3/dist/gifenc.esm.js";
+
+  let gifencModulePromise = null;
+  let gifCaptureCanvas = null;
+
+  function loadGifEncoder() {
+    if (!gifencModulePromise) {
+      gifencModulePromise =
+        import(GIFENC_URL).catch(
+          error => {
+            gifencModulePromise = null;
+            throw error;
+          }
+        );
+    }
+
+    return gifencModulePromise;
+  }
+
+  function readIntegerInput(
+    input,
+    fallback,
+    min,
+    max
+  ) {
+    const value =
+      Math.round(
+        Number(input.value)
+      );
+
+    if (!Number.isFinite(value)) {
+      return fallback;
+    }
+
+    return Math.min(
+      max,
+      Math.max(min, value)
+    );
+  }
+
+  function getGifExportSettings() {
+    return {
+      variations:
+        readIntegerInput(
+          controls.gifVariations,
+          10,
+          1,
+          100
+        ),
+      unfoldCount:
+        readIntegerInput(
+          controls.gifUnfoldCount,
+          1,
+          1,
+          20
+        ),
+      firstDelay:
+        Number(
+          controls.gifFirstUnfoldDelay.value
+        ),
+      betweenDelay:
+        Number(
+          controls.gifBetweenUnfoldDelay.value
+        ),
+      fps:
+        Number(
+          controls.gifFps.value
+        ),
+      scale:
+        Number(
+          controls.gifScale.value
+        ),
+      moveDuration:
+        1 /
+        Number(
+          controls.animationSpeed.value
+        ),
+      unfoldedPause:
+        Number(
+          controls.unfoldedPause.value
+        )
+    };
+  }
+
+  // The tail hold makes the loop seam match the between-unfold gap:
+  // tail + firstDelay = betweenDelay (when betweenDelay >= firstDelay).
+  function buildGifTimeline(settings) {
+    const segments = [];
+    let time = 0;
+
+    const push = (
+      state,
+      duration,
+      events = {}
+    ) => {
+      segments.push({
+        state,
+        start: time,
+        duration:
+          Math.max(0, duration),
+        ...events
+      });
+      time += Math.max(0, duration);
+    };
+
+    push(
+      "foldedHold",
+      settings.firstDelay
+    );
+
+    for (
+      let k = 0;
+      k < settings.unfoldCount;
+      k++
+    ) {
+      const isLast =
+        k ===
+        settings.unfoldCount - 1;
+
+      push(
+        "unfolding",
+        settings.moveDuration,
+        { randomizeColorsOnStart: true }
+      );
+      push(
+        "unfoldedHold",
+        settings.unfoldedPause
+      );
+      push(
+        "folding",
+        settings.moveDuration,
+        { chooseNetOnEnd: !isLast }
+      );
+      push(
+        "foldedHold",
+        isLast
+          ? settings.betweenDelay -
+              settings.firstDelay
+          : settings.betweenDelay
+      );
+    }
+
+    return segments;
+  }
+
+  function getGifTimelineDuration(
+    segments
+  ) {
+    const last =
+      segments[segments.length - 1];
+
+    return last.start + last.duration;
+  }
+
+  function getGifDimensions(
+    sourceCanvas,
+    scale
+  ) {
+    return {
+      width:
+        Math.max(
+          2,
+          Math.round(
+            sourceCanvas.width * scale
+          )
+        ),
+      height:
+        Math.max(
+          2,
+          Math.round(
+            sourceCanvas.height * scale
+          )
+        )
+    };
+  }
+
+  function getGifCaptureContext(
+    width,
+    height
+  ) {
+    if (!gifCaptureCanvas) {
+      gifCaptureCanvas =
+        document.createElement(
+          "canvas"
+        );
+    }
+
+    gifCaptureCanvas.width = width;
+    gifCaptureCanvas.height = height;
+
+    const ctx =
+      gifCaptureCanvas.getContext(
+        "2d",
+        { willReadFrequently: true }
+      );
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+
+    return ctx;
+  }
+
+  function captureGifFrame(
+    ctx,
+    sourceCanvas,
+    width,
+    height,
+    rect = {
+      x: 0,
+      y: 0,
+      width,
+      height
+    }
+  ) {
+    ctx.fillStyle =
+      getPageBackgroundColor();
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(
+      sourceCanvas,
+      0,
+      0,
+      width,
+      height
+    );
+
+    return ctx.getImageData(
+      rect.x,
+      rect.y,
+      rect.width,
+      rect.height
+    ).data;
+  }
+
+  function hexToRgb(hex) {
+    const value =
+      parseInt(
+        hex.replace("#", ""),
+        16
+      );
+
+    return [
+      (value >> 16) & 255,
+      (value >> 8) & 255,
+      value & 255
+    ];
+  }
+
+  function getGifTotalFrames(
+    duration,
+    fps
+  ) {
+    return Math.max(
+      1,
+      Math.round(duration * fps)
+    );
+  }
+
+  // Steps the timeline frame by frame, firing the same color / net
+  // events as the live animation, and renders each frame.
+  async function playGifTimeline(
+    timeline,
+    totalFrames,
+    fps,
+    onFrame
+  ) {
+    let segmentIndex = 0;
+
+    for (
+      let frame = 0;
+      frame < totalFrames;
+      frame++
+    ) {
+      const time = frame / fps;
+
+      while (
+        segmentIndex <
+          timeline.length - 1 &&
+        time >=
+          timeline[segmentIndex].start +
+            timeline[segmentIndex].duration
+      ) {
+        if (
+          timeline[segmentIndex]
+            .chooseNetOnEnd
+        ) {
+          chooseNewNet();
+        }
+
+        segmentIndex++;
+
+        if (
+          timeline[segmentIndex]
+            .randomizeColorsOnStart
+        ) {
+          assignRandomInnerColors(
+            currentNet.faces.length
+          );
+        }
+      }
+
+      const segment =
+        timeline[segmentIndex];
+
+      applyGifSegmentState(
+        segment,
+        time - segment.start
+      );
+
+      renderLogoScene();
+
+      onFrame(frame, time);
+
+      if (
+        frame % 10 === 0 ||
+        frame === totalFrames - 1
+      ) {
+        await new Promise(resolve => {
+          setTimeout(resolve, 0);
+        });
+      }
+    }
+  }
+
+  async function measureGifBounds({
+    timeline,
+    duration,
+    fps,
+    sourceCanvas,
+    width,
+    height,
+    onProgress
+  }) {
+    const ctx =
+      getGifCaptureContext(
+        width,
+        height
+      );
+    const totalFrames =
+      getGifTotalFrames(
+        duration,
+        fps
+      );
+    const [bgR, bgG, bgB] =
+      hexToRgb(
+        getPageBackgroundColor()
+      );
+    const tolerance = 3;
+
+    let minX = width;
+    let minY = height;
+    let maxX = -1;
+    let maxY = -1;
+
+    await playGifTimeline(
+      timeline,
+      totalFrames,
+      fps,
+      frame => {
+        const pixels =
+          captureGifFrame(
+            ctx,
+            sourceCanvas,
+            width,
+            height
+          );
+
+        for (let y = 0; y < height; y++) {
+          const row = y * width * 4;
+
+          for (let x = 0; x < width; x++) {
+            const i = row + x * 4;
+
+            if (
+              Math.abs(pixels[i] - bgR) > tolerance ||
+              Math.abs(pixels[i + 1] - bgG) > tolerance ||
+              Math.abs(pixels[i + 2] - bgB) > tolerance
+            ) {
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
+          }
+        }
+
+        if (frame % 10 === 0) {
+          onProgress(
+            frame + 1,
+            totalFrames
+          );
+        }
+      }
+    );
+
+    if (maxX < 0) {
+      return null;
+    }
+
+    return {
+      minX,
+      minY,
+      maxX,
+      maxY
+    };
+  }
+
+  // One crop shared by every variation, centered on the canvas center
+  // (where the folded cube sits) so the cube lands in the same spot in
+  // every GIF. It extends far enough to fit the widest / tallest layout.
+  function getCenteredGifCrop(
+    boundsList,
+    width,
+    height
+  ) {
+    const padding = 2;
+    const centerX = width / 2;
+    const centerY = height / 2;
+
+    let halfWidth = 0;
+    let halfHeight = 0;
+    let touchesEdge = false;
+
+    for (const bounds of boundsList) {
+      if (!bounds) {
+        continue;
+      }
+
+      halfWidth = Math.max(
+        halfWidth,
+        centerX - bounds.minX,
+        bounds.maxX + 1 - centerX
+      );
+      halfHeight = Math.max(
+        halfHeight,
+        centerY - bounds.minY,
+        bounds.maxY + 1 - centerY
+      );
+
+      touchesEdge =
+        touchesEdge ||
+        bounds.minX === 0 ||
+        bounds.minY === 0 ||
+        bounds.maxX === width - 1 ||
+        bounds.maxY === height - 1;
+    }
+
+    if (halfWidth === 0 || halfHeight === 0) {
+      return {
+        x: 0,
+        y: 0,
+        width,
+        height,
+        touchesEdge
+      };
+    }
+
+    const x0 = Math.max(
+      0,
+      Math.floor(centerX - halfWidth - padding)
+    );
+    const y0 = Math.max(
+      0,
+      Math.floor(centerY - halfHeight - padding)
+    );
+    const x1 = Math.min(
+      width,
+      Math.ceil(centerX + halfWidth + padding)
+    );
+    const y1 = Math.min(
+      height,
+      Math.ceil(centerY + halfHeight + padding)
+    );
+
+    return {
+      x: x0,
+      y: y0,
+      width: x1 - x0,
+      height: y1 - y0,
+      touchesEdge
+    };
+  }
+
+  function applyGifSegmentState(
+    segment,
+    localTime
+  ) {
+    animationState =
+      segment.state;
+
+    const t =
+      segment.duration > 0
+        ? constrain(
+            localTime /
+              segment.duration,
+            0,
+            1
+          )
+        : 1;
+
+    if (segment.state === "unfolding") {
+      progress =
+        1 - applyMotionCurve(t);
+    } else if (
+      segment.state === "folding"
+    ) {
+      progress =
+        applyMotionCurve(t);
+    } else if (
+      segment.state === "unfoldedHold"
+    ) {
+      progress = 0;
+    } else {
+      progress = 1;
+    }
+  }
+
+  function pixelsEqual(a, b) {
+    if (!a || !b || a.length !== b.length) {
+      return false;
+    }
+
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  async function encodeGifVariation({
+    gifenc,
+    timeline,
+    duration,
+    fps,
+    sourceCanvas,
+    width,
+    height,
+    crop,
+    onProgress
+  }) {
+    const gif = gifenc.GIFEncoder();
+    const ctx =
+      getGifCaptureContext(
+        width,
+        height
+      );
+    const totalFrames =
+      getGifTotalFrames(
+        duration,
+        fps
+      );
+
+    // Identical consecutive frames (the long folded holds) are
+    // merged into one GIF frame with a longer delay.
+    let pending = null;
+    let previousPixels = null;
+    let storedFrames = 0;
+
+    const writePending = endTime => {
+      const delayCs =
+        Math.max(
+          2,
+          Math.round(endTime * 100) -
+            Math.round(
+              pending.startTime * 100
+            )
+        );
+
+      gif.writeFrame(
+        pending.index,
+        crop.width,
+        crop.height,
+        {
+          palette: pending.palette,
+          delay: delayCs * 10
+        }
+      );
+      storedFrames++;
+    };
+
+    await playGifTimeline(
+      timeline,
+      totalFrames,
+      fps,
+      (frame, time) => {
+        const pixels =
+          captureGifFrame(
+            ctx,
+            sourceCanvas,
+            width,
+            height,
+            crop
+          );
+
+        if (
+          !pixelsEqual(
+            pixels,
+            previousPixels
+          )
+        ) {
+          if (pending) {
+            writePending(time);
+          }
+
+          const palette =
+            gifenc.quantize(pixels, 256);
+
+          pending = {
+            index:
+              gifenc.applyPalette(
+                pixels,
+                palette
+              ),
+            palette,
+            startTime: time
+          };
+          previousPixels = pixels;
+        }
+
+        if (
+          frame % 10 === 0 ||
+          frame === totalFrames - 1
+        ) {
+          onProgress(
+            frame + 1,
+            totalFrames
+          );
+        }
+      }
+    );
+
+    writePending(duration);
+    gif.finish();
+
+    return {
+      bytes: gif.bytes(),
+      storedFrames
+    };
+  }
+
+  function downloadBlob(
+    blob,
+    filename
+  ) {
+    const url =
+      URL.createObjectURL(blob);
+    const link =
+      document.createElement("a");
+
+    link.href = url;
+    link.download = filename;
+    link.click();
+
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }
+
+  async function exportGifVariations() {
+    if (logoExporting) {
+      return;
+    }
+
+    if (isTripleMode()) {
+      setExportNote(
+        "GIF export is for cube unfold mode."
+      );
+      return;
+    }
+
+    const sourceCanvas =
+      getWebGLCanvasElement();
+
+    if (!sourceCanvas) {
+      throw new Error(
+        "Could not read WebGL canvas for export."
+      );
+    }
+
+    setExportNote(
+      "Loading GIF encoder…"
+    );
+
+    const gifenc =
+      await loadGifEncoder();
+
+    const settings =
+      getGifExportSettings();
+    const timeline =
+      buildGifTimeline(settings);
+    const duration =
+      getGifTimelineDuration(timeline);
+    const { width, height } =
+      getGifDimensions(
+        sourceCanvas,
+        settings.scale
+      );
+    const count =
+      settings.variations;
+
+    // Every variation starts on a different net until all 11
+    // have been used, then the order repeats.
+    const startNets =
+      shuffleArray(
+        CUBE_NETS.map(
+          (_, index) => index
+        )
+      );
+
+    const randomInnerWasChecked =
+      controls.randomInnerColors.checked;
+
+    controls.randomInnerColors.checked =
+      true;
+    updateInsideColorControl();
+
+    logoExporting = true;
+    syncExportBusyUI();
+    noLoop();
+
+    const variations =
+      Array.from(
+        { length: count },
+        (_, index) => ({
+          seed:
+            createVariationSeed(index),
+          startNetIndex:
+            startNets[
+              index % startNets.length
+            ]
+        })
+      );
+
+    // Measuring and encoding must replay the identical sequence of nets.
+    const resetVariation = variation => {
+      randomSeed(variation.seed);
+      currentNetIndex =
+        variation.startNetIndex;
+      currentNet =
+        prepareNet(
+          CUBE_NETS[currentNetIndex]
+        );
+    };
+
+    let crop = null;
+
+    try {
+      const boundsList = [];
+
+      for (
+        let index = 0;
+        index < count;
+        index++
+      ) {
+        resetVariation(
+          variations[index]
+        );
+
+        boundsList.push(
+          await measureGifBounds({
+            timeline,
+            duration,
+            fps: settings.fps,
+            sourceCanvas,
+            width,
+            height,
+            onProgress: (
+              frame,
+              totalFrames
+            ) => {
+              setExportNote(
+                `Measuring crop · GIF ${index + 1} / ${count} · frame ${frame} / ${totalFrames}…`
+              );
+            }
+          })
+        );
+      }
+
+      crop =
+        getCenteredGifCrop(
+          boundsList,
+          width,
+          height
+        );
+
+      for (
+        let index = 0;
+        index < count;
+        index++
+      ) {
+        resetVariation(
+          variations[index]
+        );
+
+        const { bytes } =
+          await encodeGifVariation({
+            gifenc,
+            timeline,
+            duration,
+            fps: settings.fps,
+            sourceCanvas,
+            width,
+            height,
+            crop,
+            onProgress: (
+              frame,
+              totalFrames
+            ) => {
+              setExportNote(
+                `GIF ${index + 1} / ${count} · encoding frame ${frame} / ${totalFrames}…`
+              );
+            }
+          });
+
+        downloadBlob(
+          new Blob(
+            [bytes],
+            { type: "image/gif" }
+          ),
+          `logo-animation-${String(index + 1).padStart(2, "0")}.gif`
+        );
+
+        await new Promise(resolve => {
+          setTimeout(resolve, 250);
+        });
+      }
+    } finally {
+      controls.randomInnerColors.checked =
+        randomInnerWasChecked;
+      updateInsideColorControl();
+
+      randomSeed(Date.now());
+
+      logoExporting = false;
+      syncExportBusyUI();
+      restartAnimation();
+      loop();
+    }
+
+    setExportNote(
+      `Saved ${count} GIF${count === 1 ? "" : "s"} · ${formatExportDuration(duration)} each · ${crop.width}×${crop.height} · ${settings.fps} fps · ${getGifTotalFrames(duration, settings.fps)} frames.` +
+      (crop.touchesEdge
+        ? " Warning: the animation reaches the canvas edge, so it may be clipped — widen the window or lower the cube size."
+        : "")
+    );
+  }
   
   // ============================================================
   // RESIZE
@@ -3575,6 +4531,8 @@ let panelInnerColors = [];
       container.clientWidth,
       container.clientHeight
     );
+
+    updateGifEstimate();
   }
   
   // ============================================================
