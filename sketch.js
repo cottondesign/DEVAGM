@@ -5112,9 +5112,46 @@ function blitOneAtATimeLayer(layer) {
   pop();
 }
 
+/*
+ * Second-panel passes (split crop / tilt) shift the
+ * projection, which the screen-space layer cache and its
+ * redraw scissor can't follow, so draw every net there.
+ */
+function drawOneAtATimeShiftedPanel(settings, placements) {
+  if (settings.showCubeGrid) {
+    drawIsometricCubeGrid(settings);
+  }
+
+  if (settings.showGrid) {
+    drawScreenIsometricGrid(settings);
+  }
+
+  setIsometricCamera(settings);
+  applyDefaultSceneLights(settings);
+  shuffleInnerFrozen = true;
+
+  for (let index = 0; index < placements.length; index++) {
+    drawOneAtATimePlacement(
+      placements[index],
+      settings,
+      index === oneAtATimeState.activeIndex
+        ? oneAtATimeState.progress
+        : 0
+    );
+  }
+
+  shuffleInnerFrozen = false;
+  noLights();
+}
+
 function drawOneAtATimeFrame(settings) {
   const placements =
     getOneAtATimePlacements(settings);
+
+  if (screenTilt) {
+    drawOneAtATimeShiftedPanel(settings, placements);
+    return;
+  }
 
   const layers =
     ensureOneAtATimeLayers(settings, placements);

@@ -8,6 +8,64 @@
  * time step so every mode advances deterministically.
  */
 
+/*
+ * Dev servers like Live Server reload every page when a
+ * workspace file changes. Mid-render that kills the job,
+ * and the hidden render worker reloads even if the user
+ * cancels the prompt. Drop those reloads while a job runs.
+ */
+(function holdDevReloadsDuringReelJobs() {
+  const NativeSocket = window.WebSocket;
+
+  if (typeof NativeSocket !== "function") {
+    return;
+  }
+
+  const jobRunning = () => {
+    try {
+      return Boolean(
+        typeof window.top.isReelJobRunning === "function" &&
+          window.top.isReelJobRunning()
+      );
+    } catch (error) {
+      return false;
+    }
+  };
+
+  class DevReloadSocket extends NativeSocket {
+    constructor(url, protocols) {
+      super(url, protocols);
+
+      if (!/\/ws$/.test(String(url))) {
+        return;
+      }
+
+      let handler = null;
+
+      Object.defineProperty(this, "onmessage", {
+        configurable: true,
+        get: () => handler,
+        set: (fn) => {
+          handler = fn;
+        }
+      });
+
+      this.addEventListener("message", (event) => {
+        if (event.data === "reload" && jobRunning()) {
+          console.info("Skipped a dev-server reload during a render.");
+          return;
+        }
+
+        if (typeof handler === "function") {
+          handler.call(this, event);
+        }
+      });
+    }
+  }
+
+  window.WebSocket = DevReloadSocket;
+})();
+
 const REEL_STORAGE_KEY =
   "devagm-11-cube-unfold-reel";
 const REEL_PRESET_STORAGE_KEY =
@@ -21,6 +79,7 @@ const REEL_PRESET_STORAGE_KEY =
 const REEL_SIM_FPS = 60;
 const REEL_MAX_TRIM_SECONDS = 30;
 const REEL_MAX_CLIP_SECONDS = 1200;
+const REEL_MAX_BACKDROP_SECONDS = 4 * 3600;
 const REEL_THUMB_WIDTH = 320;
 const REEL_COLLAPSED_PREVIEW_COUNT = 3;
 /* clips with no repeating fold count one cycle as this */
@@ -40,7 +99,19 @@ const reel = {
   preview: null,
   dragId: null,
   loadedClip: null,
-  loadedClipDirty: false
+  loadedClipDirty: false,
+  /*
+   * Split lobby, alternating: `clips` is whichever side
+   * is being edited and `otherClips` the other side's
+   * order of the same clips (null = default rotation).
+   */
+  editSide: "left",
+  otherClips: null,
+  /* After Smart Arrange each side owns its own clip copies. */
+  sidesIndependent: false,
+  smartUndo: null,
+  /* The reference cuts Smart Arrange followed: { name, dark, scale, durations }. */
+  smartPlan: null
 };
 
 const reelEls = {};
@@ -88,6 +159,10 @@ function initReel() {
     "reelApplyUpdatesButton",
     "reelRandomMinutes",
     "reelRandomClipsButton",
+    "reelBackdropMinutes",
+    "reelBackdropButton",
+    "reelExportBackdropButton",
+    "reelBackdropNote",
     "reelPresetName",
     "reelPresetSaveNote",
     "reelExportJsonButton",
@@ -96,7 +171,19 @@ function initReel() {
     "reelShortenClipsButton",
     "reelContentScaleMode",
     "reelSplitMode",
-    "reelSplitModeGroup"
+    "reelSplitModeGroup",
+    "reelSplitEditRow",
+    "reelEditLeftButton",
+    "reelEditRightButton",
+    "reelSplitStatus",
+    "reelEditorSide",
+    "reelSmartArrangeButton",
+    "reelSmartPresetSelect",
+    "reelSmartUndoButton",
+    "reelSmartNote",
+    "reelSmartAlternateRow",
+    "reelSmartAlternateLeftButton",
+    "reelSmartAlternateRightButton"
   ];
 
   for (const id of ids) {
@@ -158,6 +245,16 @@ function connectReelControls() {
     addRandomClipsForMinutes
   );
 
+  reelEls.reelBackdropButton.addEventListener(
+    "click",
+    extendClipToBackdrop
+  );
+
+  reelEls.reelExportBackdropButton.addEventListener(
+    "click",
+    exportBackdropOnly
+  );
+
   reelEls.reelExportJsonButton.addEventListener(
     "click",
     exportSequenceJson
@@ -204,6 +301,41 @@ function connectReelControls() {
     "click",
     shortenLongClips
   );
+
+  reelEls.reelSmartArrangeButton.addEventListener(
+    "click",
+    smartArrangeSequences
+  );
+
+  reelEls.reelSmartUndoButton.addEventListener(
+    "click",
+    undoSmartArrange
+  );
+
+  reelEls.reelSmartAlternateLeftButton.addEventListener(
+    "click",
+    () => alternateReelSmartSide("left")
+  );
+
+  reelEls.reelSmartAlternateRightButton.addEventListener(
+    "click",
+    () => alternateReelSmartSide("right")
+  );
+
+  reelEls.reelSmartPresetSelect.addEventListener(
+    "change",
+    syncReelBusyUI
+  );
+
+  for (const [button, side] of [
+    [reelEls.reelEditLeftButton, "left"],
+    [reelEls.reelEditRightButton, "right"]
+  ]) {
+    button.addEventListener("click", () => {
+      setReelEditSide(side);
+      setReelExpanded(true);
+    });
+  }
 
   reelEls.reelContentScaleMode.addEventListener(
     "change",
@@ -615,6 +747,87 @@ function addClipToSequence() {
   }
 }
 
+/*
+ * Long single-comp backdrops: stretches the loaded clip,
+ * or adds the live sketch as a new clip, to a fixed
+ * number of minutes.
+ */
+function extendClipToBackdrop() {
+  if (reel.job) {
+    return;
+  }
+
+  const minutes = Number(reelEls.reelBackdropMinutes.value);
+
+  if (!(minutes > 0)) {
+    reelEls.reelBackdropMinutes.focus();
+    return;
+  }
+
+  const seconds = Math.min(
+    REEL_MAX_BACKDROP_SECONDS,
+    Math.round(minutes * 60)
+  );
+  const loaded = reel.loadedClip
+    ? reel.clips.find((clip) => clip.id === reel.loadedClip.id)
+    : null;
+
+  let clip = loaded;
+
+  if (!clip) {
+    const before = reel.clips.length;
+    addClipToSequence();
+
+    if (reel.clips.length === before) {
+      return;
+    }
+
+    clip = reel.clips[reel.clips.length - 1];
+  }
+
+  clip.backdropSeconds = seconds;
+  reel.backdropClipId = clip.id;
+  persistReelState();
+  renderReel();
+
+  reelEls.reelBackdropNote.textContent =
+    `${loaded ? "Extended" : "Added"} “${clip.name}” as a ${formatReelSeconds(seconds)} backdrop. Export Backdrop Only renders just this clip.`;
+}
+
+function getReelBackdropClip() {
+  const backdrops = reel.clips.filter(
+    (clip) => Number(clip.backdropSeconds) > 0
+  );
+
+  return (
+    backdrops.find((clip) => clip.id === reel.backdropClipId) ||
+    backdrops[backdrops.length - 1] ||
+    null
+  );
+}
+
+/* A split screen renders the backdrop across its full width. */
+async function exportBackdropOnly() {
+  const clip = getReelBackdropClip();
+
+  if (!clip || reel.job) {
+    return;
+  }
+
+  const fullAspect = reel.aspectRatio.replace(/-split$/, "");
+
+  if (fullAspect !== reel.aspectRatio && ASPECT_PRESETS[fullAspect]) {
+    reelRenderAspectOverride = fullAspect;
+  }
+
+  try {
+    await exportReelClips([clip], { singleTrack: true });
+  } finally {
+    reelRenderAspectOverride = null;
+    renderReel();
+  }
+}
+
 function removeReelClip(id) {
   reel.clips = reel.clips.filter(
     (clip) => clip.id !== id
@@ -637,6 +850,9 @@ function clearReelSequence() {
   }
 
   reel.clips = [];
+  reel.otherClips = null;
+  reel.sidesIndependent = false;
+  reel.editSide = "left";
   setReelExpanded(false);
   persistReelState();
   renderReel();
@@ -718,6 +934,19 @@ function getReelClipCycles(clip) {
  * until the clip is given a cycle count.
  */
 function getReelClipDuration(clip) {
+  /* Smart Arrange pins clips to the reference sequence's cuts. */
+  if (Number(clip.fixedSeconds) > 0) {
+    return constrain(Number(clip.fixedSeconds), 0.1, REEL_MAX_CLIP_SECONDS);
+  }
+
+  if (Number(clip.backdropSeconds) > 0) {
+    return constrain(
+      Number(clip.backdropSeconds),
+      1,
+      REEL_MAX_BACKDROP_SECONDS
+    );
+  }
+
   const hasLegacySeconds =
     (clip.cycles === null || clip.cycles === undefined) &&
     clip.duration !== null &&
@@ -755,13 +984,20 @@ function getReelTotalSeconds() {
  * Alternating split lobby renders each side as its own
  * 720×768 frame; everything else renders the full frame.
  */
+/* Render-only aspect for one export; never saved. */
+let reelRenderAspectOverride = null;
+
+function getReelOutputAspect() {
+  return reelRenderAspectOverride || reel.aspectRatio;
+}
+
 function isReelSplitAlternate() {
-  const preset = ASPECT_PRESETS[reel.aspectRatio];
+  const preset = ASPECT_PRESETS[getReelOutputAspect()];
   return Boolean(preset && preset.split && reel.splitMode === "alternate");
 }
 
 function getReelRenderAspect() {
-  return isReelSplitAlternate() ? "720:768" : reel.aspectRatio;
+  return isReelSplitAlternate() ? "720:768" : getReelOutputAspect();
 }
 
 function applyReelClip(clip) {
@@ -1364,11 +1600,26 @@ function autoArrangeClips() {
     return;
   }
 
+  if (reel.editSide === "right" && !reel.sidesIndependent) {
+    applyRightSideOrder(listRightSideOrders()[0].clips);
+    return;
+  }
+
   applyReelContrastOrder(computeReelContrastOrder(reel.clips, 0));
 }
 
 function alternateArrangeClips() {
   if (reel.job || reel.clips.length < 3) {
+    return;
+  }
+
+  if (canAlternateReelSmartSide()) {
+    alternateReelSmartSide(reel.editSide);
+    return;
+  }
+
+  if (reel.editSide === "right" && !reel.sidesIndependent) {
+    alternateRightSide();
     return;
   }
 
@@ -1392,11 +1643,611 @@ function alternateArrangeClips() {
 }
 
 /* ------------------------------------------------------------------
+ * Split lobby sides (alternating)
+ * ---------------------------------------------------------------- */
+
+function getReelSideClips(side) {
+  if (reel.editSide === side) {
+    return reel.clips;
+  }
+
+  if (side === "left") {
+    return reel.otherClips;
+  }
+
+  return reel.otherClips || computeReelAlternateOrder(reel.clips);
+}
+
+/*
+ * Keeps both sides holding the same clips: removals
+ * drop out of the other side, and new clips land about
+ * half a sequence away from where they sit here.
+ */
+function syncReelSides() {
+  if (reel.sidesIndependent) {
+    if (!reel.otherClips || (!reel.clips.length && !reel.otherClips.length)) {
+      reel.sidesIndependent = false;
+    } else {
+      return;
+    }
+  }
+
+  if (!reel.clips.length) {
+    if (reel.editSide === "right") {
+      reel.editSide = "left";
+    }
+
+    reel.otherClips = null;
+    return;
+  }
+
+  if (!reel.otherClips) {
+    return;
+  }
+
+  const other = reel.otherClips.filter((clip) =>
+    reel.clips.includes(clip)
+  );
+
+  if (!other.length && reel.editSide === "left") {
+    reel.otherClips = null;
+    return;
+  }
+
+  for (const clip of reel.clips) {
+    if (!other.includes(clip)) {
+      const n = other.length + 1;
+      const at =
+        (reel.clips.indexOf(clip) + Math.floor(n / 2)) % n;
+      other.splice(at, 0, clip);
+    }
+  }
+
+  reel.otherClips = other;
+}
+
+function setReelEditSide(side) {
+  if (reel.job || side === reel.editSide) {
+    return;
+  }
+
+  syncReelSides();
+
+  if (side === "right" && !isReelSplitAlternate()) {
+    return;
+  }
+
+  const right = getReelSideClips("right");
+  const left = getReelSideClips("left");
+
+  reel.editSide = side;
+  reel.clips = side === "right" ? right.slice() : left;
+  reel.otherClips = side === "right" ? left : right.slice();
+  persistReelState();
+  renderReel();
+  refreshVisibleMissingThumbnails();
+}
+
+function getReelClipSourceKey(clip) {
+  return clip.sourceId || clip.id;
+}
+
+/* Seconds where one clip is on screen on both sides. */
+function getReelSideOverlap(left, right) {
+  const spans = new Map();
+  let t = 0;
+
+  for (const clip of left) {
+    const d = getReelClipDuration(clip);
+    const key = getReelClipSourceKey(clip);
+
+    if (!spans.has(key)) {
+      spans.set(key, []);
+    }
+
+    spans.get(key).push([t, t + d]);
+    t += d;
+  }
+
+  let overlap = 0;
+  t = 0;
+
+  for (const clip of right) {
+    const d = getReelClipDuration(clip);
+
+    for (const span of spans.get(getReelClipSourceKey(clip)) || []) {
+      overlap += Math.max(
+        0,
+        Math.min(span[1], t + d) - Math.max(span[0], t)
+      );
+    }
+
+    t += d;
+  }
+
+  return overlap;
+}
+
+/*
+ * Right-side candidates: contrast orders first (best
+ * flow), then rotations of the left side; the ones with
+ * the least same-clip overlap come first.
+ */
+function listRightSideOrders() {
+  const left = getReelSideClips("left");
+  const n = left.length;
+  const seen = new Set();
+  const candidates = [];
+
+  const add = (clips) => {
+    const key = clips.map((clip) => clip.id).join("|");
+
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    candidates.push({
+      clips,
+      key,
+      overlap:
+        Math.round(getReelSideOverlap(left, clips) * 100) / 100
+    });
+  };
+
+  for (const entry of listReelContrastOrders(left)) {
+    add(entry.order.map((index) => left[index]));
+  }
+
+  for (let k = 1; k < n; k++) {
+    add(left.slice(k).concat(left.slice(0, k)));
+  }
+
+  candidates.sort((a, b) => a.overlap - b.overlap);
+  return candidates;
+}
+
+function applyRightSideOrder(clips) {
+  reel.clips = clips.slice();
+  persistReelState();
+  renderReel();
+  refreshVisibleMissingThumbnails();
+}
+
+/* Steps the right side to its next least-overlapping order. */
+function alternateRightSide() {
+  const candidates = listRightSideOrders();
+  const best = candidates[0].overlap;
+  const group = candidates.filter(
+    (entry) => entry.overlap <= best + 0.01
+  );
+  const currentKey = reel.clips.map((clip) => clip.id).join("|");
+  const index = group.findIndex(
+    (entry) => entry.key === currentKey
+  );
+
+  const next = group.length > 1 || index < 0
+    ? group[(index + 1) % group.length]
+    : candidates.find((entry) => entry.key !== currentKey);
+
+  if (next) {
+    applyRightSideOrder(next.clips);
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Smart Arrange — a reference sequence preset sets the
+ * cut times. At every reference clip, the left side
+ * matches its background and cube scale and the right
+ * side takes the opposite of both.
+ * ---------------------------------------------------------------- */
+
+/* Background is a hard rule; it only breaks when no clip has the needed one. */
+const REEL_SMART_BG_WEIGHT = 1e6;
+const REEL_SMART_SCALE_WEIGHT = 3;
+const REEL_SMART_REUSE_WEIGHT = 1.5;
+const REEL_SMART_REPEAT_WEIGHT = 6;
+const REEL_SMART_SAME_SLOT_WEIGHT = 1e4;
+const REEL_SMART_CONTRAST_WEIGHT = 0.6;
+const REEL_SMART_CHANGE_WEIGHT = 1.5;
+const REEL_SMART_ALTERNATE_JITTER = 0.8;
+const REEL_SMART_HISTORY_LENGTH = 4;
+
+/* Recent arrangements per side for the current plan (not saved). */
+const reelSmartHistory = { plan: "", left: [], right: [] };
+
+function isReelClipDark(clip) {
+  return getReelClipFeatures(clip).bgLum < 0.5;
+}
+
+/* On-screen cube size, as a log so steps feel even. */
+function getReelClipScale(clip) {
+  const fields = clip.snapshot.fields || {};
+
+  return Math.log(
+    Math.max(1, Number(fields.gridSize) || 64) *
+      Math.max(0.1, Number(fields.cameraZoom) || 1)
+  );
+}
+
+/* 0 = smallest in the set, 1 = largest (ties share a rank). */
+function rankReelClipScales(clips) {
+  const values = clips.map(getReelClipScale);
+  const sorted = [...values].sort((a, b) => a - b);
+  const n = sorted.length;
+
+  return values.map((value) => {
+    if (n < 2) {
+      return 0.5;
+    }
+
+    const first = sorted.indexOf(value);
+    const last = sorted.lastIndexOf(value);
+    return ((first + last) / 2) / (n - 1);
+  });
+}
+
+function getReelSmartReference(name) {
+  const preset = readReelPresetStore()[name];
+
+  if (!preset || !Array.isArray(preset.clips)) {
+    return null;
+  }
+
+  const clips = deserializeReelClips(preset.clips);
+  const defaultCycles =
+    Number(preset.defaultCycles) > 0
+      ? roundToHalfCycle(preset.defaultCycles)
+      : reel.defaultCycles;
+  const savedDefault = reel.defaultCycles;
+
+  reel.defaultCycles = defaultCycles;
+
+  const durations = clips.map(getReelClipDuration);
+
+  reel.defaultCycles = savedDefault;
+
+  return clips.length ? { name, clips, durations } : null;
+}
+
+/* Unique source clips from both sides (Smart copies fold back to their source). */
+function getReelSmartPool() {
+  syncReelSides();
+
+  const seen = new Map();
+
+  for (const clip of [
+    ...getReelSideClips("left"),
+    ...getReelSideClips("right")
+  ]) {
+    const key = getReelClipSourceKey(clip);
+
+    if (!seen.has(key)) {
+      seen.set(key, clip);
+    }
+  }
+
+  return [...seen.values()];
+}
+
+function copyReelClipForSlot(clip, seconds) {
+  return {
+    ...clip,
+    id: createReelClipId(),
+    sourceId: getReelClipSourceKey(clip),
+    cycles: null,
+    duration: null,
+    fixedSeconds: Math.round(seconds * 1000) / 1000
+  };
+}
+
+function smartArrangeSequences() {
+  if (reel.job || !isReelSplitAlternate()) {
+    return;
+  }
+
+  const name = reelEls.reelSmartPresetSelect.value;
+  const reference = name ? getReelSmartReference(name) : null;
+
+  if (!reference) {
+    reelEls.reelSmartNote.textContent =
+      "Pick a saved sequence preset to follow.";
+    return;
+  }
+
+  const pool = getReelSmartPool();
+
+  if (pool.length < 2) {
+    reelEls.reelSmartNote.textContent =
+      "Add at least two clips to arrange both sides.";
+    return;
+  }
+
+  const plan = {
+    name: reference.name,
+    dark: reference.clips.map(isReelClipDark),
+    scale: rankReelClipScales(reference.clips),
+    durations: reference.durations
+  };
+  const ctx = buildReelSmartContext(pool);
+  const left = pickReelSmartSide(ctx, plan, "left", []);
+  const right = pickReelSmartSide(ctx, plan, "right", left.picks);
+
+  reel.smartUndo = serializeReelState();
+  reel.smartPlan = plan;
+  applyReelSmartSides(
+    buildReelSmartClips(ctx, plan, left.picks),
+    buildReelSmartClips(ctx, plan, right.picks)
+  );
+
+  const total = plan.durations.reduce((sum, d) => sum + d, 0);
+  const misses = left.bgMisses + right.bgMisses;
+
+  reelEls.reelSmartNote.textContent =
+    `Both sides now cut with “${plan.name}”: ${plan.durations.length} slots · ${formatReelSeconds(total)}.` +
+    describeReelSmartMisses(ctx, misses);
+}
+
+/* Per-pool data every smart pick needs. */
+function buildReelSmartContext(pool) {
+  return {
+    pool,
+    dark: pool.map(isReelClipDark),
+    scale: rankReelClipScales(pool),
+    features: pool.map(getReelClipFeatures)
+  };
+}
+
+/*
+ * Picks one side slot by slot. `otherPicks` is the
+ * other side (never the same clip in the same slot);
+ * `avoidHistory` (newest first) + `jitter` push an
+ * alternate away from recent arrangements without
+ * breaking the rules.
+ */
+function pickReelSmartSide(ctx, plan, sideName, otherPicks, options = {}) {
+  const { pool, dark, scale, features } = ctx;
+  const avoidHistory = options.avoidHistory || [];
+  const jitter = options.jitter || 0;
+  const uses = new Array(pool.length).fill(0);
+  const picks = [];
+  let bgMisses = 0;
+
+  for (let slot = 0; slot < plan.durations.length; slot++) {
+    const wantDark = sideName === "left" ? plan.dark[slot] : !plan.dark[slot];
+    const wantScale =
+      sideName === "left" ? plan.scale[slot] : 1 - plan.scale[slot];
+    const previous = picks[slot - 1];
+    let best = -1;
+    let bestCost = Infinity;
+
+    for (let i = 0; i < pool.length; i++) {
+      let cost =
+        (dark[i] !== wantDark ? REEL_SMART_BG_WEIGHT : 0) +
+        Math.abs(scale[i] - wantScale) * REEL_SMART_SCALE_WEIGHT +
+        uses[i] * REEL_SMART_REUSE_WEIGHT +
+        Math.random() * jitter;
+
+      if (i === otherPicks[slot]) {
+        cost += REEL_SMART_SAME_SLOT_WEIGHT;
+      }
+
+      /* Newest arrangement weighs most, so presses keep moving forward. */
+      avoidHistory.forEach((past, age) => {
+        if (past[slot] === i) {
+          cost += REEL_SMART_CHANGE_WEIGHT / (age + 1);
+        }
+      });
+
+      if (previous !== undefined) {
+        cost += i === previous ? REEL_SMART_REPEAT_WEIGHT : 0;
+        cost -=
+          reelClipDifference(features[previous], features[i]) *
+          REEL_SMART_CONTRAST_WEIGHT;
+      }
+
+      if (cost < bestCost) {
+        bestCost = cost;
+        best = i;
+      }
+    }
+
+    if (dark[best] !== wantDark) {
+      bgMisses++;
+    }
+
+    picks.push(best);
+    uses[best]++;
+  }
+
+  return { picks, bgMisses };
+}
+
+function buildReelSmartClips(ctx, plan, picks) {
+  return picks.map((index, slot) =>
+    copyReelClipForSlot(ctx.pool[index], plan.durations[slot])
+  );
+}
+
+function applyReelSmartSides(left, right) {
+  reel.sidesIndependent = true;
+  reel.clips = reel.editSide === "right" ? right : left;
+  reel.otherClips = reel.editSide === "right" ? left : right;
+  reel.loadedClip = null;
+  reel.loadedClipDirty = false;
+
+  persistReelState();
+  renderReel();
+  refreshVisibleMissingThumbnails();
+}
+
+function describeReelSmartMisses(ctx, misses) {
+  return misses
+    ? ` ${misses} slot${misses === 1 ? "" : "s"} couldn't follow the background rule because no clip has a ${ctx.dark.every(Boolean) ? "light" : "dark"} background — add one and run Smart Arrange again.`
+    : " Every slot follows the background rule.";
+}
+
+function canAlternateReelSmartSide() {
+  return Boolean(
+    reel.sidesIndependent &&
+      reel.smartPlan &&
+      getReelSideClips("left").length === reel.smartPlan.durations.length &&
+      getReelSideClips("right").length === reel.smartPlan.durations.length
+  );
+}
+
+/*
+ * Re-picks one side under the same rules, keeping the
+ * other side and every cut time as they are.
+ */
+function alternateReelSmartSide(sideName) {
+  if (reel.job || !canAlternateReelSmartSide()) {
+    return;
+  }
+
+  const plan = reel.smartPlan;
+  const ctx = buildReelSmartContext(getReelSmartPool());
+  const indexOf = new Map(
+    ctx.pool.map((clip, index) => [getReelClipSourceKey(clip), index])
+  );
+  const toPicks = (clips) =>
+    clips.map((clip) => indexOf.get(getReelClipSourceKey(clip)));
+  const otherName = sideName === "left" ? "right" : "left";
+  const current = toPicks(getReelSideClips(sideName));
+  const otherPicks = toPicks(getReelSideClips(otherName));
+  const key = (picks) => picks.join(",");
+  const planKey = `${plan.name}|${plan.durations.join(",")}`;
+
+  if (reelSmartHistory.plan !== planKey) {
+    reelSmartHistory.plan = planKey;
+    reelSmartHistory.left = [];
+    reelSmartHistory.right = [];
+  }
+
+  const history = [
+    current,
+    ...reelSmartHistory[sideName].filter((past) => key(past) !== key(current))
+  ].slice(0, REEL_SMART_HISTORY_LENGTH);
+  const seen = new Set(history.map(key));
+
+  let result = null;
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    result = pickReelSmartSide(ctx, plan, sideName, otherPicks, {
+      avoidHistory: history,
+      jitter: REEL_SMART_ALTERNATE_JITTER * (1 + attempt * 0.5)
+    });
+
+    if (!seen.has(key(result.picks))) {
+      break;
+    }
+  }
+
+  reelSmartHistory[sideName] = history;
+
+  const changed = result.picks.filter(
+    (pick, slot) => pick !== current[slot]
+  ).length;
+
+  if (!changed) {
+    reelEls.reelSmartNote.textContent =
+      `No other ${sideName}-side arrangement fits the rules with these clips — add more clips to get variations.`;
+    return;
+  }
+
+  const rebuilt = buildReelSmartClips(ctx, plan, result.picks);
+  const kept = getReelSideClips(otherName);
+
+  reel.smartUndo = serializeReelState();
+  applyReelSmartSides(
+    sideName === "left" ? rebuilt : kept,
+    sideName === "left" ? kept : rebuilt
+  );
+
+  reelEls.reelSmartNote.textContent =
+    `New ${sideName} side: ${changed} of ${plan.durations.length} slots changed, still cutting with “${plan.name}”.` +
+    describeReelSmartMisses(ctx, result.bgMisses);
+}
+
+function undoSmartArrange() {
+  if (reel.job || !reel.smartUndo) {
+    return;
+  }
+
+  const state = reel.smartUndo;
+
+  applyReelStateSettings(JSON.parse(JSON.stringify(state)));
+  reel.loadedClip = null;
+  reel.loadedClipDirty = false;
+  persistReelState();
+  renderReel();
+  refreshVisibleMissingThumbnails();
+  reelEls.reelSmartNote.textContent = "Restored both sides from before Smart Arrange.";
+}
+
+function refreshReelSmartPresetSelect() {
+  const select = reelEls.reelSmartPresetSelect;
+
+  if (!select) {
+    return;
+  }
+
+  const store = readReelPresetStore();
+  const current = select.value;
+  const names = Object.keys(store).sort((a, b) => a.localeCompare(b));
+
+  select.innerHTML = "";
+
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = names.length
+    ? "Follow sequence preset…"
+    : "No sequence presets saved";
+  select.appendChild(placeholder);
+
+  for (const name of names) {
+    const count = Array.isArray(store[name].clips)
+      ? store[name].clips.length
+      : 0;
+    const option = document.createElement("option");
+
+    option.value = name;
+    option.textContent = `${name} · ${count} clip${count === 1 ? "" : "s"}`;
+    select.appendChild(option);
+  }
+
+  select.value = names.includes(current) ? current : "";
+}
+
+/* ------------------------------------------------------------------
  * Rendering engine
  * ---------------------------------------------------------------- */
 
+/*
+ * Background tabs clamp setTimeout to 1 s, then 1 min,
+ * which stalls long renders; message tasks aren't
+ * throttled.
+ */
+const reelYieldChannel = new MessageChannel();
+const reelYieldQueue = [];
+
+reelYieldChannel.port1.onmessage = () => {
+  const resolve = reelYieldQueue.shift();
+
+  if (resolve) {
+    resolve();
+  }
+};
+
 function reelYield() {
-  return new Promise((resolve) => setTimeout(resolve, 0));
+  return new Promise((resolve) => {
+    reelYieldQueue.push(resolve);
+    reelYieldChannel.port2.postMessage(0);
+  });
+}
+
+function isReelJobRunning() {
+  return Boolean(reel.job);
 }
 
 function reelWait(ms) {
@@ -1474,6 +2325,7 @@ async function runReelJob(kind, work) {
     name: sourceImageName
   };
 
+  stopReelCompanion();
   reel.job = job;
   reelRendering = true;
   fixedFrameDeltaMs = 1000 / REEL_SIM_FPS;
@@ -1515,6 +2367,7 @@ async function runReelJob(kind, work) {
     loop();
     fixedFrameDeltaMs = null;
     syncReelBusyUI();
+    updateReelCompanion();
   }
 
   if (job.error) {
@@ -1528,7 +2381,7 @@ async function runReelJob(kind, work) {
 
 function getReelExportSize() {
   const preset =
-    ASPECT_PRESETS[reel.aspectRatio] ||
+    ASPECT_PRESETS[getReelOutputAspect()] ||
     ASPECT_PRESETS["16:9"];
   const size = resolveAspectCanvasSize(preset);
   const scale = reel.resolutionScale || 1;
@@ -1684,10 +2537,10 @@ function prepareReelTrack(track) {
   return track;
 }
 
-async function buildReelTracks(clips) {
+async function buildReelTracks(clips, singleTrack = false) {
   const size = getReelExportSize();
 
-  if (!isReelSplitAlternate()) {
+  if (singleTrack || !isReelSplitAlternate()) {
     return [
       prepareReelTrack({
         clips,
@@ -1707,7 +2560,7 @@ async function buildReelTracks(clips) {
       rect: { x: 0, y: 0, w: half, h: size.height }
     }),
     prepareReelTrack({
-      clips: computeReelAlternateOrder(clips),
+      clips: getReelSideClips("right").slice(),
       api: createWorkerTrackApi(win),
       rect: { x: half, y: 0, w: size.width - half, h: size.height }
     })
@@ -1754,6 +2607,243 @@ function hideReelCompositeView() {
   getSketchCanvasElement().style.display = "";
 }
 
+/* ------------------------------------------------------------------
+ * Live split companion — with a clip loaded in the
+ * alternating split, the other screen plays the clip
+ * that runs alongside it, rendered by the worker.
+ * ---------------------------------------------------------------- */
+
+const reelCompanion = {
+  key: "",
+  token: 0,
+  api: null,
+  canvas: null,
+  raf: null,
+  lastTime: 0,
+  carryMs: 0
+};
+
+/* The other side's clip at the moment the loaded clip starts. */
+function getReelCompanionTarget() {
+  if (!isReelSplitAlternate() || reel.job) {
+    return null;
+  }
+
+  const loaded = getLoadedReelClip();
+
+  if (!loaded) {
+    return null;
+  }
+
+  syncReelSides();
+
+  const side = reel.editSide;
+  const other = getReelSideClips(side === "left" ? "right" : "left");
+  const index = reel.clips.indexOf(loaded);
+
+  if (index < 0 || !other.length) {
+    return null;
+  }
+
+  let time = 0;
+
+  for (let i = 0; i < index; i++) {
+    time += getReelClipDuration(reel.clips[i]);
+  }
+
+  let start = 0;
+
+  for (const clip of other) {
+    const duration = getReelClipDuration(clip);
+
+    if (time < start + duration - 1e-6) {
+      return { side, clip, offset: time - start };
+    }
+
+    start += duration;
+  }
+
+  return { side, clip: other[other.length - 1], offset: 0 };
+}
+
+function updateReelCompanion() {
+  if (RENDER_WORKER) {
+    return;
+  }
+
+  const target = getReelCompanionTarget();
+
+  if (!target) {
+    stopReelCompanion();
+    return;
+  }
+
+  const key = JSON.stringify([
+    target.side,
+    target.clip.id,
+    target.offset.toFixed(3),
+    target.clip.snapshot,
+    getReelClipTrim(target.clip),
+    reel.cameraZoomScale,
+    reel.contentScaleMode
+  ]);
+
+  if (key === reelCompanion.key) {
+    layoutReelCompanion(target.side);
+    return;
+  }
+
+  reelCompanion.key = key;
+  startReelCompanion(target);
+}
+
+function stopReelCompanion() {
+  reelCompanion.token++;
+  reelCompanion.key = "";
+  reelCompanion.api = null;
+
+  if (reelCompanion.raf !== null) {
+    cancelAnimationFrame(reelCompanion.raf);
+    reelCompanion.raf = null;
+  }
+
+  if (reelCompanion.canvas) {
+    reelCompanion.canvas.style.display = "none";
+  }
+
+  document
+    .getElementById("canvas-stage")
+    .classList.remove("split-live");
+}
+
+async function startReelCompanion(target) {
+  const token = ++reelCompanion.token;
+  const stale = () => token !== reelCompanion.token || reel.job;
+  let win;
+
+  try {
+    win = await getReelRenderWorker();
+  } catch (error) {
+    if (!stale()) {
+      setReelNote(error.message || String(error));
+    }
+
+    return;
+  }
+
+  if (stale()) {
+    return;
+  }
+
+  const api = createWorkerTrackApi(win);
+  const job = { cancelled: false };
+
+  api.apply(target.clip);
+
+  if (!(await api.preroll(job, target.clip)) || stale()) {
+    return;
+  }
+
+  const steps = Math.round(target.offset * REEL_SIM_FPS);
+  let sliceStart = performance.now();
+
+  for (let i = 0; i < steps; i++) {
+    api.simulate();
+
+    if (performance.now() - sliceStart > 30) {
+      await reelYield();
+      sliceStart = performance.now();
+
+      if (stale()) {
+        return;
+      }
+    }
+  }
+
+  if (stale()) {
+    return;
+  }
+
+  api.step();
+  reelCompanion.api = api;
+  reelCompanion.lastTime = performance.now();
+  reelCompanion.carryMs = 0;
+  layoutReelCompanion(target.side);
+
+  if (reelCompanion.raf === null) {
+    reelCompanion.raf = requestAnimationFrame(tickReelCompanion);
+  }
+}
+
+function layoutReelCompanion(side) {
+  if (!reelCompanion.api) {
+    return;
+  }
+
+  const stage = document.getElementById("canvas-stage");
+
+  if (!reelCompanion.canvas) {
+    reelCompanion.canvas = document.createElement("canvas");
+    reelCompanion.canvas.id = "reelCompanionView";
+    stage.appendChild(reelCompanion.canvas);
+  }
+
+  stage.classList.add("split-live");
+  reelCompanion.canvas.style.display = "block";
+  reelCompanion.canvas.style.order = side === "left" ? "1" : "-1";
+  reelCompanion.canvas.title = side === "left"
+    ? "Right side — plays alongside the loaded clip"
+    : "Left side — plays alongside the loaded clip";
+}
+
+function tickReelCompanion(now) {
+  reelCompanion.raf = null;
+
+  const api = reelCompanion.api;
+
+  if (!api || reel.job) {
+    return;
+  }
+
+  const frameMs = 1000 / REEL_SIM_FPS;
+
+  reelCompanion.carryMs += Math.min(250, now - reelCompanion.lastTime);
+  reelCompanion.lastTime = now;
+
+  const steps = Math.min(4, Math.floor(reelCompanion.carryMs / frameMs));
+
+  reelCompanion.carryMs -= steps * frameMs;
+
+  for (let i = 0; i < steps; i++) {
+    api.step();
+  }
+
+  /* WebGL buffers are only readable in the task that drew them. */
+  if (!steps) {
+    reelCompanion.raf = requestAnimationFrame(tickReelCompanion);
+    return;
+  }
+
+  const source = api.canvas();
+  const target = reelCompanion.canvas;
+  const main = getSketchCanvasElement();
+
+  if (target.width !== source.width || target.height !== source.height) {
+    target.width = source.width;
+    target.height = source.height;
+  }
+
+  if (target.style.width !== main.style.width) {
+    target.style.width = main.style.width;
+  }
+
+  target
+    .getContext("2d", { alpha: false })
+    .drawImage(source, 0, 0, target.width, target.height);
+
+  reelCompanion.raf = requestAnimationFrame(tickReelCompanion);
+}
+
 /*
  * Preview stays open until exited. Seeking re-applies
  * the target clip and steps from its start (or keeps
@@ -1762,7 +2852,8 @@ function hideReelCompositeView() {
  * playback and export would show.
  */
 async function previewReel() {
-  const clips = reel.clips.slice();
+  syncReelSides();
+  const clips = getReelSideClips("left").slice();
 
   if (!clips.length || reel.job) {
     return;
@@ -2031,9 +3122,12 @@ function exitReelPreview() {
   }
 }
 
-async function exportReel() {
-  const clips = reel.clips.slice();
+function exportReel() {
+  syncReelSides();
+  return exportReelClips(getReelSideClips("left").slice());
+}
 
+async function exportReelClips(clips, { singleTrack = false } = {}) {
   if (!clips.length || reel.job) {
     return;
   }
@@ -2088,10 +3182,11 @@ async function exportReel() {
   let savedToFile = false;
   let extension = "mp4";
 
+  const releaseAwake = holdReelExportAwake();
   const { ok, job: finishedJob } = await runReelJob("export", async (job) => {
     setReelProgress("Preparing encoder…", 0);
 
-    const tracks = (await buildReelTracks(clips)).map((track) => {
+    const tracks = (await buildReelTracks(clips, singleTrack)).map((track) => {
       track.frameCounts = countFrames(track.clips);
       track.c = -1;
       track.framesLeft = 0;
@@ -2120,6 +3215,9 @@ async function exportReel() {
     }
 
     extension = encoder.extension;
+
+    const composite =
+      tracks.length > 1 ? showReelCompositeView(size) : null;
 
     const progressLabel = () => {
       const c = Math.max(0, tracks[0].c);
@@ -2164,6 +3262,10 @@ async function exportReel() {
         await encoder.addFrame(out, frameIndex);
 
         if ((frameIndex + 1) % 4 === 0) {
+          if (composite) {
+            composite.drawImage(out, 0, 0);
+          }
+
           setReelProgress(progressLabel(), (frameIndex + 1) / totalFrames);
           await reelYield();
         }
@@ -2193,6 +3295,7 @@ async function exportReel() {
 
     return true;
   });
+  releaseAwake();
 
   const summary =
     `${totalFrames} frames · ${size.width}×${size.height} · ${fps} fps · ${extension.toUpperCase()}`;
@@ -2205,6 +3308,80 @@ async function exportReel() {
   } else if (finishedJob && finishedJob.cancelled) {
     setReelNote("Export cancelled.");
   }
+}
+
+/*
+ * Long exports die if Chrome freezes or discards the
+ * tab, or the computer sleeps. A held Web Lock keeps
+ * the tab from being frozen; the wake lock keeps the
+ * screen (and machine) awake while the tab is visible.
+ */
+function holdReelExportAwake() {
+  let releaseLock = null;
+  let wakeLock = null;
+  let active = true;
+
+  if (navigator.locks) {
+    const held = new Promise((resolve) => {
+      releaseLock = resolve;
+    });
+
+    navigator.locks
+      .request("devagm-reel-export", () => held)
+      .catch(() => {});
+  }
+
+  const requestWake = async () => {
+    if (
+      !active ||
+      wakeLock ||
+      !("wakeLock" in navigator) ||
+      document.visibilityState !== "visible"
+    ) {
+      return;
+    }
+
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => {
+        wakeLock = null;
+      });
+
+      if (!active) {
+        wakeLock.release().catch(() => {});
+      }
+    } catch (error) {
+      wakeLock = null;
+    }
+  };
+
+  const onVisibility = () => {
+    requestWake();
+  };
+
+  const onBeforeUnload = (event) => {
+    event.preventDefault();
+    event.returnValue = "";
+  };
+
+  document.addEventListener("visibilitychange", onVisibility);
+  window.addEventListener("beforeunload", onBeforeUnload);
+  requestWake();
+
+  return () => {
+    active = false;
+    document.removeEventListener("visibilitychange", onVisibility);
+    window.removeEventListener("beforeunload", onBeforeUnload);
+
+    if (releaseLock) {
+      releaseLock();
+    }
+
+    if (wakeLock) {
+      wakeLock.release().catch(() => {});
+      wakeLock = null;
+    }
+  };
 }
 
 function getReelFileStem() {
@@ -2329,6 +3506,17 @@ async function createWebCodecsReelEncoder(width, height, fps, fileHandle) {
 
   encoder.configure(config);
 
+  /* The timeout only matters if the encoder dies mid-wait. */
+  const waitForDequeue = () =>
+    "ondequeue" in encoder
+      ? Promise.race([
+          new Promise((resolve) =>
+            encoder.addEventListener("dequeue", resolve, { once: true })
+          ),
+          reelWait(1000)
+        ])
+      : reelYield();
+
   const frameDuration = Math.round(1e6 / fps);
 
   return {
@@ -2349,8 +3537,8 @@ async function createWebCodecsReelEncoder(width, height, fps, fileHandle) {
       });
       frame.close();
 
-      while (encoder.encodeQueueSize > 6) {
-        await reelWait(2);
+      while (encoder.encodeQueueSize > 6 && !failure) {
+        await waitForDequeue();
       }
     },
 
@@ -2546,6 +3734,8 @@ function createMediaRecorderReelEncoder(canvas, fps) {
  * ---------------------------------------------------------------- */
 
 function persistReelState() {
+  syncReelSides();
+
   if (reelPersistTimer !== null) {
     clearTimeout(reelPersistTimer);
   }
@@ -2566,6 +3756,9 @@ function serializeReelClip(clip) {
     cycles: clip.cycles,
     cycleSeconds: clip.cycleSeconds,
     trimStart: clip.trimStart,
+    fixedSeconds: clip.fixedSeconds || null,
+    backdropSeconds: clip.backdropSeconds || null,
+    sourceId: clip.sourceId || null,
     usesImage:
       clip.snapshot.fields.sketchMode === "image"
   };
@@ -2589,12 +3782,22 @@ function deserializeReelClips(clips) {
           ? Number(clip.cycleSeconds)
           : null,
       trimStart: Number(clip.trimStart) || 0,
+      fixedSeconds:
+        Number(clip.fixedSeconds) > 0 ? Number(clip.fixedSeconds) : null,
+      backdropSeconds:
+        Number(clip.backdropSeconds) > 0 ? Number(clip.backdropSeconds) : null,
+      sourceId: clip.sourceId || null,
       image: null,
       imageMissing: Boolean(clip.usesImage)
     }));
 }
 
 function serializeReelState() {
+  syncReelSides();
+  const left = getReelSideClips("left");
+  const customRight =
+    reel.editSide === "right" || reel.otherClips;
+
   return {
     version: 1,
     aspectRatio: reel.aspectRatio,
@@ -2604,7 +3807,15 @@ function serializeReelState() {
     fps: reel.fps,
     resolutionScale: reel.resolutionScale,
     cameraZoomScale: reel.cameraZoomScale || 1,
-    clips: reel.clips.map(serializeReelClip)
+    clips: left.map(serializeReelClip),
+    sidesIndependent: reel.sidesIndependent,
+    rightClips: reel.sidesIndependent
+      ? getReelSideClips("right").map(serializeReelClip)
+      : null,
+    smartPlan: reel.sidesIndependent ? reel.smartPlan : null,
+    rightOrder: customRight && !reel.sidesIndependent
+      ? getReelSideClips("right").map((clip) => clip.id)
+      : null
   };
 }
 
@@ -2644,6 +3855,42 @@ function applyReelStateSettings(state) {
   }
 
   reel.clips = deserializeReelClips(state.clips);
+  reel.editSide = "left";
+  reel.otherClips = null;
+  reel.sidesIndependent = false;
+  reel.smartUndo = null;
+
+  reel.smartPlan = null;
+
+  if (state.sidesIndependent && Array.isArray(state.rightClips)) {
+    reel.otherClips = deserializeReelClips(state.rightClips);
+    reel.sidesIndependent = true;
+
+    const plan = state.smartPlan;
+
+    if (
+      plan &&
+      Array.isArray(plan.durations) &&
+      Array.isArray(plan.dark) &&
+      Array.isArray(plan.scale) &&
+      plan.dark.length === plan.durations.length &&
+      plan.scale.length === plan.durations.length
+    ) {
+      reel.smartPlan = plan;
+    }
+  } else if (Array.isArray(state.rightOrder)) {
+    const byId = new Map(
+      reel.clips.map((clip) => [clip.id, clip])
+    );
+    const right = state.rightOrder
+      .map((id) => byId.get(id))
+      .filter(Boolean);
+
+    if (right.length) {
+      reel.otherClips = [...new Set(right)];
+      syncReelSides();
+    }
+  }
 }
 
 function writeReelState() {
@@ -2664,15 +3911,19 @@ function writeReelState() {
      * first so the collapsed preview keeps its images;
      * missing ones re-render when they're shown.
      */
-    let keep = state.clips.length;
+    const lists = [state.clips, state.rightClips || []];
+    let keep = Math.max(...lists.map((list) => list.length));
 
     while (keep > 0) {
       keep = Math.floor(keep / 2);
-      state.clips.forEach((clip, index) => {
-        if (index >= keep) {
-          clip.thumbnail = "";
-        }
-      });
+
+      for (const list of lists) {
+        list.forEach((clip, index) => {
+          if (index >= keep) {
+            clip.thumbnail = "";
+          }
+        });
+      }
 
       try {
         localStorage.setItem(
@@ -2722,7 +3973,11 @@ function shortenLongClips() {
   let stillLong = 0;
 
   for (const clip of reel.clips) {
-    if (getReelClipDuration(clip) <= REEL_SHORTEN_MAX_SECONDS + 1e-6) {
+    if (
+      clip.fixedSeconds ||
+      clip.backdropSeconds ||
+      getReelClipDuration(clip) <= REEL_SHORTEN_MAX_SECONDS + 1e-6
+    ) {
       continue;
     }
 
@@ -2933,6 +4188,8 @@ function refreshReelPresetSelect(selectedName = "") {
     "hidden",
     names.length === 0
   );
+
+  refreshReelSmartPresetSelect();
 }
 
 function saveSequenceAsPreset() {
@@ -3238,10 +4495,27 @@ function syncReelBusyUI() {
   reelEls.reelAddClipButton.disabled = busy;
   reelEls.reelRandomClipsButton.disabled = busy;
   reelEls.reelRandomMinutes.disabled = busy;
+  reelEls.reelBackdropMinutes.disabled = busy;
+  reelEls.reelBackdropButton.disabled = busy;
+  reelEls.reelExportBackdropButton.disabled =
+    busy || !getReelBackdropClip();
   reelEls.reelApplyUpdatesButton.disabled = busy;
   reelEls.reelShortenClipsButton.disabled = busy || !count;
   reelEls.reelContentScaleMode.disabled = busy;
   reelEls.reelSplitMode.disabled = busy;
+  reelEls.reelEditLeftButton.disabled = busy;
+  reelEls.reelEditRightButton.disabled = busy;
+  reelEls.reelSmartPresetSelect.disabled = busy;
+  reelEls.reelSmartArrangeButton.disabled =
+    busy || !reelEls.reelSmartPresetSelect.value;
+  reelEls.reelSmartUndoButton.disabled = busy;
+
+  const canAlternate = canAlternateReelSmartSide();
+
+  reelEls.reelSmartAlternateRow.classList.toggle("hidden", !canAlternate);
+  reelEls.reelSmartAlternateLeftButton.disabled = busy || !canAlternate;
+  reelEls.reelSmartAlternateRightButton.disabled = busy || !canAlternate;
+  reelEls.reelSmartUndoButton.classList.toggle("hidden", !reel.smartUndo);
   reelEls.reelAutoArrangeButton.disabled =
     busy || count < 3;
   reelEls.reelAlternateArrangeButton.disabled =
@@ -3264,6 +4538,18 @@ function syncReelBusyUI() {
 }
 
 function renderReel() {
+  syncReelSides();
+
+  if (
+    reel.editSide === "right" &&
+    !isReelSplitAlternate() &&
+    !reel.job &&
+    !reelRenderAspectOverride
+  ) {
+    setReelEditSide("left");
+    return;
+  }
+
   const count = reel.clips.length;
   const preset =
     ASPECT_PRESETS[reel.aspectRatio] ||
@@ -3282,6 +4568,38 @@ function renderReel() {
     "hidden",
     !preset.split
   );
+
+  const alternate = isReelSplitAlternate();
+  const editingRight = reel.editSide === "right";
+
+  reelEls.reelSplitEditRow.classList.toggle(
+    "hidden",
+    !alternate || count < 2
+  );
+  reelEls.reelEditLeftButton.classList.toggle("active", !editingRight);
+  reelEls.reelEditRightButton.classList.toggle("active", editingRight);
+  reelEls.reelEditorSide.classList.toggle(
+    "hidden",
+    !alternate || count < 2
+  );
+
+  if (alternate && count >= 2) {
+    const overlap = getReelSideOverlap(
+      getReelSideClips("left"),
+      getReelSideClips("right")
+    );
+    const overlapText = overlap > 0.01
+      ? `The same clip is on both sides for ${formatReelSeconds(overlap)} — try Alternate Arrange on the right side.`
+      : "No clip plays on both sides at the same time.";
+
+    reelEls.reelSplitStatus.textContent =
+      `Editing the ${editingRight ? "right" : "left"} side. ${overlapText}`;
+    reelEls.reelEditorSide.textContent = reel.sidesIndependent
+      ? `${editingRight ? "Right" : "Left"} side sequence — cuts are synced by Smart Arrange; reordering this side moves them.`
+      : editingRight
+        ? "Right side sequence — Alternate Arrange steps to the next order that avoids the left side."
+        : "Left side sequence";
+  }
 
   reelEls.reelDefaultDurationValue.textContent =
     formatReelCycles(reel.defaultCycles);
@@ -3342,6 +4660,7 @@ function renderReel() {
 
   renderReelClips();
   syncReelBusyUI();
+  updateReelCompanion();
 }
 
 function renderReelClips() {
@@ -3418,9 +4737,13 @@ function renderReelClips() {
       clip.duration !== null &&
       clip.duration !== undefined;
 
-    duration.textContent = usesLegacySeconds
-      ? `${formatReelSeconds(getReelClipDuration(clip))} · trimmed`
-      : `${formatReelCycles(getReelClipCycles(clip))} · ${formatReelSeconds(getReelClipDuration(clip))}`;
+    duration.textContent = clip.fixedSeconds
+      ? `${formatReelSeconds(getReelClipDuration(clip))} · synced cut`
+      : clip.backdropSeconds
+        ? `${formatReelSeconds(getReelClipDuration(clip))} · backdrop`
+      : usesLegacySeconds
+        ? `${formatReelSeconds(getReelClipDuration(clip))} · trimmed`
+        : `${formatReelCycles(getReelClipCycles(clip))} · ${formatReelSeconds(getReelClipDuration(clip))}`;
 
     const contrast = document.createElement("span");
 
@@ -3490,6 +4813,54 @@ function buildReelTrimControls(clip) {
   durationLabel.textContent = "Fold cycles";
 
   const durationInput = document.createElement("input");
+
+  if (clip.fixedSeconds) {
+    durationLabel.textContent = "Seconds (synced)";
+    durationInput.type = "number";
+    durationInput.min = "0.1";
+    durationInput.step = "0.1";
+    durationInput.value = String(clip.fixedSeconds);
+    durationInput.title =
+      "Smart Arrange set this to match the reference sequence's cut; changing it moves every later cut on this side.";
+    durationInput.addEventListener("change", () => {
+      if (Number(durationInput.value) > 0) {
+        clip.fixedSeconds = Number(durationInput.value);
+      }
+
+      persistReelState();
+      renderReel();
+    });
+    durationLabel.appendChild(durationInput);
+    wrap.appendChild(durationLabel);
+    wrap.appendChild(buildReelTrimStartControl(clip));
+    return wrap;
+  }
+
+  if (clip.backdropSeconds) {
+    durationLabel.textContent = "Minutes (backdrop)";
+    durationInput.type = "number";
+    durationInput.min = "0";
+    durationInput.max = String(REEL_MAX_BACKDROP_SECONDS / 60);
+    durationInput.step = "1";
+    durationInput.value = String(
+      Math.round((clip.backdropSeconds / 60) * 100) / 100
+    );
+    durationInput.title =
+      "Backdrop length. Set to 0 to go back to fold cycles.";
+    durationInput.addEventListener("change", () => {
+      const minutes = Number(durationInput.value);
+      clip.backdropSeconds = minutes > 0
+        ? Math.min(REEL_MAX_BACKDROP_SECONDS, Math.round(minutes * 60))
+        : null;
+      persistReelState();
+      renderReel();
+    });
+    durationLabel.appendChild(durationInput);
+    wrap.appendChild(durationLabel);
+    wrap.appendChild(buildReelTrimStartControl(clip));
+    return wrap;
+  }
+
   durationInput.type = "number";
   durationInput.min = "0.5";
   durationInput.step = "0.5";
@@ -3514,6 +4885,13 @@ function buildReelTrimControls(clip) {
 
   durationLabel.appendChild(durationInput);
 
+  wrap.appendChild(durationLabel);
+  wrap.appendChild(buildReelTrimStartControl(clip));
+
+  return wrap;
+}
+
+function buildReelTrimStartControl(clip) {
   const startLabel = document.createElement("label");
   startLabel.textContent = "Start at (s)";
 
@@ -3538,10 +4916,7 @@ function buildReelTrimControls(clip) {
 
   startLabel.appendChild(startInput);
 
-  wrap.appendChild(durationLabel);
-  wrap.appendChild(startLabel);
-
-  return wrap;
+  return startLabel;
 }
 
 function buildReelClipActions(clip, index) {

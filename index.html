@@ -274,6 +274,15 @@
       max-width: 100%;
     }
 
+    #canvas-stage.split-live {
+      display: flex;
+      align-items: flex-start;
+    }
+
+    #canvas-stage.split-live canvas {
+      max-width: 50%;
+    }
+
     body {
       --reel-panel-width: 270px;
     }
@@ -368,6 +377,41 @@
       padding: 6px;
       font-size: 10px;
       opacity: 0.7;
+    }
+
+    #reelSplitEditRow {
+      margin-top: 12px;
+    }
+
+    .reel-advanced {
+      margin-top: 10px;
+    }
+
+    .reel-smart-row {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 6px;
+      margin: 8px 0 6px;
+    }
+
+    .reel-smart-row button {
+      width: auto;
+      white-space: nowrap;
+    }
+
+    .reel-smart-row select {
+      min-width: 0;
+    }
+
+    .reel-side-toggle button.active {
+      background: var(--page-fg, #f4f1ea);
+      color: var(--page-bg, #032932);
+    }
+
+    .reel-editor-side {
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.4;
     }
 
     .reel-random-row {
@@ -2198,10 +2242,46 @@
       </p>
     </div>
 
+    <div class="control-group">
+      <div class="control-row">
+        <label for="reelBackdropMinutes">
+          Backdrop length (minutes)
+        </label>
+      </div>
+
+      <div class="reel-random-row">
+        <input
+          id="reelBackdropMinutes"
+          type="number"
+          min="1"
+          max="240"
+          step="1"
+          value="60"
+        />
+
+        <button id="reelBackdropButton" type="button">
+          (Backdrop) Extend Clip to Duration
+        </button>
+      </div>
+
+      <button id="reelExportBackdropButton" type="button" disabled>
+        Export Backdrop Only
+      </button>
+
+      <p id="reelBackdropNote" class="note">
+        Stretches the clip you have loaded to this length,
+        or adds the current sketch as one long clip. Export
+        Backdrop Only renders just that clip, full frame,
+        without touching the rest of the sequence.
+      </p>
+    </div>
+
     <div id="reelEditorHead" class="control-group hidden">
       <button id="reelBackButton" type="button">
         ← Back to Sketch Controls
       </button>
+
+      <p id="reelEditorSide" class="reel-editor-side hidden"></p>
 
       <div class="button-row">
         <button id="reelAutoArrangeButton" type="button">
@@ -2285,6 +2365,60 @@
         clip is never on both at once. Two crops shows
         one clip with each side framed differently.
       </p>
+
+      <div id="reelSplitEditRow" class="hidden">
+        <div class="control-row">
+          <label>Edit sequence</label>
+        </div>
+
+        <div class="button-row reel-side-toggle">
+          <button id="reelEditLeftButton" type="button">
+            Left Side
+          </button>
+
+          <button id="reelEditRightButton" type="button">
+            Right Side
+          </button>
+        </div>
+
+        <p class="note" id="reelSplitStatus"></p>
+
+        <details class="grid-toggles reel-advanced" open>
+          <summary>Advanced settings</summary>
+
+          <div class="reel-smart-row">
+            <button id="reelSmartArrangeButton" type="button">
+              Smart Arrange
+            </button>
+
+            <select
+              id="reelSmartPresetSelect"
+              aria-label="Sequence preset to follow"
+            ></select>
+          </div>
+
+          <div id="reelSmartAlternateRow" class="button-row hidden">
+            <button id="reelSmartAlternateLeftButton" type="button">
+              Alternate Left
+            </button>
+
+            <button id="reelSmartAlternateRightButton" type="button">
+              Alternate Right
+            </button>
+          </div>
+
+          <button id="reelSmartUndoButton" class="hidden" type="button">
+            Undo Smart Arrange
+          </button>
+
+          <p class="note" id="reelSmartNote">
+            Follows a saved sequence preset: both sides cut
+            whenever it does. Left matches its background
+            and cube scale; right takes the opposite of
+            both.
+          </p>
+        </details>
+      </div>
     </div>
 
     <div class="control-group">
