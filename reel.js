@@ -93,6 +93,8 @@ const reel = {
   splitMode: "alternate",
   fps: 30,
   resolutionScale: 1,
+  /* null exports the whole sequence */
+  exportMinutes: null,
   cameraZoomScale: 1,
   expanded: false,
   job: null,
@@ -137,6 +139,7 @@ function initReel() {
     "reelClearSequenceButton",
     "reelFps",
     "reelResolution",
+    "reelExportMinutes",
     "reelPreviewButton",
     "reelExportButton",
     "reelProgress",
@@ -222,6 +225,8 @@ function syncReelSettingInputs() {
   reelEls.reelFps.value = String(reel.fps);
   reelEls.reelResolution.value =
     String(reel.resolutionScale);
+  reelEls.reelExportMinutes.value =
+    reel.exportMinutes ? String(reel.exportMinutes) : "";
 }
 
 function connectReelControls() {
@@ -414,6 +419,14 @@ function connectReelControls() {
       renderReel();
     }
   );
+
+  reelEls.reelExportMinutes.addEventListener("change", () => {
+    const minutes = Number(reelEls.reelExportMinutes.value);
+    reel.exportMinutes = minutes > 0 ? minutes : null;
+    reelEls.reelExportMinutes.value =
+      reel.exportMinutes ? String(reel.exportMinutes) : "";
+    persistReelState();
+  });
 
   reelEls.reelPreviewButton.addEventListener(
     "click",
@@ -3199,6 +3212,13 @@ async function exportReelClips(clips, { singleTrack = false } = {}) {
       )
     );
 
+    if (reel.exportMinutes > 0) {
+      totalFrames = Math.min(
+        totalFrames,
+        Math.max(1, Math.round(reel.exportMinutes * 60 * fps))
+      );
+    }
+
     const encoder =
       (await createWebCodecsReelEncoder(
         size.width,
@@ -3806,6 +3826,7 @@ function serializeReelState() {
     splitMode: reel.splitMode,
     fps: reel.fps,
     resolutionScale: reel.resolutionScale,
+    exportMinutes: reel.exportMinutes,
     cameraZoomScale: reel.cameraZoomScale || 1,
     clips: left.map(serializeReelClip),
     sidesIndependent: reel.sidesIndependent,
@@ -3844,6 +3865,11 @@ function applyReelStateSettings(state) {
 
   if ([1, 0.75, 0.5].includes(Number(state.resolutionScale))) {
     reel.resolutionScale = Number(state.resolutionScale);
+  }
+
+  if ("exportMinutes" in state) {
+    reel.exportMinutes =
+      Number(state.exportMinutes) > 0 ? Number(state.exportMinutes) : null;
   }
 
   if (Number(state.cameraZoomScale) > 0) {
@@ -4525,6 +4551,7 @@ function syncReelBusyUI() {
   reelEls.reelDefaultDuration.disabled = busy;
   reelEls.reelFps.disabled = busy;
   reelEls.reelResolution.disabled = busy;
+  reelEls.reelExportMinutes.disabled = busy;
   reelEls.reelPreviewButton.disabled = busy || !count;
   reelEls.reelExportButton.disabled = busy || !count;
   reelEls.reelArrangeButton.disabled = busy;
